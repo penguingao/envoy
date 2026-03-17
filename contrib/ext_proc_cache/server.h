@@ -6,6 +6,12 @@
 #include "envoy/service/ext_proc/v3/external_processor.grpc.pb.h"
 #include "envoy/service/ext_proc/v3/external_processor.pb.h"
 
+#include "contrib/ext_proc_cache/cache_age_calculator.h"
+#include "contrib/ext_proc_cache/cache_key_generator.h"
+#include "contrib/ext_proc_cache/cache_lookup_coordinator.h"
+#include "contrib/ext_proc_cache/cache_stream_handler.h"
+#include "contrib/ext_proc_cache/cacheability_checker.h"
+
 #include "grpc++/server.h"
 
 namespace Envoy {
@@ -33,18 +39,23 @@ struct Task {
 class ExtProcCacheReactor
     : public grpc::ServerBidiReactor<ProcessingRequest, ProcessingResponse> {
 public:
-  ExtProcCacheReactor();
+  ExtProcCacheReactor(std::shared_ptr<CacheLookupCoordinator> coordinator,
+                      std::shared_ptr<CacheKeyGenerator> key_gen,
+                      std::shared_ptr<CacheabilityChecker> cacheability,
+                      std::shared_ptr<CacheAgeCalculator> age_calc,
+                      grpc::CallbackServerContext* context);
 
   void OnReadDone(bool ok) override;
   void OnWriteDone(bool ok) override;
+  void OnCancel() override;
   void OnDone() override;
 
 private:
   // The main processing coroutine.
   Task run();
 
-  // Build a response for the given request.
-  static ProcessingResponse buildResponse(const ProcessingRequest& request);
+  // Build a response for the given request, dispatching to the handler.
+  Awaitable<ProcessingResponse> handleRequest(const ProcessingRequest& request);
 
   // Awaitable that wraps StartRead. Resumes coroutine in OnReadDone.
   struct ReadAwaitable {
@@ -70,20 +81,37 @@ private:
   bool write_ok_ = false;
   ProcessingRequest request_;
   ProcessingResponse response_;
+
+  std::unique_ptr<CacheStreamHandler> handler_;
 };
 
 // Callback-based service that returns a coroutine-driven reactor per stream.
 class ExtProcCacheService
     : public envoy::service::ext_proc::v3::ExternalProcessor::CallbackService {
 public:
+  ExtProcCacheService(std::shared_ptr<CacheLookupCoordinator> coordinator,
+                      std::shared_ptr<CacheKeyGenerator> key_gen,
+                      std::shared_ptr<CacheabilityChecker> cacheability,
+                      std::shared_ptr<CacheAgeCalculator> age_calc);
+
   grpc::ServerBidiReactor<ProcessingRequest, ProcessingResponse>*
   Process(grpc::CallbackServerContext* context) override;
+
+private:
+  std::shared_ptr<CacheLookupCoordinator> coordinator_;
+  std::shared_ptr<CacheKeyGenerator> key_gen_;
+  std::shared_ptr<CacheabilityChecker> cacheability_;
+  std::shared_ptr<CacheAgeCalculator> age_calc_;
 };
 
 // Manages the gRPC server lifecycle.
 class ExtProcCacheServer {
 public:
-  void start(const std::string& address);
+  void start(const std::string& address,
+             std::shared_ptr<CacheLookupCoordinator> coordinator,
+             std::shared_ptr<CacheKeyGenerator> key_gen,
+             std::shared_ptr<CacheabilityChecker> cacheability,
+             std::shared_ptr<CacheAgeCalculator> age_calc);
   void shutdown();
   void wait();
   int port() const { return listening_port_; }

@@ -2,6 +2,11 @@
 #include <iostream>
 #include <string>
 
+#include "contrib/ext_proc_cache/cache_age_calculator.h"
+#include "contrib/ext_proc_cache/cache_key_generator.h"
+#include "contrib/ext_proc_cache/cache_lookup_coordinator.h"
+#include "contrib/ext_proc_cache/cacheability_checker.h"
+#include "contrib/ext_proc_cache/in_memory_cache_store.h"
 #include "contrib/ext_proc_cache/server.h"
 
 std::function<void(int)> shutdown_handler;
@@ -18,8 +23,15 @@ int main(int argc, char** argv) {
     address = argv[1];
   }
 
+  // Wire default implementations.
+  auto store = std::make_shared<Envoy::Extensions::ExtProcCache::InMemoryCacheStore>();
+  auto key_gen = std::make_shared<Envoy::Extensions::ExtProcCache::DefaultCacheKeyGenerator>();
+  auto cacheability = std::make_shared<Envoy::Extensions::ExtProcCache::DefaultCacheabilityChecker>();
+  auto age_calc = std::make_shared<Envoy::Extensions::ExtProcCache::DefaultCacheAgeCalculator>();
+  auto coordinator = std::make_shared<Envoy::Extensions::ExtProcCache::CacheLookupCoordinator>(store);
+
   Envoy::Extensions::ExtProcCache::ExtProcCacheServer server;
-  server.start(address);
+  server.start(address, coordinator, key_gen, cacheability, age_calc);
 
   std::cout << "ExtProcCache server listening on " << address
             << " (port " << server.port() << ")" << std::endl;
