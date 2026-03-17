@@ -147,10 +147,9 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
     (void)absl::SimpleAtoi(status_str, &status_int);
     pending_entry_.status_code = static_cast<uint32_t>(status_int);
 
-    // Request BUFFERED body so we receive the full body via mode_override
-    // on the ProcessingResponse.
-    response.mutable_mode_override()->set_response_body_mode(
-        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::BUFFERED);
+    // In FULL_DUPLEX_STREAMED mode, body chunks arrive streamed.
+    // We accumulate them for caching in onResponseBody() and pass them
+    // through via StreamedBodyResponse.
   } else {
     // Not storing — report fill failure.
     coordinator_->reportFillFailure(current_key_);
@@ -163,11 +162,18 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
 Awaitable<ProcessingResponse>
 CacheStreamHandler::onResponseBody(const envoy::service::ext_proc::v3::HttpBody& body) {
   ProcessingResponse response;
-  response.mutable_response_body();
 
   std::cerr << "[HANDLER] onResponseBody: storing_=" << storing_
             << " body_size=" << body.body().size()
             << " end_of_stream=" << body.end_of_stream() << std::endl;
+
+  // In FULL_DUPLEX_STREAMED mode, use StreamedBodyResponse to pass the body
+  // through to the downstream/upstream.
+  auto* body_mutation =
+      response.mutable_response_body()->mutable_response()->mutable_body_mutation();
+  auto* streamed = body_mutation->mutable_streamed_response();
+  streamed->set_body(body.body());
+  streamed->set_end_of_stream(body.end_of_stream());
 
   if (!storing_) {
     co_return response;

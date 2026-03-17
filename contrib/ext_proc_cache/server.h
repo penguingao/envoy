@@ -3,6 +3,7 @@
 #include <coroutine>
 #include <memory>
 
+#include "envoy/extensions/filters/http/ext_proc/v3/processing_mode.pb.h"
 #include "envoy/service/ext_proc/v3/external_processor.grpc.pb.h"
 #include "envoy/service/ext_proc/v3/external_processor.pb.h"
 

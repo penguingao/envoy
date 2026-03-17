@@ -92,8 +92,8 @@ public:
     ext_proc_config.mutable_grpc_service()->mutable_timeout()->CopyFrom(
         Protobuf::util::TimeUtil::SecondsToDuration(5));
 
-    // The cache server needs to see request headers, response headers, and
-    // the response body (BUFFERED so it receives the complete body for caching).
+    // The cache server requires FULL_DUPLEX_STREAMED mode for the response body.
+    // This mode also requires trailer modes to be set to SEND.
     auto* processing_mode = ext_proc_config.mutable_processing_mode();
     processing_mode->set_request_header_mode(
         envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::SEND);
@@ -102,11 +102,11 @@ public:
     processing_mode->set_request_body_mode(
         envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::NONE);
     processing_mode->set_response_body_mode(
-        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::BUFFERED);
+        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::FULL_DUPLEX_STREAMED);
     processing_mode->set_request_trailer_mode(
-        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::SKIP);
+        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::SEND);
     processing_mode->set_response_trailer_mode(
-        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::SKIP);
+        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::SEND);
 
     envoy::extensions::filters::network::http_connection_manager::v3::HttpFilter ext_proc_filter;
     ext_proc_filter.set_name("envoy.filters.http.ext_proc");

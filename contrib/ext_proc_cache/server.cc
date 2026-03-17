@@ -59,11 +59,30 @@ void ExtProcCacheReactor::OnCancel() {
 void ExtProcCacheReactor::OnDone() { delete this; }
 
 Task ExtProcCacheReactor::run() {
+  bool first_message = true;
   while (true) {
     bool read_ok = co_await ReadAwaitable{this, &request_};
     if (!read_ok) {
       std::cerr << "[EXT_PROC_CACHE] Read failed, finishing stream" << std::endl;
       break;
+    }
+
+    // Validate that the first message has FULL_DUPLEX_STREAMED mode for the
+    // response body. The protocol_config is only present on the first request.
+    if (first_message) {
+      first_message = false;
+      if (request_.has_protocol_config()) {
+        const auto& config = request_.protocol_config();
+        if (config.response_body_mode() !=
+            envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::FULL_DUPLEX_STREAMED) {
+          std::cerr << "[EXT_PROC_CACHE] Error: response_body_mode must be FULL_DUPLEX_STREAMED, "
+                    << "got " << config.response_body_mode() << std::endl;
+          Finish(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                              "ext_proc_cache requires response_body_mode to be "
+                              "FULL_DUPLEX_STREAMED"));
+          co_return;
+        }
+      }
     }
 
     std::cerr << "[EXT_PROC_CACHE] Received request: " << request_.request_case() << std::endl;
