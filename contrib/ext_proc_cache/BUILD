@@ -1,4 +1,4 @@
-load("//bazel:envoy_build_system.bzl", "envoy_cc_binary", "envoy_cc_library", "envoy_contrib_package")
+load("//bazel:envoy_build_system.bzl", "envoy_cc_binary", "envoy_cc_library", "envoy_cc_test", "envoy_contrib_package")
 
 licenses(["notice"])  # Apache 2
 
@@ -118,5 +118,25 @@ envoy_cc_binary(
         ":cacheability_checker_lib",
         ":in_memory_cache_store_lib",
         ":server_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "ext_proc_cache_integration_test",
+    size = "large",
+    srcs = ["ext_proc_cache_integration_test.cc"],
+    deps = [
+        ":cache_age_calculator_lib",
+        ":cache_key_generator_lib",
+        ":cache_lookup_coordinator_lib",
+        ":cacheability_checker_lib",
+        ":in_memory_cache_store_lib",
+        ":server_lib",
+        "//source/common/protobuf:utility_lib",
+        "//source/extensions/filters/http/ext_proc:config",
+        "//test/integration:http_integration_lib",
+        "//test/test_common:utility_lib",
+        "@envoy_api//envoy/extensions/filters/http/ext_proc/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
     ],
 )

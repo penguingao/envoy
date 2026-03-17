@@ -62,13 +62,17 @@ Task ExtProcCacheReactor::run() {
   while (true) {
     bool read_ok = co_await ReadAwaitable{this, &request_};
     if (!read_ok) {
+      std::cerr << "[EXT_PROC_CACHE] Read failed, finishing stream" << std::endl;
       break;
     }
 
+    std::cerr << "[EXT_PROC_CACHE] Received request: " << request_.request_case() << std::endl;
     response_ = co_await handleRequest(request_);
+    std::cerr << "[EXT_PROC_CACHE] Sending response: " << response_.response_case() << std::endl;
 
     bool write_ok = co_await WriteAwaitable{this, &response_};
     if (!write_ok) {
+      std::cerr << "[EXT_PROC_CACHE] Write failed, finishing stream" << std::endl;
       break;
     }
   }

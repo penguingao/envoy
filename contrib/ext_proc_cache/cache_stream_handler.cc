@@ -2,6 +2,8 @@
 
 #include "envoy/service/ext_proc/v3/external_processor.pb.h"
 
+#include <iostream>
+
 #include "absl/strings/numbers.h"
 
 namespace Envoy {
@@ -24,9 +26,14 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
 
   // Generate cache key.
   current_key_ = key_gen_->generateKey(proto_headers);
+  std::cerr << "[HANDLER] onRequestHeaders: key=" << current_key_ << std::endl;
+  for (const auto& h : proto_headers.headers()) {
+    std::cerr << "[HANDLER]   " << h.key() << ": " << h.value() << std::endl;
+  }
 
   // Check request cacheability.
   auto req_cacheability = cacheability_->requestCacheability(proto_headers);
+  std::cerr << "[HANDLER] req_cacheability=" << static_cast<int>(req_cacheability) << std::endl;
   if (req_cacheability == RequestCacheability::Bypass) {
     // Not cacheable — just continue.
     response.mutable_request_headers();
@@ -35,6 +42,9 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
 
   // Coordinated lookup.
   auto lookup_result = co_await coordinator_->lookup(current_key_, deadline_);
+
+  std::cerr << "[HANDLER] lookup status=" << static_cast<int>(lookup_result.status)
+            << " has_entry=" << lookup_result.entry.has_value() << std::endl;
 
   switch (lookup_result.status) {
   case LookupStatus::Hit: {
@@ -46,6 +56,9 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
                                                    entry.response_headers, entry.body.size(),
                                                    entry.response_time, now);
 
+    std::cerr << "[HANDLER] usability: status=" << static_cast<int>(usability.status)
+              << " age=" << usability.age.count()
+              << " ttl=" << usability.ttl.count() << std::endl;
     if (usability.status == CacheEntryStatus::Ok) {
       // Serve from cache via ImmediateResponse.
       auto* immediate = response.mutable_immediate_response();
@@ -105,15 +118,23 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
   ProcessingResponse response;
   response.mutable_response_headers();
 
+  std::cerr << "[HANDLER] onResponseHeaders: is_filler_=" << is_filler_ << std::endl;
+
   if (!is_filler_) {
     return response;
   }
 
   const auto& proto_headers = headers.headers();
+  std::cerr << "[HANDLER] Response headers count: " << proto_headers.headers_size() << std::endl;
+  for (const auto& h : proto_headers.headers()) {
+    std::cerr << "[HANDLER]   " << h.key() << ": " << h.value() << std::endl;
+  }
 
   // Check response cacheability.
   auto resp_cacheability =
       cacheability_->responseCacheability(saved_request_headers_, proto_headers);
+
+  std::cerr << "[HANDLER] resp_cacheability=" << static_cast<int>(resp_cacheability) << std::endl;
 
   if (resp_cacheability == ResponseCacheability::StoreFullResponse) {
     storing_ = true;
@@ -144,6 +165,10 @@ CacheStreamHandler::onResponseBody(const envoy::service::ext_proc::v3::HttpBody&
   ProcessingResponse response;
   response.mutable_response_body();
 
+  std::cerr << "[HANDLER] onResponseBody: storing_=" << storing_
+            << " body_size=" << body.body().size()
+            << " end_of_stream=" << body.end_of_stream() << std::endl;
+
   if (!storing_) {
     co_return response;
   }
@@ -152,8 +177,12 @@ CacheStreamHandler::onResponseBody(const envoy::service::ext_proc::v3::HttpBody&
 
   if (body.end_of_stream()) {
     // Store the entry.
+    std::cerr << "[HANDLER] Storing entry: key=" << current_key_
+              << " body_size=" << pending_entry_.body.size()
+              << " status_code=" << pending_entry_.status_code << std::endl;
     auto store_ok =
         co_await coordinator_->store()->store(current_key_, pending_entry_);
+    std::cerr << "[HANDLER] Store result: " << store_ok << std::endl;
     if (store_ok) {
       coordinator_->reportFillSuccess(current_key_, pending_entry_);
     } else {

@@ -15,6 +15,10 @@ namespace ExtProcCache {
 std::string getHeader(const ProtoHeaderMap& headers, absl::string_view name) {
   for (const auto& header : headers.headers()) {
     if (header.key() == name) {
+      // The ext_proc filter populates raw_value (bytes) rather than value (string).
+      if (!header.raw_value().empty()) {
+        return header.raw_value();
+      }
       return header.value();
     }
   }
