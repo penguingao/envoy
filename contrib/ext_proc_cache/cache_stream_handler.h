@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "envoy/service/ext_proc/v3/external_processor.pb.h"
@@ -32,8 +33,9 @@ public:
   Awaitable<ProcessingResponse>
   onRequestHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers);
 
-  // Sync: decides whether to cache, sets mode_override for body.
-  ProcessingResponse onResponseHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers);
+  // Handles response headers. May co_await store on 304 revalidation.
+  Awaitable<ProcessingResponse>
+  onResponseHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers);
 
   // May co_await store on end_of_stream.
   Awaitable<ProcessingResponse>
@@ -57,7 +59,9 @@ private:
   std::string current_key_;
   bool is_filler_ = false;
   bool storing_ = false;
+  bool validating_ = false;
   CachedEntry pending_entry_;
+  std::optional<CachedEntry> stale_entry_;
   ProtoHeaderMap saved_request_headers_;
 };
 

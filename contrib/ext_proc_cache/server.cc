@@ -103,7 +103,7 @@ ExtProcCacheReactor::handleRequest(const ProcessingRequest& request) {
   if (request.has_request_headers()) {
     co_return co_await handler_->onRequestHeaders(request.request_headers());
   } else if (request.has_response_headers()) {
-    co_return handler_->onResponseHeaders(request.response_headers());
+    co_return co_await handler_->onResponseHeaders(request.response_headers());
   } else if (request.has_response_body()) {
     co_return co_await handler_->onResponseBody(request.response_body());
   } else if (request.has_response_trailers()) {

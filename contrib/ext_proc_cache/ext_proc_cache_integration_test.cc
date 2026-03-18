@@ -309,6 +309,118 @@ TEST_P(ExtProcCacheIntegrationTest, DifferentPathsDifferentCacheEntries) {
   }
 }
 
+// Verifies that a cache entry with no-cache triggers revalidation with the
+// upstream on every request instead of being served from cache.
+TEST_P(ExtProcCacheIntegrationTest, StaleCacheEntryRequiresRevalidation) {
+  initializeWithExtProc();
+
+  const std::string request_path = "/test/stale";
+  const std::string original_body = "original response";
+  const std::string revalidated_body = "revalidated response";
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},
+      {":path", request_path},
+      {":scheme", "http"},
+      {":authority", "cache-test-host"}};
+
+  // --- First request: cache miss, store with no-cache (always requires revalidation) ---
+  {
+    Http::TestResponseHeaderMapImpl upstream_response_headers{
+        {":status", "200"},
+        {"cache-control", "no-cache"},
+        {"date", httpDateNow()},
+        {"content-length", std::to_string(original_body.size())}};
+    auto response =
+        sendRequestGetFromUpstream(request_headers, original_body, upstream_response_headers);
+    EXPECT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    EXPECT_EQ(original_body, response->body());
+  }
+  resetUpstreamConnection();
+
+  // Entry should be in the store.
+  EXPECT_EQ(store_->size(), 1);
+
+  // --- Second request: entry requires revalidation, must go to upstream ---
+  {
+    Http::TestResponseHeaderMapImpl upstream_response_headers{
+        {":status", "200"},
+        {"cache-control", "public, max-age=3600"},
+        {"date", httpDateNow()},
+        {"content-length", std::to_string(revalidated_body.size())}};
+    auto response =
+        sendRequestGetFromUpstream(request_headers, revalidated_body, upstream_response_headers);
+    EXPECT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    // Should get the fresh upstream response, not the stale cached one.
+    EXPECT_EQ(revalidated_body, response->body());
+  }
+}
+
+// Verifies that conditional revalidation with a 304 response refreshes headers
+// but serves the original cached body.
+TEST_P(ExtProcCacheIntegrationTest, ConditionalRevalidation304) {
+  initializeWithExtProc();
+
+  const std::string request_path = "/test/conditional";
+  const std::string cached_body = "cached body content";
+  const std::string original_date = httpDateNow();
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},
+      {":path", request_path},
+      {":scheme", "http"},
+      {":authority", "cache-test-host"}};
+
+  // --- First request: cache miss, store with no-cache + etag ---
+  {
+    Http::TestResponseHeaderMapImpl upstream_response_headers{
+        {":status", "200"},
+        {"cache-control", "no-cache"},
+        {"etag", "\"v1\""},
+        {"date", original_date},
+        {"content-length", std::to_string(cached_body.size())}};
+    auto response =
+        sendRequestGetFromUpstream(request_headers, cached_body, upstream_response_headers);
+    EXPECT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    EXPECT_EQ(cached_body, response->body());
+  }
+  resetUpstreamConnection();
+  EXPECT_EQ(store_->size(), 1);
+
+  // --- Second request: upstream returns 304, body served from cache ---
+  {
+    auto response = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+    // The request should reach upstream with conditional headers.
+    ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_,
+                                                           fake_upstream_connection_));
+    ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+    ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+
+    // Verify the ext_proc server injected If-None-Match.
+    EXPECT_EQ("\"v1\"", upstream_request_->headers()
+                            .get(Http::LowerCaseString("if-none-match"))[0]
+                            ->value()
+                            .getStringView());
+
+    // Upstream responds with 304 Not Modified and a refreshed date.
+    const std::string new_date = httpDateNow();
+    Http::TestResponseHeaderMapImpl not_modified_headers{
+        {":status", "304"},
+        {"date", new_date},
+        {"etag", "\"v1\""},
+        {"cache-control", "no-cache"}};
+    upstream_request_->encodeHeaders(not_modified_headers, true);
+
+    ASSERT_TRUE(response->waitForEndStream());
+    EXPECT_TRUE(response->complete());
+    // Should get 200 with the original cached body, not a 304.
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    EXPECT_EQ(cached_body, response->body());
+  }
+}
+
 } // namespace
 } // namespace ExtProcCache
 } // namespace Extensions
