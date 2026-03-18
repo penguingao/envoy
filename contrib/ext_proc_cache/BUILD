@@ -14,6 +14,7 @@ envoy_cc_library(
     srcs = ["cache_types.cc"],
     hdrs = ["cache_types.h"],
     deps = [
+        ":awaitable_lib",
         "@abseil-cpp//absl/strings",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],

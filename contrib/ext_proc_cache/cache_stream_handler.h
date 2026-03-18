@@ -53,17 +53,18 @@ public:
   void onCancel();
 
 private:
-  // Build a StreamedImmediateResponse sequence for a cached entry.
+  // Build a StreamedImmediateResponse sequence by streaming body from reader.
   // First message has headers (with :status), followed by body chunks.
   // Only valid in response to request_headers.
-  std::vector<ProcessingResponse>
-  buildStreamedCacheResponse(const CachedEntry& entry,
+  Awaitable<std::vector<ProcessingResponse>>
+  buildStreamedCacheResponse(const CacheEntryMetadata& metadata, CacheBodyReader& reader,
                              std::optional<Seconds> age = std::nullopt);
 
   // Build a single ImmediateResponse for a cached entry.
   // Used in response to response_headers (where StreamedImmediateResponse
-  // is not supported).
-  static ProcessingResponse buildImmediateCacheResponse(const CachedEntry& entry);
+  // is not supported). Requires the full body as a string.
+  static ProcessingResponse buildImmediateCacheResponse(const CacheEntryMetadata& metadata,
+                                                        const std::string& body);
 
   std::shared_ptr<CacheLookupCoordinator> coordinator_;
   std::shared_ptr<CacheKeyGenerator> key_gen_;
@@ -78,7 +79,8 @@ private:
   bool storing_ = false;
   bool validating_ = false;
   CachedEntry pending_entry_;
-  std::optional<CachedEntry> stale_entry_;
+  std::optional<CacheEntryMetadata> stale_metadata_;
+  std::unique_ptr<CacheBodyReader> stale_reader_;
   ProtoHeaderMap saved_request_headers_;
 };
 

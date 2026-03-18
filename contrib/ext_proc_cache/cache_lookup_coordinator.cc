@@ -16,7 +16,10 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
   // First, check the cache store.
   auto cached = co_await store_->lookup(key);
   if (cached.has_value()) {
-    co_return CoordinatedLookupResult{LookupStatus::Hit, std::move(cached)};
+    auto& result = *cached;
+    co_return CoordinatedLookupResult{
+        LookupStatus::Hit, std::move(result.metadata),
+        result.body_reader_factory->createReader()};
   }
 
   // Cache miss. Check if there's already a fill in progress.
@@ -36,13 +39,13 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
   }
 
   if (is_filler) {
-    co_return CoordinatedLookupResult{LookupStatus::YouFill, std::nullopt};
+    co_return CoordinatedLookupResult{LookupStatus::YouFill, std::nullopt, nullptr};
   }
 
   // Another stream is filling. Check deadline.
   auto now = std::chrono::system_clock::now();
   if (now >= deadline) {
-    co_return CoordinatedLookupResult{LookupStatus::TimedOut, std::nullopt};
+    co_return CoordinatedLookupResult{LookupStatus::TimedOut, std::nullopt, nullptr};
   }
 
   // Suspend and wait for the fill to complete.
@@ -60,7 +63,7 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
       auto it = coordinator->pending_.find(key);
       if (it == coordinator->pending_.end() || !it->second.filling) {
         // Fill completed between our check and suspend. Resume immediately.
-        result = {LookupStatus::TimedOut, std::nullopt};
+        result = {LookupStatus::TimedOut, std::nullopt, nullptr};
         h.resume();
         return;
       }
@@ -73,7 +76,9 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
   co_return co_await SuspendAwaitable{this, key, deadline, {}};
 }
 
-void CacheLookupCoordinator::reportFillSuccess(const std::string& key, const CachedEntry& entry) {
+void CacheLookupCoordinator::reportFillSuccess(
+    const std::string& key, const CacheEntryMetadata& metadata,
+    std::shared_ptr<CacheBodyReaderFactory> factory) {
   std::vector<Waiter> waiters_to_resume;
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -85,10 +90,10 @@ void CacheLookupCoordinator::reportFillSuccess(const std::string& key, const Cac
     pending_.erase(it);
   }
 
-  // Resume all waiters with the cached entry.
+  // Resume all waiters with metadata and an independent body reader each.
   for (auto& waiter : waiters_to_resume) {
-    *waiter.result_ptr = CoordinatedLookupResult{LookupStatus::Hit,
-                                                 CachedEntry(entry)};
+    *waiter.result_ptr = CoordinatedLookupResult{
+        LookupStatus::Hit, CacheEntryMetadata(metadata), factory->createReader()};
     waiter.handle.resume();
   }
 }
@@ -119,7 +124,7 @@ void CacheLookupCoordinator::reportFillFailure(const std::string& key) {
                            [next_filler](const Waiter& w) { return &w == next_filler; }),
             pk.waiters.end());
         // Resume filler outside the lock.
-        *filler_copy.result_ptr = CoordinatedLookupResult{LookupStatus::YouFill, std::nullopt};
+        *filler_copy.result_ptr = CoordinatedLookupResult{LookupStatus::YouFill, std::nullopt, nullptr};
         filler_copy.handle.resume();
         return;
       }
@@ -131,7 +136,7 @@ void CacheLookupCoordinator::reportFillFailure(const std::string& key) {
   }
 
   for (auto& waiter : waiters_to_timeout) {
-    *waiter.result_ptr = CoordinatedLookupResult{LookupStatus::TimedOut, std::nullopt};
+    *waiter.result_ptr = CoordinatedLookupResult{LookupStatus::TimedOut, std::nullopt, nullptr};
     waiter.handle.resume();
   }
 }
@@ -148,7 +153,7 @@ void CacheLookupCoordinator::cancelWaiter(const std::string& key, std::coroutine
     auto wit = std::find_if(pk.waiters.begin(), pk.waiters.end(),
                             [handle](const Waiter& w) { return w.handle == handle; });
     if (wit != pk.waiters.end()) {
-      *wit->result_ptr = CoordinatedLookupResult{LookupStatus::Cancelled, std::nullopt};
+      *wit->result_ptr = CoordinatedLookupResult{LookupStatus::Cancelled, std::nullopt, nullptr};
       wit->handle.resume();
       pk.waiters.erase(wit);
     }
@@ -190,7 +195,7 @@ void CacheLookupCoordinator::releaseAll(const std::string& key) {
   }
 
   for (auto& waiter : waiters_to_release) {
-    *waiter.result_ptr = CoordinatedLookupResult{LookupStatus::TimedOut, std::nullopt};
+    *waiter.result_ptr = CoordinatedLookupResult{LookupStatus::TimedOut, std::nullopt, nullptr};
     waiter.handle.resume();
   }
 }

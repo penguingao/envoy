@@ -20,8 +20,9 @@ CacheStreamHandler::CacheStreamHandler(std::shared_ptr<CacheLookupCoordinator> c
       cacheability_(std::move(cacheability)), age_calc_(std::move(age_calc)),
       deadline_(deadline), chunk_size_(chunk_size) {}
 
-std::vector<ProcessingResponse>
-CacheStreamHandler::buildStreamedCacheResponse(const CachedEntry& entry,
+Awaitable<std::vector<ProcessingResponse>>
+CacheStreamHandler::buildStreamedCacheResponse(const CacheEntryMetadata& metadata,
+                                               CacheBodyReader& reader,
                                                std::optional<Seconds> age) {
   std::vector<ProcessingResponse> responses;
 
@@ -34,10 +35,10 @@ CacheStreamHandler::buildStreamedCacheResponse(const CachedEntry& entry,
   // Add :status pseudo-header.
   auto* status_h = header_map->add_headers();
   status_h->set_key(":status");
-  status_h->set_raw_value(std::to_string(entry.status_code));
+  status_h->set_raw_value(std::to_string(metadata.status_code));
 
   // Add cached response headers (skip pseudo-headers already in the entry).
-  for (const auto& header : entry.response_headers.headers()) {
+  for (const auto& header : metadata.response_headers.headers()) {
     if (!header.key().empty() && header.key()[0] == ':') {
       continue;
     }
@@ -54,44 +55,52 @@ CacheStreamHandler::buildStreamedCacheResponse(const CachedEntry& entry,
   }
 
   // If body is empty, set end_of_stream on headers.
-  if (entry.body.empty()) {
+  if (metadata.content_length == 0) {
     http_headers->set_end_of_stream(true);
     responses.push_back(std::move(header_resp));
-    return responses;
+    co_return responses;
   }
 
   responses.push_back(std::move(header_resp));
 
-  // Body chunks.
-  const size_t body_size = entry.body.size();
-  const size_t effective_chunk = (chunk_size_ > 0) ? chunk_size_ : body_size;
-
-  for (size_t offset = 0; offset < body_size; offset += effective_chunk) {
-    const size_t this_chunk = std::min(effective_chunk, body_size - offset);
-    const bool is_last = (offset + this_chunk >= body_size);
-
+  // Stream body chunks from the reader.
+  const size_t effective_chunk = (chunk_size_ > 0) ? chunk_size_ : metadata.content_length;
+  while (true) {
+    auto chunk = co_await reader.nextChunk(effective_chunk);
+    if (chunk.empty()) {
+      break;
+    }
     ProcessingResponse body_resp;
     auto* body_streamed = body_resp.mutable_streamed_immediate_response();
     auto* body_part = body_streamed->mutable_body_response();
-    body_part->set_body(entry.body.substr(offset, this_chunk));
-    body_part->set_end_of_stream(is_last);
-
+    body_part->set_body(std::move(chunk));
+    // Peek if there's more data by checking if we got less than requested.
+    // The reader returns empty when exhausted, so set eos after the loop.
     responses.push_back(std::move(body_resp));
   }
 
-  return responses;
+  // Mark the last body chunk as end_of_stream.
+  if (responses.size() > 1) {
+    responses.back()
+        .mutable_streamed_immediate_response()
+        ->mutable_body_response()
+        ->set_end_of_stream(true);
+  }
+
+  co_return responses;
 }
 
 ProcessingResponse
-CacheStreamHandler::buildImmediateCacheResponse(const CachedEntry& entry) {
+CacheStreamHandler::buildImmediateCacheResponse(const CacheEntryMetadata& metadata,
+                                                const std::string& body) {
   ProcessingResponse response;
   auto* immediate = response.mutable_immediate_response();
   immediate->mutable_status()->set_code(
-      static_cast<envoy::type::v3::StatusCode>(entry.status_code));
-  immediate->set_body(entry.body);
+      static_cast<envoy::type::v3::StatusCode>(metadata.status_code));
+  immediate->set_body(body);
 
   auto* header_mutation = immediate->mutable_headers();
-  for (const auto& header : entry.response_headers.headers()) {
+  for (const auto& header : metadata.response_headers.headers()) {
     if (!header.key().empty() && header.key()[0] == ':') {
       continue;
     }
@@ -129,36 +138,39 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
   auto lookup_result = co_await coordinator_->lookup(current_key_, deadline_);
 
   std::cerr << "[HANDLER] lookup status=" << static_cast<int>(lookup_result.status)
-            << " has_entry=" << lookup_result.entry.has_value() << std::endl;
+            << " has_entry=" << lookup_result.metadata.has_value() << std::endl;
 
   switch (lookup_result.status) {
   case LookupStatus::Hit: {
-    const auto& entry = *lookup_result.entry;
+    auto& metadata = *lookup_result.metadata;
 
     // Check freshness.
     auto now = std::chrono::system_clock::now();
     auto usability = age_calc_->calculateUsability(saved_request_headers_,
-                                                   entry.response_headers, entry.body.size(),
-                                                   entry.response_time, now);
+                                                   metadata.response_headers,
+                                                   metadata.content_length,
+                                                   metadata.response_time, now);
 
     std::cerr << "[HANDLER] usability: status=" << static_cast<int>(usability.status)
               << " age=" << usability.age.count()
               << " ttl=" << usability.ttl.count() << std::endl;
     if (usability.status == CacheEntryStatus::Ok) {
       // Serve from cache via StreamedImmediateResponse.
-      co_return buildStreamedCacheResponse(entry, usability.age);
+      co_return co_await buildStreamedCacheResponse(metadata, *lookup_result.body_reader,
+                                                    usability.age);
     }
 
     // Entry is stale/requires validation — forward to upstream with
     // conditional headers so the origin can respond with 304.
     validating_ = true;
-    stale_entry_ = entry;
+    stale_metadata_ = std::move(metadata);
+    stale_reader_ = std::move(lookup_result.body_reader);
 
     auto* headers_resp = response.mutable_request_headers();
     auto* mutation = headers_resp->mutable_response()->mutable_header_mutation();
 
     // Add If-None-Match from cached ETag.
-    const std::string etag = getHeader(entry.response_headers, "etag");
+    const std::string etag = getHeader(stale_metadata_->response_headers, "etag");
     if (!etag.empty()) {
       auto* hvo = mutation->add_set_headers();
       hvo->mutable_header()->set_key("if-none-match");
@@ -166,7 +178,8 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
     }
 
     // Add If-Modified-Since from cached Last-Modified.
-    const std::string last_modified = getHeader(entry.response_headers, "last-modified");
+    const std::string last_modified =
+        getHeader(stale_metadata_->response_headers, "last-modified");
     if (!last_modified.empty()) {
       auto* hvo = mutation->add_set_headers();
       hvo->mutable_header()->set_key("if-modified-since");
@@ -210,9 +223,9 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
             << " validating_=" << validating_ << " status=" << status_str << std::endl;
 
   // Handle 304 Not Modified during conditional revalidation.
-  if (validating_ && status_str == "304" && stale_entry_.has_value()) {
+  if (validating_ && status_str == "304" && stale_metadata_.has_value()) {
     validating_ = false;
-    auto& entry = *stale_entry_;
+    auto& metadata = *stale_metadata_;
 
     std::cerr << "[HANDLER] 304 revalidation: refreshing cached headers" << std::endl;
 
@@ -227,7 +240,7 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
           !h.raw_value().empty() ? std::string(h.raw_value()) : std::string(h.value());
       // Find and update existing header, or add new one.
       bool found = false;
-      for (auto& existing : *entry.response_headers.mutable_headers()) {
+      for (auto& existing : *metadata.response_headers.mutable_headers()) {
         if (existing.key() == h.key()) {
           existing.set_raw_value(value);
           existing.set_value(value);
@@ -236,29 +249,40 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
         }
       }
       if (!found) {
-        auto* new_header = entry.response_headers.add_headers();
+        auto* new_header = metadata.response_headers.add_headers();
         new_header->set_key(h.key());
         new_header->set_raw_value(value);
         new_header->set_value(value);
       }
     }
-    entry.response_time = std::chrono::system_clock::now();
+    metadata.response_time = std::chrono::system_clock::now();
+
+    // Read the full body from the stale reader for re-storing and serving.
+    auto body = co_await stale_reader_->readAll();
 
     // Store the refreshed entry.
-    auto store_ok = co_await coordinator_->store()->store(current_key_, entry);
+    CachedEntry refreshed_entry;
+    refreshed_entry.response_headers = metadata.response_headers;
+    refreshed_entry.trailers = metadata.trailers;
+    refreshed_entry.response_time = metadata.response_time;
+    refreshed_entry.status_code = metadata.status_code;
+    refreshed_entry.body = body;
+    auto store_ok = co_await coordinator_->store()->store(current_key_, refreshed_entry);
     std::cerr << "[HANDLER] 304 store result: " << store_ok << std::endl;
 
     // Serve the cached body with refreshed headers via ImmediateResponse.
     // (StreamedImmediateResponse is only valid in response to request_headers.)
-    auto result = buildImmediateCacheResponse(entry);
-    stale_entry_.reset();
+    auto result = buildImmediateCacheResponse(metadata, body);
+    stale_metadata_.reset();
+    stale_reader_.reset();
     co_return std::vector<ProcessingResponse>{std::move(result)};
   }
 
   // Non-304 response during validation — discard stale entry, pass through.
   if (validating_) {
     validating_ = false;
-    stale_entry_.reset();
+    stale_metadata_.reset();
+    stale_reader_.reset();
   }
 
   response.mutable_response_headers();
@@ -310,12 +334,14 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
       auto retry_result = co_await coordinator_->lookup(current_key_, deadline_);
 
       if (retry_result.status == LookupStatus::Hit) {
-        const auto& entry = *retry_result.entry;
+        const auto& metadata = *retry_result.metadata;
         std::cerr << "[HANDLER] Retry succeeded, serving from cache" << std::endl;
 
-        // Serve the retried entry via ImmediateResponse.
+        // Read the full body and serve via ImmediateResponse.
         // (StreamedImmediateResponse is only valid in response to request_headers.)
-        co_return std::vector<ProcessingResponse>{buildImmediateCacheResponse(entry)};
+        auto body = co_await retry_result.body_reader->readAll();
+        co_return std::vector<ProcessingResponse>{
+            buildImmediateCacheResponse(metadata, body)};
       }
 
       if (retry_result.status == LookupStatus::YouFill) {
@@ -362,7 +388,15 @@ CacheStreamHandler::onResponseBody(const envoy::service::ext_proc::v3::HttpBody&
         co_await coordinator_->store()->store(current_key_, pending_entry_);
     std::cerr << "[HANDLER] Store result: " << store_ok << std::endl;
     if (store_ok) {
-      coordinator_->reportFillSuccess(current_key_, pending_entry_);
+      CacheEntryMetadata metadata;
+      metadata.response_headers = pending_entry_.response_headers;
+      metadata.trailers = pending_entry_.trailers;
+      metadata.response_time = pending_entry_.response_time;
+      metadata.status_code = pending_entry_.status_code;
+      metadata.content_length = pending_entry_.body.size();
+      auto factory =
+          coordinator_->store()->createBodyReaderFactory(std::move(pending_entry_.body));
+      coordinator_->reportFillSuccess(current_key_, metadata, std::move(factory));
     } else {
       coordinator_->reportFillFailure(current_key_);
     }
@@ -388,7 +422,15 @@ CacheStreamHandler::onResponseTrailers(const envoy::service::ext_proc::v3::HttpT
   auto store_ok =
       co_await coordinator_->store()->store(current_key_, pending_entry_);
   if (store_ok) {
-    coordinator_->reportFillSuccess(current_key_, pending_entry_);
+    CacheEntryMetadata metadata;
+    metadata.response_headers = pending_entry_.response_headers;
+    metadata.trailers = pending_entry_.trailers;
+    metadata.response_time = pending_entry_.response_time;
+    metadata.status_code = pending_entry_.status_code;
+    metadata.content_length = pending_entry_.body.size();
+    auto factory =
+        coordinator_->store()->createBodyReaderFactory(std::move(pending_entry_.body));
+    coordinator_->reportFillSuccess(current_key_, metadata, std::move(factory));
   } else {
     coordinator_->reportFillFailure(current_key_);
   }

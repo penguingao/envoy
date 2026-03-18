@@ -28,7 +28,9 @@ public:
                                             std::chrono::system_clock::time_point deadline);
 
   // Called by the filler stream after successful store to CacheStore.
-  void reportFillSuccess(const std::string& key, const CachedEntry& entry);
+  // Distributes metadata + per-waiter body readers to all waiting streams.
+  void reportFillSuccess(const std::string& key, const CacheEntryMetadata& metadata,
+                         std::shared_ptr<CacheBodyReaderFactory> factory);
 
   // Called by the filler stream when upstream/store fails.
   void reportFillFailure(const std::string& key);

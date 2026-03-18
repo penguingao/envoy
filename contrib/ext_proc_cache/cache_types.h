@@ -2,10 +2,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 
 #include "envoy/config/core/v3/base.pb.h"
+
+#include "contrib/ext_proc_cache/awaitable.h"
 
 #include "absl/strings/string_view.h"
 
@@ -21,13 +24,50 @@ using OptionalDuration = std::optional<SystemTime::duration>;
 // Alias for the proto header type used throughout.
 using ProtoHeaderMap = envoy::config::core::v3::HeaderMap;
 
-// A complete cached HTTP response.
+// A complete cached HTTP response used for the write/store path.
 struct CachedEntry {
   ProtoHeaderMap response_headers;
   std::string body;
   std::optional<ProtoHeaderMap> trailers;
   SystemTime response_time; // when this was stored
   uint32_t status_code = 0; // extracted from :status
+};
+
+// Cached entry metadata — cheap to copy, no body data.
+struct CacheEntryMetadata {
+  ProtoHeaderMap response_headers;
+  std::optional<ProtoHeaderMap> trailers;
+  SystemTime response_time;
+  uint32_t status_code = 0;
+  uint64_t content_length = 0;
+};
+
+// Abstract interface for reading cached body data chunk by chunk.
+// Each reader has its own read position and is used by a single consumer.
+class CacheBodyReader {
+public:
+  virtual ~CacheBodyReader() = default;
+
+  // Returns the next chunk of body data up to max_size bytes.
+  // Returns empty string when exhausted.
+  virtual Awaitable<std::string> nextChunk(size_t max_size) = 0;
+
+  // Read all remaining body data into a single string.
+  virtual Awaitable<std::string> readAll() = 0;
+};
+
+// Factory that produces independent CacheBodyReaders from the same stored body.
+// Enables multiple coalesced waiters to each get their own reader.
+class CacheBodyReaderFactory {
+public:
+  virtual ~CacheBodyReaderFactory() = default;
+  virtual std::unique_ptr<CacheBodyReader> createReader() = 0;
+};
+
+// Result of a cache store lookup (metadata + body reader factory).
+struct CacheLookupResult {
+  CacheEntryMetadata metadata;
+  std::shared_ptr<CacheBodyReaderFactory> body_reader_factory;
 };
 
 // Result of a coordinated lookup.
@@ -40,7 +80,8 @@ enum class LookupStatus {
 
 struct CoordinatedLookupResult {
   LookupStatus status;
-  std::optional<CachedEntry> entry; // present when status == Hit
+  std::optional<CacheEntryMetadata> metadata;         // present when status == Hit
+  std::unique_ptr<CacheBodyReader> body_reader;        // present when status == Hit
 };
 
 // Whether a given cache entry is good for the current request.
