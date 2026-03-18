@@ -23,7 +23,6 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
   }
 
   // Cache miss. Check if there's already a fill in progress.
-  CoordinatedLookupResult result;
   bool is_filler = false;
 
   {
@@ -31,7 +30,6 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
     auto& pk = pending_[key];
 
     if (!pk.filling) {
-      // No fill in progress — this stream becomes the filler.
       pk.filling = true;
       pk.fill_attempts = 1;
       is_filler = true;
@@ -48,8 +46,7 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
     co_return CoordinatedLookupResult{LookupStatus::TimedOut, std::nullopt, nullptr};
   }
 
-  // Suspend and wait for the fill to complete.
-  // The coroutine will be resumed by reportFillSuccess/reportFillFailure/cancelWaiter.
+  // Suspend and wait for the fill to complete or headers to become available.
   struct SuspendAwaitable {
     CacheLookupCoordinator* coordinator;
     const std::string& key;
@@ -62,18 +59,21 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
       std::lock_guard<std::mutex> lock(coordinator->mu_);
       auto it = coordinator->pending_.find(key);
       if (it == coordinator->pending_.end() || !it->second.filling) {
-        // Fill completed between our check and suspend. Resume immediately.
         result = {LookupStatus::TimedOut, std::nullopt, nullptr};
         h.resume();
         return;
       }
-      // If headers were already released, give this late waiter a
-      // FollowingBodyReader immediately rather than suspending.
       auto& pk = it->second;
-      if (pk.headers_released && pk.shared_stream && pk.released_metadata) {
-        result = {LookupStatus::Hit,
-                  CacheEntryMetadata(*pk.released_metadata),
-                  std::make_unique<FollowingBodyReader>(pk.shared_stream)};
+      if (pk.headers_released) {
+        // Headers already committed to store. Do a store lookup to get a
+        // tailing reader for this late-arriving waiter.
+        auto lookup_result = coordinator->store_->lookup(key).syncGet();
+        if (lookup_result.has_value()) {
+          result = {LookupStatus::Hit, std::move(lookup_result->metadata),
+                    std::move(lookup_result->body_reader)};
+        } else {
+          result = {LookupStatus::TimedOut, std::nullopt, nullptr};
+        }
         h.resume();
         return;
       }
@@ -86,9 +86,7 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
   co_return co_await SuspendAwaitable{this, key, deadline, {}};
 }
 
-void CacheLookupCoordinator::reportHeadersAvailable(
-    const std::string& key, const CacheEntryMetadata& metadata,
-    std::shared_ptr<SharedBodyStream> stream) {
+void CacheLookupCoordinator::reportHeadersAvailable(const std::string& key) {
   std::vector<Waiter> waiters_to_resume;
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -98,23 +96,25 @@ void CacheLookupCoordinator::reportHeadersAvailable(
     }
     auto& pk = it->second;
     pk.headers_released = true;
-    pk.shared_stream = stream;
-    pk.released_metadata = metadata;
     waiters_to_resume = std::move(pk.waiters);
   }
 
-  // Release all waiters with metadata + a FollowingBodyReader each.
+  // Release all waiters — each gets a tailing reader from the store.
   for (auto& waiter : waiters_to_resume) {
-    *waiter.result_ptr = CoordinatedLookupResult{
-        LookupStatus::Hit, CacheEntryMetadata(metadata),
-        std::make_unique<FollowingBodyReader>(stream)};
+    auto lookup_result = store_->lookup(key).syncGet();
+    if (lookup_result.has_value()) {
+      *waiter.result_ptr = CoordinatedLookupResult{
+          LookupStatus::Hit, std::move(lookup_result->metadata),
+          std::move(lookup_result->body_reader)};
+    } else {
+      *waiter.result_ptr = CoordinatedLookupResult{
+          LookupStatus::TimedOut, std::nullopt, nullptr};
+    }
     waiter.handle.resume();
   }
 }
 
-void CacheLookupCoordinator::reportFillSuccess(
-    const std::string& key, const CacheEntryMetadata& metadata,
-    std::shared_ptr<const std::string> body) {
+void CacheLookupCoordinator::reportFillSuccess(const std::string& key) {
   std::vector<Waiter> waiters_to_resume;
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -122,17 +122,21 @@ void CacheLookupCoordinator::reportFillSuccess(
     if (it == pending_.end()) {
       return;
     }
-    // Grab any remaining waiters (late arrivals after headers were released,
-    // or all waiters if headers were never released).
     waiters_to_resume = std::move(it->second.waiters);
     pending_.erase(it);
   }
 
-  // Resume waiters with the full body.
+  // Release any late-arriving waiters with the completed entry.
   for (auto& waiter : waiters_to_resume) {
-    *waiter.result_ptr = CoordinatedLookupResult{
-        LookupStatus::Hit, CacheEntryMetadata(metadata),
-        std::make_unique<StringBodyReader>(body)};
+    auto lookup_result = store_->lookup(key).syncGet();
+    if (lookup_result.has_value()) {
+      *waiter.result_ptr = CoordinatedLookupResult{
+          LookupStatus::Hit, std::move(lookup_result->metadata),
+          std::move(lookup_result->body_reader)};
+    } else {
+      *waiter.result_ptr = CoordinatedLookupResult{
+          LookupStatus::TimedOut, std::nullopt, nullptr};
+    }
     waiter.handle.resume();
   }
 }
@@ -140,7 +144,7 @@ void CacheLookupCoordinator::reportFillSuccess(
 void CacheLookupCoordinator::reportFillFailure(const std::string& key) {
   Waiter* next_filler = nullptr;
   std::vector<Waiter> waiters_to_timeout;
-  std::shared_ptr<SharedBodyStream> stream_to_error;
+  bool should_abort = false;
 
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -152,9 +156,9 @@ void CacheLookupCoordinator::reportFillFailure(const std::string& key) {
     pk.filling = false;
 
     if (pk.headers_released) {
-      // Early-released waiters are streaming via FollowingBodyReaders.
-      // Signal error so they stop. Any late arrivals also get TimedOut.
-      stream_to_error = std::move(pk.shared_stream);
+      // Early-released waiters are streaming from the store. abortBody will
+      // signal error to their tailing readers. Late arrivals get TimedOut.
+      should_abort = true;
       waiters_to_timeout = std::move(pk.waiters);
       pending_.erase(it);
     } else {
@@ -181,8 +185,8 @@ void CacheLookupCoordinator::reportFillFailure(const std::string& key) {
     }
   }
 
-  if (stream_to_error) {
-    stream_to_error->signalError();
+  if (should_abort) {
+    store_->abortBody(key);
   }
 
   for (auto& waiter : waiters_to_timeout) {
@@ -209,9 +213,6 @@ void CacheLookupCoordinator::cancelWaiter(const std::string& key, std::coroutine
     }
   }
 
-  // If this waiter was the filler, treat as fill failure.
-  // Note: the filler is not in the waiters list, so this path handles
-  // cancellation of the filler stream via the CacheStreamHandler.
   if (was_filling) {
     reportFillFailure(key);
   }
@@ -223,7 +224,7 @@ CacheLookupCoordinator::selectNextFiller(PendingKey& pk) {
   Waiter* best = nullptr;
   for (auto& w : pk.waiters) {
     if (w.deadline <= now) {
-      continue; // expired
+      continue;
     }
     if (!best || w.deadline > best->deadline) {
       best = &w;

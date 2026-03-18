@@ -277,24 +277,17 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
 
   if (resp_cacheability == ResponseCacheability::StoreFullResponse) {
     storing_ = true;
-    pending_entry_.response_headers = proto_headers;
-    pending_entry_.response_time = std::chrono::system_clock::now();
 
     // Extract status code from :status pseudo-header.
     int status_int = 0;
     (void)absl::SimpleAtoi(status_str, &status_int);
-    pending_entry_.status_code = static_cast<uint32_t>(status_int);
 
-    // Create a shared body stream so coalesced waiters can start receiving
-    // body chunks as the filler streams them, rather than waiting for the
-    // entire body to be stored.
-    shared_stream_ = std::make_shared<SharedBodyStream>();
-
-    // Build metadata for early release. Use Content-Length if available.
-    CacheEntryMetadata early_metadata;
-    early_metadata.response_headers = proto_headers;
-    early_metadata.response_time = pending_entry_.response_time;
-    early_metadata.status_code = pending_entry_.status_code;
+    // Build metadata and commit to the store immediately. This creates a
+    // "filling" entry that tailing readers can stream from.
+    CacheEntryMetadata metadata;
+    metadata.response_headers = proto_headers;
+    metadata.response_time = std::chrono::system_clock::now();
+    metadata.status_code = static_cast<uint32_t>(status_int);
     const std::string content_length_str = getHeader(proto_headers, "content-length");
     uint64_t cl = 0;
     if (!content_length_str.empty()) {
@@ -302,10 +295,12 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
     } else {
       cl = 1; // Non-zero so buildCacheHitResult doesn't set end_of_stream on headers.
     }
-    early_metadata.content_length = cl;
+    metadata.content_length = cl;
 
-    // Release waiters immediately with headers + FollowingBodyReaders.
-    coordinator_->reportHeadersAvailable(current_key_, early_metadata, shared_stream_);
+    co_await coordinator_->store()->storeHeaders(current_key_, metadata);
+
+    // Release waiters — each gets a tailing reader from the store.
+    coordinator_->reportHeadersAvailable(current_key_);
   } else {
     // Not storing — report fill failure so the coordinator can promote the
     // next waiter to filler.
@@ -367,39 +362,14 @@ CacheStreamHandler::onResponseBody(const envoy::service::ext_proc::v3::HttpBody&
     co_return response;
   }
 
-  pending_entry_.body.append(body.body());
-
-  // Push body data to the shared stream so FollowingBodyReaders can consume
-  // it in real time.
-  if (shared_stream_) {
-    shared_stream_->append(body.body());
-  }
+  // Append body data to the store. Tailing readers are resumed automatically.
+  coordinator_->store()->appendBody(current_key_, body.body());
 
   if (body.end_of_stream()) {
-    // Signal the shared stream that no more data is coming.
-    if (shared_stream_) {
-      shared_stream_->finish();
-      shared_stream_.reset();
-    }
-    // Store the entry.
-    std::cerr << "[HANDLER] Storing entry: key=" << current_key_
-              << " body_size=" << pending_entry_.body.size()
-              << " status_code=" << pending_entry_.status_code << std::endl;
-    auto store_ok =
-        co_await coordinator_->store()->store(current_key_, pending_entry_);
-    std::cerr << "[HANDLER] Store result: " << store_ok << std::endl;
-    if (store_ok) {
-      CacheEntryMetadata metadata;
-      metadata.response_headers = pending_entry_.response_headers;
-      metadata.trailers = pending_entry_.trailers;
-      metadata.response_time = pending_entry_.response_time;
-      metadata.status_code = pending_entry_.status_code;
-      metadata.content_length = pending_entry_.body.size();
-      auto body = std::make_shared<const std::string>(std::move(pending_entry_.body));
-      coordinator_->reportFillSuccess(current_key_, metadata, std::move(body));
-    } else {
-      coordinator_->reportFillFailure(current_key_);
-    }
+    // Mark the entry as complete in the store.
+    coordinator_->store()->finishBody(current_key_);
+    std::cerr << "[HANDLER] Body complete for key=" << current_key_ << std::endl;
+    coordinator_->reportFillSuccess(current_key_);
     storing_ = false;
     is_filler_ = false;
   }
@@ -416,29 +386,9 @@ CacheStreamHandler::onResponseTrailers(const envoy::service::ext_proc::v3::HttpT
     co_return response;
   }
 
-  pending_entry_.trailers = trailers.trailers();
-
-  // Signal the shared stream that no more body data is coming.
-  if (shared_stream_) {
-    shared_stream_->finish();
-    shared_stream_.reset();
-  }
-
-  // Finalize and store.
-  auto store_ok =
-      co_await coordinator_->store()->store(current_key_, pending_entry_);
-  if (store_ok) {
-    CacheEntryMetadata metadata;
-    metadata.response_headers = pending_entry_.response_headers;
-    metadata.trailers = pending_entry_.trailers;
-    metadata.response_time = pending_entry_.response_time;
-    metadata.status_code = pending_entry_.status_code;
-    metadata.content_length = pending_entry_.body.size();
-    auto body = std::make_shared<const std::string>(std::move(pending_entry_.body));
-    coordinator_->reportFillSuccess(current_key_, metadata, std::move(body));
-  } else {
-    coordinator_->reportFillFailure(current_key_);
-  }
+  // Mark the entry as complete with trailers.
+  coordinator_->store()->finishBody(current_key_, trailers.trailers());
+  coordinator_->reportFillSuccess(current_key_);
   storing_ = false;
   is_filler_ = false;
 
@@ -446,11 +396,12 @@ CacheStreamHandler::onResponseTrailers(const envoy::service::ext_proc::v3::HttpT
 }
 
 void CacheStreamHandler::onCancel() {
-  if (shared_stream_) {
-    shared_stream_->signalError();
-    shared_stream_.reset();
-  }
   if (is_filler_) {
+    // abortBody removes the in-progress entry and signals error to tailing
+    // readers. reportFillFailure handles retry logic for pre-header waiters.
+    if (storing_) {
+      coordinator_->store()->abortBody(current_key_);
+    }
     coordinator_->reportFillFailure(current_key_);
     is_filler_ = false;
   }

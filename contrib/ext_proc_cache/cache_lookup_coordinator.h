@@ -27,17 +27,14 @@ public:
   Awaitable<CoordinatedLookupResult> lookup(const std::string& key,
                                             std::chrono::system_clock::time_point deadline);
 
-  // Called by the filler when cacheable response headers arrive. Releases
-  // all waiters immediately with metadata + FollowingBodyReaders that tail
-  // the shared stream.
-  void reportHeadersAvailable(const std::string& key, const CacheEntryMetadata& metadata,
-                              std::shared_ptr<SharedBodyStream> stream);
+  // Called by the filler when cacheable response headers are committed to the
+  // store via storeHeaders(). Releases all waiters immediately — each gets a
+  // tailing reader from the store that follows the filler's body writes.
+  void reportHeadersAvailable(const std::string& key);
 
-  // Called by the filler stream after successful store to CacheStore.
-  // If waiters were already released via reportHeadersAvailable, just cleans
-  // up the pending entry. Otherwise distributes metadata + body readers.
-  void reportFillSuccess(const std::string& key, const CacheEntryMetadata& metadata,
-                         std::shared_ptr<const std::string> body);
+  // Called by the filler after finishBody(). Releases any late-arriving waiters
+  // with the completed entry and cleans up the pending state.
+  void reportFillSuccess(const std::string& key);
 
   // Called by the filler stream when upstream/store fails.
   void reportFillFailure(const std::string& key);
@@ -60,8 +57,6 @@ private:
     size_t fill_attempts = 0;
     bool filling = false;
     bool headers_released = false;
-    std::shared_ptr<SharedBodyStream> shared_stream;
-    std::optional<CacheEntryMetadata> released_metadata; // set when headers_released
   };
 
   // Pick waiter with longest remaining deadline, skip expired.

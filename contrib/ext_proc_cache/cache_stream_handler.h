@@ -86,10 +86,9 @@ private:
   bool is_filler_ = false;
   bool storing_ = false;
   bool validating_ = false;
-  CachedEntry pending_entry_;
+  CachedEntry pending_entry_; // used only for 304 re-store path
   std::optional<CacheEntryMetadata> stale_metadata_;
   std::unique_ptr<CacheBodyReader> stale_reader_;
-  std::shared_ptr<SharedBodyStream> shared_stream_;
   ProtoHeaderMap saved_request_headers_;
 };
 

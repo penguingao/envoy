@@ -81,6 +81,16 @@ public:
     return std::move(*promise.value);
   }
 
+  // Drive the coroutine to completion synchronously and return the result.
+  // Only valid for coroutines that complete without suspending (e.g.
+  // InMemoryCacheStore operations that use co_return immediately).
+  T syncGet() {
+    if (!handle_.done()) {
+      handle_.resume();
+    }
+    return await_resume();
+  }
+
   // Factory for creating an Awaitable that is immediately ready with a value.
   static Awaitable ready(T val) {
     co_return std::move(val);
