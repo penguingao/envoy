@@ -89,6 +89,7 @@ private:
   CachedEntry pending_entry_;
   std::optional<CacheEntryMetadata> stale_metadata_;
   std::unique_ptr<CacheBodyReader> stale_reader_;
+  std::shared_ptr<SharedBodyStream> shared_stream_;
   ProtoHeaderMap saved_request_headers_;
 };
 

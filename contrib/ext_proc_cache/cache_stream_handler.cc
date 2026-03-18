@@ -285,9 +285,27 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
     (void)absl::SimpleAtoi(status_str, &status_int);
     pending_entry_.status_code = static_cast<uint32_t>(status_int);
 
-    // In FULL_DUPLEX_STREAMED mode, body chunks arrive streamed.
-    // We accumulate them for caching in onResponseBody() and pass them
-    // through via StreamedBodyResponse.
+    // Create a shared body stream so coalesced waiters can start receiving
+    // body chunks as the filler streams them, rather than waiting for the
+    // entire body to be stored.
+    shared_stream_ = std::make_shared<SharedBodyStream>();
+
+    // Build metadata for early release. Use Content-Length if available.
+    CacheEntryMetadata early_metadata;
+    early_metadata.response_headers = proto_headers;
+    early_metadata.response_time = pending_entry_.response_time;
+    early_metadata.status_code = pending_entry_.status_code;
+    const std::string content_length_str = getHeader(proto_headers, "content-length");
+    uint64_t cl = 0;
+    if (!content_length_str.empty()) {
+      (void)absl::SimpleAtoi(content_length_str, &cl);
+    } else {
+      cl = 1; // Non-zero so buildCacheHitResult doesn't set end_of_stream on headers.
+    }
+    early_metadata.content_length = cl;
+
+    // Release waiters immediately with headers + FollowingBodyReaders.
+    coordinator_->reportHeadersAvailable(current_key_, early_metadata, shared_stream_);
   } else {
     // Not storing — report fill failure so the coordinator can promote the
     // next waiter to filler.
@@ -351,7 +369,18 @@ CacheStreamHandler::onResponseBody(const envoy::service::ext_proc::v3::HttpBody&
 
   pending_entry_.body.append(body.body());
 
+  // Push body data to the shared stream so FollowingBodyReaders can consume
+  // it in real time.
+  if (shared_stream_) {
+    shared_stream_->append(body.body());
+  }
+
   if (body.end_of_stream()) {
+    // Signal the shared stream that no more data is coming.
+    if (shared_stream_) {
+      shared_stream_->finish();
+      shared_stream_.reset();
+    }
     // Store the entry.
     std::cerr << "[HANDLER] Storing entry: key=" << current_key_
               << " body_size=" << pending_entry_.body.size()
@@ -389,6 +418,12 @@ CacheStreamHandler::onResponseTrailers(const envoy::service::ext_proc::v3::HttpT
 
   pending_entry_.trailers = trailers.trailers();
 
+  // Signal the shared stream that no more body data is coming.
+  if (shared_stream_) {
+    shared_stream_->finish();
+    shared_stream_.reset();
+  }
+
   // Finalize and store.
   auto store_ok =
       co_await coordinator_->store()->store(current_key_, pending_entry_);
@@ -411,6 +446,10 @@ CacheStreamHandler::onResponseTrailers(const envoy::service::ext_proc::v3::HttpT
 }
 
 void CacheStreamHandler::onCancel() {
+  if (shared_stream_) {
+    shared_stream_->signalError();
+    shared_stream_.reset();
+  }
   if (is_filler_) {
     coordinator_->reportFillFailure(current_key_);
     is_filler_ = false;

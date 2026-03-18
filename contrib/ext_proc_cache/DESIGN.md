@@ -13,7 +13,7 @@ age/freshness.
 ExtProcCacheReactor (per-stream, gRPC coroutine reactor)
     │
     ├─ drives streaming loop: writes headers, then pulls body chunks
-    │  one at a time from CacheBodyReader
+    │  one at a time from CacheBodyReader (StringBodyReader or FollowingBodyReader)
     │
 CacheStreamHandler (per-stream, ext_proc protocol state machine)
     │
@@ -21,12 +21,13 @@ CacheStreamHandler (per-stream, ext_proc protocol state machine)
     │
 CacheLookupCoordinator (shared, coalescing + deadline-aware retry)
     │
-    ├─ distributes CacheEntryMetadata + per-waiter CacheBodyReader
-    │  via CacheBodyReaderFactory
+    ├─ on cache hit: returns metadata + StringBodyReader
+    ├─ on early release: reportHeadersAvailable() gives waiters metadata
+    │  + FollowingBodyReader tailing a SharedBodyStream
     │
 CacheStore (pluggable backend, coroutine-native)
     │
-    ├─ lookup() returns CacheEntryMetadata + CacheBodyReaderFactory
+    ├─ lookup() returns CacheEntryMetadata + CacheBodyReader
     └─ store() accepts CachedEntry (metadata + full body string)
 ```
 
@@ -48,22 +49,15 @@ class CacheStore {
   virtual Awaitable<std::optional<CacheLookupResult>> lookup(const std::string& key) = 0;
   virtual Awaitable<bool> store(const std::string& key, CachedEntry entry) = 0;
   virtual Awaitable<bool> remove(const std::string& key) = 0;
-  virtual std::shared_ptr<CacheBodyReaderFactory>
-      createBodyReaderFactory(std::string body) = 0;
 };
 ```
 
 `lookup()` returns `CacheLookupResult` containing `CacheEntryMetadata` (headers,
-status, timestamps, content_length) and a `CacheBodyReaderFactory`. The factory
-produces independent `CacheBodyReader` instances so multiple coalesced waiters
-can each stream the body at their own pace.
-
-`createBodyReaderFactory()` is called by the coordinator after a fill to produce
-a factory from the filler's accumulated body, without coupling the handler to a
-specific store implementation.
+status, timestamps, content_length) and a `CacheBodyReader`. The reader provides
+chunk-by-chunk access to the body.
 
 Default: `InMemoryCacheStore` — thread-safe LRU with mutex. Body stored as
-`shared_ptr<const string>`; readers wrap it with independent offsets.
+`shared_ptr<const string>`; lookup returns a `StringBodyReader`.
 
 ### Streaming Body Access (`cache_types.h`)
 
@@ -72,25 +66,33 @@ class CacheBodyReader {
   virtual Awaitable<std::string> nextChunk(size_t max_size) = 0;
   virtual Awaitable<std::string> readAll() = 0;
 };
-
-class CacheBodyReaderFactory {
-  virtual std::unique_ptr<CacheBodyReader> createReader() = 0;
-};
 ```
 
-`CacheBodyReader` provides chunk-by-chunk access to cached body data. Each
-reader has its own read position and is used by a single consumer. The interface
-supports future disk/SSD-backed stores that should not load entire responses into
-memory.
+Implementations:
 
-- `nextChunk(max_size)` returns the next chunk up to `max_size` bytes; empty
-  string when exhausted.
-- `readAll()` reads all remaining data into one string. Used for
-  `ImmediateResponse` paths (304, 5xx retry) that need the full body.
+- **`StringBodyReader`** — reads from a `shared_ptr<const string>` with an
+  independent offset. Used by the in-memory store and the coordinator for
+  distributing completed bodies to late waiters.
 
-`CacheBodyReaderFactory` produces independent readers from the same stored body.
-For in-memory: wraps `shared_ptr<const string>`, each reader has its own offset.
-For disk: each reader would open its own file handle.
+- **`FollowingBodyReader`** — tails a `SharedBodyStream` being written by a
+  filler. Suspends when caught up to the write frontier, resumes when the
+  filler appends more data or signals completion. Used for early release of
+  coalesced waiters.
+
+### SharedBodyStream (`cache_types.h`)
+
+Shared append-only buffer written by the filler and read by multiple
+`FollowingBodyReaders` at independent offsets:
+
+- `append(data)` — appends data, resumes all waiting readers.
+- `finish()` — signals end-of-stream, resumes all waiting readers.
+- `signalError()` — signals failure, resumes all waiting readers (they
+  return empty, terminating the stream).
+
+Synchronization: mutex protects buffer/state; coroutine handles are collected
+under the lock and resumed outside it to avoid deadlock. This mirrors the
+existing pattern in `reportFillSuccess` where the filler's thread resumes
+waiter coroutines that call `StartWrite` (thread-safe in gRPC callback API).
 
 ### CacheKeyGenerator (`cache_key_generator.h`) — sync
 
@@ -138,12 +140,36 @@ lookups for the same key through a single cache fill:
 1. **lookup(key, deadline)**: checks store → hit returns metadata + body reader;
    miss with no pending fill designates caller as filler (`YouFill`); miss with
    fill in progress suspends the coroutine.
-2. **reportFillSuccess(key, metadata, factory)**: gives each waiter a copy of
-   the metadata and an independent `CacheBodyReader` from the factory.
-3. **reportFillFailure(key)**: selects next filler by longest remaining
-   deadline; if retries exhausted, releases all waiters with `TimedOut`.
-4. **cancelWaiter(key, handle)**: removes waiter; if filler, triggers fill
+2. **reportHeadersAvailable(key, metadata, stream)**: called by the filler when
+   cacheable response headers arrive. Releases all waiters immediately with
+   metadata + `FollowingBodyReader` tailing the `SharedBodyStream`. Waiters
+   start receiving body chunks in real time as the filler streams them from
+   upstream.
+3. **reportFillSuccess(key, metadata, body)**: if waiters were already released
+   via `reportHeadersAvailable`, just cleans up the pending entry. Otherwise
+   (fallback), distributes metadata + `StringBodyReader` to waiters.
+4. **reportFillFailure(key)**: if waiters were already released, signals error
+   on the `SharedBodyStream` (readers return empty). If not yet released,
+   selects next filler by longest remaining deadline; if retries exhausted,
+   releases all waiters with `TimedOut`.
+5. **cancelWaiter(key, handle)**: removes waiter; if filler, triggers fill
    failure path.
+
+### Early Release Flow
+
+```
+Time →
+Filler:   [req_headers] → [resp_headers: cacheable!] → [body₁] → [body₂] → [eos] → [store]
+                                   │                       │         │         │
+                           reportHeadersAvailable     append()  append()  finish()
+                                   │
+Waiter A: [suspended]────────→ [released: headers] → [body₁] → [body₂] → [eos]
+Waiter B: [suspended]────────→ [released: headers] → [body₁] → [body₂] → [eos]
+```
+
+Waiters receive headers and start streaming body chunks at the same pace as
+the filler. `FollowingBodyReader::nextChunk()` suspends when caught up and
+resumes when the filler appends more data.
 
 ## Streaming Mode
 
@@ -167,8 +193,9 @@ The reactor drives the streaming loop:
 3. Write each chunk as `StreamedImmediateResponse` with `body_response`.
 4. Use one-chunk-ahead reading to set `end_of_stream` on the last chunk.
 
-Only one body chunk is in memory at a time. For empty bodies, `end_of_stream`
-is set on the headers response.
+Only one body chunk is in memory at a time. For `FollowingBodyReader`, the
+`nextChunk()` call suspends when the reader catches up to the filler, resuming
+when more data arrives.
 
 Cache hits from `response_headers` (304 revalidation, 5xx retry) use
 `ImmediateResponse` since `StreamedImmediateResponse` is only valid in response
@@ -186,8 +213,9 @@ body.
   - **304 during validation**: refreshes cached headers per RFC 7234 §4.3.4,
     stores the updated entry, and serves the cached body via
     `ImmediateResponse`.
-  - **Filler with cacheable response**: starts accumulating body via
-    `StreamedBodyResponse` (pass-through + buffer for caching).
+  - **Filler with cacheable response**: creates `SharedBodyStream`, calls
+    `reportHeadersAvailable` to release waiters immediately, starts
+    accumulating body.
   - **Filler with 5xx error**: calls `reportFillFailure`, then re-enqueues as
     a waiter via `coordinator_->lookup()`. If the retry filler succeeds, serves
     the cached entry via `ImmediateResponse`; otherwise falls through with the
@@ -196,23 +224,50 @@ body.
     `reportFillFailure` and passes through the response (valid for the client,
     just not cached).
 - **onResponseBody**: passes body through via `StreamedBodyResponse`; if
-  storing, buffers body; on `end_of_stream`, stores entry and reports fill
-  success with metadata + body reader factory.
-- **onResponseTrailers**: if storing, saves trailers, finalizes and stores.
-- **onCancel**: reports fill failure if filler.
+  storing, buffers body and pushes to `SharedBodyStream`; on `end_of_stream`,
+  finishes the shared stream, stores entry, and reports fill success.
+- **onResponseTrailers**: if storing, finishes the shared stream, saves
+  trailers, stores entry, and reports fill success.
+- **onCancel**: signals error on `SharedBodyStream` if active; reports fill
+  failure if filler.
+
+## Future Considerations
+
+### Decoupling Fill Lifetime from ext_proc Stream
+
+Currently, if the filler's downstream client resets the HTTP request, Envoy
+cancels the ext_proc stream, which triggers `onCancel` and abandons the cache
+fill mid-stream. Coalesced waiters that were already released via
+`reportHeadersAvailable` receive a truncated body (error signal on the
+`SharedBodyStream`). Waiters not yet released fall back to the retry path.
+
+This is a limitation of the ext_proc architecture: the upstream response data
+flows through the ext_proc filter, so when the filter's stream dies, the data
+source dies. The ext_proc server cannot unilaterally keep the fill alive.
+
+Possible solutions (requiring Envoy filter changes):
+- **Filter-level fill detach**: configure the ext_proc filter to keep the
+  upstream connection alive and forward body data even after the downstream
+  client disconnects, if the ext_proc server indicates the fill should continue.
+- **Server-side upstream fetch**: the ext_proc server fetches directly from the
+  upstream (bypassing Envoy's ext_proc filter for the fill), so the fill is
+  independent of any client stream. This fundamentally changes the architecture.
+
+For now, the server relies on fast retry: the coordinator promotes the next
+waiter to filler quickly so a re-fetch starts immediately.
 
 ## File Layout
 
 | File | Contents |
 |------|----------|
 | `awaitable.h` | `Awaitable<T>` coroutine return type |
-| `cache_types.h/.cc` | `CachedEntry`, `CacheEntryMetadata`, `CacheBodyReader`, `CacheBodyReaderFactory`, `CacheLookupResult`, `CoordinatedLookupResult`, `LookupStatus`, cache-control parsing, proto header helpers |
-| `cache_store.h` | `CacheStore` abstract interface (lookup returns metadata + reader factory) |
-| `in_memory_cache_store.h/.cc` | `InMemoryCacheStore`, `InMemoryBodyReader`, `InMemoryBodyReaderFactory` |
+| `cache_types.h/.cc` | `CachedEntry`, `CacheEntryMetadata`, `CacheBodyReader`, `StringBodyReader`, `SharedBodyStream`, `FollowingBodyReader`, `CacheLookupResult`, `CoordinatedLookupResult`, `LookupStatus`, cache-control parsing, proto header helpers |
+| `cache_store.h` | `CacheStore` abstract interface (lookup returns metadata + reader) |
+| `in_memory_cache_store.h/.cc` | `InMemoryCacheStore` (thread-safe LRU) |
 | `cache_key_generator.h` | `CacheKeyGenerator` interface + `DefaultCacheKeyGenerator` |
 | `cacheability_checker.h` | `CacheabilityChecker` interface + `DefaultCacheabilityChecker` |
 | `cache_age_calculator.h` | `CacheAgeCalculator` interface + `DefaultCacheAgeCalculator` |
-| `cache_lookup_coordinator.h/.cc` | `CacheLookupCoordinator` (shared coalescing layer, distributes per-waiter readers) |
+| `cache_lookup_coordinator.h/.cc` | `CacheLookupCoordinator` (coalescing, early release via `reportHeadersAvailable`, retry) |
 | `cache_stream_handler.h/.cc` | `CacheStreamHandler`, `HandleResult` (per-stream ext_proc logic) |
 | `server.h/.cc` | Reactor/service with `FULL_DUPLEX_STREAMED` validation and lazy body streaming loop |
 | `main.cc` | Wires default implementations |

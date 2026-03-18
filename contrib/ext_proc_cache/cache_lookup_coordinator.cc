@@ -76,6 +76,31 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
   co_return co_await SuspendAwaitable{this, key, deadline, {}};
 }
 
+void CacheLookupCoordinator::reportHeadersAvailable(
+    const std::string& key, const CacheEntryMetadata& metadata,
+    std::shared_ptr<SharedBodyStream> stream) {
+  std::vector<Waiter> waiters_to_resume;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = pending_.find(key);
+    if (it == pending_.end()) {
+      return;
+    }
+    auto& pk = it->second;
+    pk.headers_released = true;
+    pk.shared_stream = stream;
+    waiters_to_resume = std::move(pk.waiters);
+  }
+
+  // Release all waiters with metadata + a FollowingBodyReader each.
+  for (auto& waiter : waiters_to_resume) {
+    *waiter.result_ptr = CoordinatedLookupResult{
+        LookupStatus::Hit, CacheEntryMetadata(metadata),
+        std::make_unique<FollowingBodyReader>(stream)};
+    waiter.handle.resume();
+  }
+}
+
 void CacheLookupCoordinator::reportFillSuccess(
     const std::string& key, const CacheEntryMetadata& metadata,
     std::shared_ptr<const std::string> body) {
@@ -86,11 +111,17 @@ void CacheLookupCoordinator::reportFillSuccess(
     if (it == pending_.end()) {
       return;
     }
+    if (it->second.headers_released) {
+      // Waiters already released via reportHeadersAvailable. Just clean up.
+      pending_.erase(it);
+      return;
+    }
+    // Fallback: waiters not yet released (e.g. non-cacheable turned cacheable
+    // at store time). Distribute full body.
     waiters_to_resume = std::move(it->second.waiters);
     pending_.erase(it);
   }
 
-  // Resume all waiters with metadata and an independent body reader each.
   for (auto& waiter : waiters_to_resume) {
     *waiter.result_ptr = CoordinatedLookupResult{
         LookupStatus::Hit, CacheEntryMetadata(metadata),
@@ -102,6 +133,7 @@ void CacheLookupCoordinator::reportFillSuccess(
 void CacheLookupCoordinator::reportFillFailure(const std::string& key) {
   Waiter* next_filler = nullptr;
   std::vector<Waiter> waiters_to_timeout;
+  std::shared_ptr<SharedBodyStream> stream_to_error;
 
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -112,28 +144,37 @@ void CacheLookupCoordinator::reportFillFailure(const std::string& key) {
     auto& pk = it->second;
     pk.filling = false;
 
-    if (pk.fill_attempts < max_fill_retries_ && !pk.waiters.empty()) {
-      next_filler = selectNextFiller(pk);
-      if (next_filler) {
-        pk.filling = true;
-        pk.fill_attempts++;
-        // Copy out the filler info before modifying the vector.
-        Waiter filler_copy = *next_filler;
-        // Remove filler from waiters.
-        pk.waiters.erase(
-            std::remove_if(pk.waiters.begin(), pk.waiters.end(),
-                           [next_filler](const Waiter& w) { return &w == next_filler; }),
-            pk.waiters.end());
-        // Resume filler outside the lock.
-        *filler_copy.result_ptr = CoordinatedLookupResult{LookupStatus::YouFill, std::nullopt, nullptr};
-        filler_copy.handle.resume();
-        return;
+    if (pk.headers_released) {
+      // Waiters already released and streaming. Signal error on the stream
+      // so FollowingBodyReaders return empty and stop.
+      stream_to_error = std::move(pk.shared_stream);
+      pending_.erase(it);
+    } else {
+      // Waiters not yet released — existing retry logic.
+      if (pk.fill_attempts < max_fill_retries_ && !pk.waiters.empty()) {
+        next_filler = selectNextFiller(pk);
+        if (next_filler) {
+          pk.filling = true;
+          pk.fill_attempts++;
+          Waiter filler_copy = *next_filler;
+          pk.waiters.erase(
+              std::remove_if(pk.waiters.begin(), pk.waiters.end(),
+                             [next_filler](const Waiter& w) { return &w == next_filler; }),
+              pk.waiters.end());
+          *filler_copy.result_ptr =
+              CoordinatedLookupResult{LookupStatus::YouFill, std::nullopt, nullptr};
+          filler_copy.handle.resume();
+          return;
+        }
       }
-    }
 
-    // All retries exhausted or no live waiters. Release all.
-    waiters_to_timeout = std::move(pk.waiters);
-    pending_.erase(it);
+      waiters_to_timeout = std::move(pk.waiters);
+      pending_.erase(it);
+    }
+  }
+
+  if (stream_to_error) {
+    stream_to_error->signalError();
   }
 
   for (auto& waiter : waiters_to_timeout) {
