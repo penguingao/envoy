@@ -660,6 +660,70 @@ TEST_P(ExtProcCacheIntegrationTest, ChunkedStreamedCacheHit) {
   }
 }
 
+// Verifies that a request arriving after the cache fill has already started
+// streaming body data still receives the complete response. The late waiter
+// gets a tailing reader from the store that reads buffered data immediately
+// and then follows the filler for remaining chunks.
+TEST_P(ExtProcCacheIntegrationTest, LateWaiterDuringBodyFill) {
+  initializeWithExtProc();
+
+  const std::string path = "/test/late-waiter";
+  const std::string body_chunk1 = "first chunk of data, ";
+  const std::string body_chunk2 = "second chunk of data";
+  const std::string full_body = body_chunk1 + body_chunk2;
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},
+      {":path", path},
+      {":scheme", "http"},
+      {":authority", "cache-test-host"}};
+
+  // Send request 1 — becomes the filler.
+  auto r1 = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  // Wait for the filler's request to reach upstream.
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_,
+                                                         fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+
+  // Upstream sends response headers (cacheable) — this triggers storeHeaders +
+  // reportHeadersAvailable in the ext_proc cache server.
+  Http::TestResponseHeaderMapImpl upstream_response_headers{
+      {":status", "200"},
+      {"cache-control", "public, max-age=3600"},
+      {"date", httpDateNow()},
+      {"content-length", std::to_string(full_body.size())}};
+  upstream_request_->encodeHeaders(upstream_response_headers, false);
+
+  // Send the first body chunk — this triggers appendBody, which writes to the
+  // store. Any tailing readers would get this data.
+  upstream_request_->encodeData(body_chunk1, false);
+
+  // Now send request 2 — the late arrival. The filler is mid-body-stream.
+  // This request will do a coordinator lookup, find headers_released=true,
+  // call store->lookup(), and get a tailing reader that has body_chunk1
+  // already available in the store buffer.
+  auto r2 = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  // Send the remaining body data + end_of_stream.
+  upstream_request_->encodeData(body_chunk2, true);
+
+  // Both requests should complete with the full body.
+  ASSERT_TRUE(r1->waitForEndStream());
+  ASSERT_TRUE(r2->waitForEndStream());
+
+  EXPECT_TRUE(r1->complete());
+  EXPECT_EQ("200", r1->headers().getStatusValue());
+  EXPECT_EQ(full_body, r1->body());
+
+  EXPECT_TRUE(r2->complete());
+  EXPECT_EQ("200", r2->headers().getStatusValue());
+  EXPECT_EQ(full_body, r2->body());
+
+  // Cache should have the entry.
+  EXPECT_EQ(store_->size(), 1);
+}
+
 } // namespace
 } // namespace ExtProcCache
 } // namespace Extensions
