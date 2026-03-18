@@ -94,17 +94,40 @@ lookups for the same key through a single cache fill:
 4. **cancelWaiter(key, handle)**: removes waiter; if filler, triggers fill
    failure path.
 
+## Streaming Mode
+
+The server requires **`FULL_DUPLEX_STREAMED`** response body mode. On the first
+`ProcessingRequest`, the server validates `protocol_config.response_body_mode`
+and rejects the stream with `INVALID_ARGUMENT` if it is not
+`FULL_DUPLEX_STREAMED`. Body chunks are passed through using
+`StreamedBodyResponse` in the `BodyMutation`, and trailer modes must be set to
+`SEND`.
+
 ## ext_proc Flow
 
 - **onRequestHeaders**: generate key → check request cacheability → coordinated
-  lookup → `Hit` sends `ImmediateResponse`; `YouFill` continues to upstream;
+  lookup → `Hit` serves via `ImmediateResponse`; stale `Hit` (requires
+  validation) injects conditional headers (`If-None-Match`/`If-Modified-Since`)
+  and forwards to upstream; `YouFill` continues to upstream;
   `TimedOut`/`Cancelled` continues without caching.
-- **onResponseHeaders**: if filler, check response cacheability → if cacheable,
-  start accumulating; set `mode_override` to `BUFFERED` for full body.
-- **onResponseBody**: if storing, buffer body; on `end_of_stream`, store and
-  report fill success.
-- **onResponseTrailers**: if storing, save trailers, finalize and store.
-- **onCancel**: report fill failure if filler.
+- **onResponseHeaders**:
+  - **304 during validation**: refreshes cached headers per RFC 7234 §4.3.4,
+    stores the updated entry, and serves the cached body via
+    `ImmediateResponse`.
+  - **Filler with cacheable response**: starts accumulating body via
+    `StreamedBodyResponse` (pass-through + buffer for caching).
+  - **Filler with 5xx error**: calls `reportFillFailure`, then re-enqueues as
+    a waiter via `coordinator_->lookup()`. If the retry filler succeeds, serves
+    the cached entry via `ImmediateResponse`; otherwise falls through with the
+    error.
+  - **Filler with uncacheable response** (e.g. `no-store`): calls
+    `reportFillFailure` and passes through the response (valid for the client,
+    just not cached).
+- **onResponseBody**: passes body through via `StreamedBodyResponse`; if
+  storing, buffers body; on `end_of_stream`, stores entry and reports fill
+  success.
+- **onResponseTrailers**: if storing, saves trailers, finalizes and stores.
+- **onCancel**: reports fill failure if filler.
 
 ## File Layout
 
@@ -119,6 +142,7 @@ lookups for the same key through a single cache fill:
 | `cache_age_calculator.h` | `CacheAgeCalculator` interface + `DefaultCacheAgeCalculator` |
 | `cache_lookup_coordinator.h/.cc` | `CacheLookupCoordinator` (shared coalescing layer) |
 | `cache_stream_handler.h/.cc` | `CacheStreamHandler` (per-stream ext_proc logic) |
-| `server.h/.cc` | Updated reactor/service with handler integration |
+| `server.h/.cc` | Reactor/service with `FULL_DUPLEX_STREAMED` validation |
 | `main.cc` | Wires default implementations |
+| `ext_proc_cache_integration_test.cc` | End-to-end tests (miss/hit, coalescing, revalidation, 304, retry) |
 | `BUILD` | Build targets |
