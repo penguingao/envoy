@@ -366,9 +366,8 @@ CacheStreamHandler::onResponseBody(const envoy::service::ext_proc::v3::HttpBody&
       metadata.response_time = pending_entry_.response_time;
       metadata.status_code = pending_entry_.status_code;
       metadata.content_length = pending_entry_.body.size();
-      auto factory =
-          coordinator_->store()->createBodyReaderFactory(std::move(pending_entry_.body));
-      coordinator_->reportFillSuccess(current_key_, metadata, std::move(factory));
+      auto body = std::make_shared<const std::string>(std::move(pending_entry_.body));
+      coordinator_->reportFillSuccess(current_key_, metadata, std::move(body));
     } else {
       coordinator_->reportFillFailure(current_key_);
     }
@@ -400,9 +399,8 @@ CacheStreamHandler::onResponseTrailers(const envoy::service::ext_proc::v3::HttpT
     metadata.response_time = pending_entry_.response_time;
     metadata.status_code = pending_entry_.status_code;
     metadata.content_length = pending_entry_.body.size();
-    auto factory =
-        coordinator_->store()->createBodyReaderFactory(std::move(pending_entry_.body));
-    coordinator_->reportFillSuccess(current_key_, metadata, std::move(factory));
+    auto body = std::make_shared<const std::string>(std::move(pending_entry_.body));
+    coordinator_->reportFillSuccess(current_key_, metadata, std::move(body));
   } else {
     coordinator_->reportFillFailure(current_key_);
   }

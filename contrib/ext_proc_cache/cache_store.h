@@ -17,8 +17,7 @@ public:
   virtual ~CacheStore() = default;
 
   // Look up a cache entry by key. Returns nullopt on miss.
-  // On hit, returns metadata + a body reader factory that can produce
-  // independent readers for streaming body data.
+  // On hit, returns metadata + a body reader for streaming body data.
   virtual Awaitable<std::optional<CacheLookupResult>> lookup(const std::string& key) = 0;
 
   // Store a cache entry. Returns true on success.
@@ -26,11 +25,6 @@ public:
 
   // Remove a cache entry. Returns true if an entry was removed.
   virtual Awaitable<bool> remove(const std::string& key) = 0;
-
-  // Create a body reader factory from a body string. Used by the coordinator
-  // to distribute body readers to coalesced waiters after a fill completes.
-  virtual std::shared_ptr<CacheBodyReaderFactory>
-  createBodyReaderFactory(std::string body) = 0;
 };
 
 } // namespace ExtProcCache

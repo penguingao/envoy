@@ -19,7 +19,7 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
     auto& result = *cached;
     co_return CoordinatedLookupResult{
         LookupStatus::Hit, std::move(result.metadata),
-        result.body_reader_factory->createReader()};
+        std::move(result.body_reader)};
   }
 
   // Cache miss. Check if there's already a fill in progress.
@@ -78,7 +78,7 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
 
 void CacheLookupCoordinator::reportFillSuccess(
     const std::string& key, const CacheEntryMetadata& metadata,
-    std::shared_ptr<CacheBodyReaderFactory> factory) {
+    std::shared_ptr<const std::string> body) {
   std::vector<Waiter> waiters_to_resume;
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -93,7 +93,8 @@ void CacheLookupCoordinator::reportFillSuccess(
   // Resume all waiters with metadata and an independent body reader each.
   for (auto& waiter : waiters_to_resume) {
     *waiter.result_ptr = CoordinatedLookupResult{
-        LookupStatus::Hit, CacheEntryMetadata(metadata), factory->createReader()};
+        LookupStatus::Hit, CacheEntryMetadata(metadata),
+        std::make_unique<StringBodyReader>(body)};
     waiter.handle.resume();
   }
 }

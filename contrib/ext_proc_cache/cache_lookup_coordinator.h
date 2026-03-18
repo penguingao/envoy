@@ -30,7 +30,7 @@ public:
   // Called by the filler stream after successful store to CacheStore.
   // Distributes metadata + per-waiter body readers to all waiting streams.
   void reportFillSuccess(const std::string& key, const CacheEntryMetadata& metadata,
-                         std::shared_ptr<CacheBodyReaderFactory> factory);
+                         std::shared_ptr<const std::string> body);
 
   // Called by the filler stream when upstream/store fails.
   void reportFillFailure(const std::string& key);

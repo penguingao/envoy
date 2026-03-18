@@ -19,7 +19,7 @@ Awaitable<std::optional<CacheLookupResult>> InMemoryCacheStore::lookup(const std
 
   CacheLookupResult result;
   result.metadata = it->second.metadata;
-  result.body_reader_factory = std::make_shared<InMemoryBodyReaderFactory>(it->second.body);
+  result.body_reader = std::make_unique<StringBodyReader>(it->second.body);
   co_return result;
 }
 
@@ -62,12 +62,6 @@ Awaitable<bool> InMemoryCacheStore::remove(const std::string& key) {
   lru_list_.erase(it->second.lru_it);
   entries_.erase(it);
   co_return true;
-}
-
-std::shared_ptr<CacheBodyReaderFactory>
-InMemoryCacheStore::createBodyReaderFactory(std::string body) {
-  return std::make_shared<InMemoryBodyReaderFactory>(
-      std::make_shared<const std::string>(std::move(body)));
 }
 
 size_t InMemoryCacheStore::size() const {

@@ -56,18 +56,38 @@ public:
   virtual Awaitable<std::string> readAll() = 0;
 };
 
-// Factory that produces independent CacheBodyReaders from the same stored body.
-// Enables multiple coalesced waiters to each get their own reader.
-class CacheBodyReaderFactory {
+// Reads body data from a shared in-memory string. General-purpose reader used
+// by the coordinator to distribute body data to coalesced waiters, and by the
+// in-memory store for cache hits.
+class StringBodyReader : public CacheBodyReader {
 public:
-  virtual ~CacheBodyReaderFactory() = default;
-  virtual std::unique_ptr<CacheBodyReader> createReader() = 0;
+  explicit StringBodyReader(std::shared_ptr<const std::string> body) : body_(std::move(body)) {}
+
+  Awaitable<std::string> nextChunk(size_t max_size) override {
+    if (offset_ >= body_->size()) {
+      co_return std::string{};
+    }
+    size_t chunk = std::min(max_size, body_->size() - offset_);
+    std::string result = body_->substr(offset_, chunk);
+    offset_ += chunk;
+    co_return result;
+  }
+
+  Awaitable<std::string> readAll() override {
+    std::string result = body_->substr(offset_);
+    offset_ = body_->size();
+    co_return result;
+  }
+
+private:
+  std::shared_ptr<const std::string> body_;
+  size_t offset_ = 0;
 };
 
-// Result of a cache store lookup (metadata + body reader factory).
+// Result of a cache store lookup (metadata + body reader).
 struct CacheLookupResult {
   CacheEntryMetadata metadata;
-  std::shared_ptr<CacheBodyReaderFactory> body_reader_factory;
+  std::unique_ptr<CacheBodyReader> body_reader;
 };
 
 // Result of a coordinated lookup.
