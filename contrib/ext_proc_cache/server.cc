@@ -30,13 +30,14 @@ ExtProcCacheReactor::ExtProcCacheReactor(std::shared_ptr<CacheLookupCoordinator>
                                          std::shared_ptr<CacheKeyGenerator> key_gen,
                                          std::shared_ptr<CacheabilityChecker> cacheability,
                                          std::shared_ptr<CacheAgeCalculator> age_calc,
-                                         grpc::CallbackServerContext* context) {
+                                         grpc::CallbackServerContext* context,
+                                         size_t chunk_size) {
   // Extract deadline from the gRPC context.
   auto deadline = context->deadline();
 
   handler_ = std::make_unique<CacheStreamHandler>(std::move(coordinator), std::move(key_gen),
                                                   std::move(cacheability), std::move(age_calc),
-                                                  deadline);
+                                                  deadline, chunk_size);
   run();
 }
 
@@ -86,28 +87,39 @@ Task ExtProcCacheReactor::run() {
     }
 
     std::cerr << "[EXT_PROC_CACHE] Received request: " << request_.request_case() << std::endl;
-    response_ = co_await handleRequest(request_);
-    std::cerr << "[EXT_PROC_CACHE] Sending response: " << response_.response_case() << std::endl;
+    auto responses = co_await handleRequest(request_);
 
-    bool write_ok = co_await WriteAwaitable{this, &response_};
-    if (!write_ok) {
-      std::cerr << "[EXT_PROC_CACHE] Write failed, finishing stream" << std::endl;
+    bool write_failed = false;
+    for (auto& resp : responses) {
+      response_ = std::move(resp);
+      std::cerr << "[EXT_PROC_CACHE] Sending response: " << response_.response_case() << std::endl;
+
+      bool write_ok = co_await WriteAwaitable{this, &response_};
+      if (!write_ok) {
+        std::cerr << "[EXT_PROC_CACHE] Write failed, finishing stream" << std::endl;
+        write_failed = true;
+        break;
+      }
+    }
+    if (write_failed) {
       break;
     }
   }
   Finish(grpc::Status::OK);
 }
 
-Awaitable<ProcessingResponse>
+Awaitable<std::vector<ProcessingResponse>>
 ExtProcCacheReactor::handleRequest(const ProcessingRequest& request) {
   if (request.has_request_headers()) {
     co_return co_await handler_->onRequestHeaders(request.request_headers());
   } else if (request.has_response_headers()) {
     co_return co_await handler_->onResponseHeaders(request.response_headers());
   } else if (request.has_response_body()) {
-    co_return co_await handler_->onResponseBody(request.response_body());
+    auto resp = co_await handler_->onResponseBody(request.response_body());
+    co_return std::vector<ProcessingResponse>{std::move(resp)};
   } else if (request.has_response_trailers()) {
-    co_return co_await handler_->onResponseTrailers(request.response_trailers());
+    auto resp = co_await handler_->onResponseTrailers(request.response_trailers());
+    co_return std::vector<ProcessingResponse>{std::move(resp)};
   }
 
   // For request body/trailers or unknown types, just continue.
@@ -117,7 +129,7 @@ ExtProcCacheReactor::handleRequest(const ProcessingRequest& request) {
   } else if (request.has_request_trailers()) {
     response.mutable_request_trailers();
   }
-  co_return response;
+  co_return std::vector<ProcessingResponse>{std::move(response)};
 }
 
 // --- ExtProcCacheService ---
@@ -125,13 +137,16 @@ ExtProcCacheReactor::handleRequest(const ProcessingRequest& request) {
 ExtProcCacheService::ExtProcCacheService(std::shared_ptr<CacheLookupCoordinator> coordinator,
                                          std::shared_ptr<CacheKeyGenerator> key_gen,
                                          std::shared_ptr<CacheabilityChecker> cacheability,
-                                         std::shared_ptr<CacheAgeCalculator> age_calc)
+                                         std::shared_ptr<CacheAgeCalculator> age_calc,
+                                         size_t chunk_size)
     : coordinator_(std::move(coordinator)), key_gen_(std::move(key_gen)),
-      cacheability_(std::move(cacheability)), age_calc_(std::move(age_calc)) {}
+      cacheability_(std::move(cacheability)), age_calc_(std::move(age_calc)),
+      chunk_size_(chunk_size) {}
 
 grpc::ServerBidiReactor<ProcessingRequest, ProcessingResponse>*
 ExtProcCacheService::Process(grpc::CallbackServerContext* context) {
-  return new ExtProcCacheReactor(coordinator_, key_gen_, cacheability_, age_calc_, context);
+  return new ExtProcCacheReactor(coordinator_, key_gen_, cacheability_, age_calc_, context,
+                                chunk_size_);
 }
 
 // --- ExtProcCacheServer ---
@@ -140,9 +155,11 @@ void ExtProcCacheServer::start(const std::string& address,
                                std::shared_ptr<CacheLookupCoordinator> coordinator,
                                std::shared_ptr<CacheKeyGenerator> key_gen,
                                std::shared_ptr<CacheabilityChecker> cacheability,
-                               std::shared_ptr<CacheAgeCalculator> age_calc) {
+                               std::shared_ptr<CacheAgeCalculator> age_calc,
+                               size_t chunk_size) {
   service_ = std::make_unique<ExtProcCacheService>(
-      std::move(coordinator), std::move(key_gen), std::move(cacheability), std::move(age_calc));
+      std::move(coordinator), std::move(key_gen), std::move(cacheability), std::move(age_calc),
+      chunk_size);
   grpc::ServerBuilder builder;
   builder.RegisterService(service_.get());
   builder.AddListeningPort(address, grpc::InsecureServerCredentials(), &listening_port_);

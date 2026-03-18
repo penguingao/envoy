@@ -50,7 +50,8 @@ public:
     coordinator_ = std::make_shared<CacheLookupCoordinator>(store_);
 
     // Start the gRPC server on a random port (IPv4).
-    cache_server_.start("127.0.0.1:0", coordinator_, key_gen, cacheability, age_calc);
+    cache_server_.start("127.0.0.1:0", coordinator_, key_gen, cacheability, age_calc,
+                        chunk_size_);
   }
 
   void TearDown() override {
@@ -149,6 +150,7 @@ public:
   std::shared_ptr<InMemoryCacheStore> store_;
   std::shared_ptr<CacheLookupCoordinator> coordinator_;
   ExtProcCacheServer cache_server_;
+  size_t chunk_size_ = 65536;
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, ExtProcCacheIntegrationTest,
@@ -606,6 +608,56 @@ TEST_P(ExtProcCacheIntegrationTest, UncacheableResponseRetries) {
 
   // Cache should have the cacheable entry.
   EXPECT_EQ(store_->size(), 1);
+}
+
+// Verifies that cached responses are served via StreamedImmediateResponse with
+// chunked body delivery when a small chunk_size is configured.
+TEST_P(ExtProcCacheIntegrationTest, ChunkedStreamedCacheHit) {
+  // Use a small chunk size so the body is split across multiple messages.
+  chunk_size_ = 5;
+  // Re-create the server with the new chunk size (SetUp already ran).
+  cache_server_.shutdown();
+  auto key_gen = std::make_shared<DefaultCacheKeyGenerator>();
+  auto cacheability = std::make_shared<DefaultCacheabilityChecker>();
+  auto age_calc = std::make_shared<DefaultCacheAgeCalculator>();
+  cache_server_.start("127.0.0.1:0", coordinator_, key_gen, cacheability, age_calc, chunk_size_);
+
+  initializeWithExtProc();
+
+  const std::string request_path = "/test/chunked";
+  const std::string response_body = "hello from upstream, chunked!"; // 28 bytes → 6 chunks of 5
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},
+      {":path", request_path},
+      {":scheme", "http"},
+      {":authority", "cache-test-host"}};
+  Http::TestResponseHeaderMapImpl upstream_response_headers{
+      {":status", "200"},
+      {"cache-control", "public, max-age=3600"},
+      {"date", httpDateNow()},
+      {"content-length", std::to_string(response_body.size())}};
+
+  // First request: cache miss, fill cache.
+  {
+    auto response =
+        sendRequestGetFromUpstream(request_headers, response_body, upstream_response_headers);
+    EXPECT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    EXPECT_EQ(response_body, response->body());
+  }
+  resetUpstreamConnection();
+  EXPECT_EQ(store_->size(), 1);
+
+  // Second request: cache hit, served via StreamedImmediateResponse with
+  // chunk_size=5 (body split across multiple gRPC messages).
+  {
+    auto response = codec_client_->makeHeaderOnlyRequest(request_headers);
+    ASSERT_TRUE(response->waitForEndStream());
+    EXPECT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    EXPECT_EQ(response_body, response->body());
+    EXPECT_FALSE(response->headers().get(Http::LowerCaseString("age")).empty());
+  }
 }
 
 } // namespace

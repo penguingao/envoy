@@ -2,6 +2,7 @@
 
 #include <coroutine>
 #include <memory>
+#include <vector>
 
 #include "envoy/extensions/filters/http/ext_proc/v3/processing_mode.pb.h"
 #include "envoy/service/ext_proc/v3/external_processor.grpc.pb.h"
@@ -44,7 +45,8 @@ public:
                       std::shared_ptr<CacheKeyGenerator> key_gen,
                       std::shared_ptr<CacheabilityChecker> cacheability,
                       std::shared_ptr<CacheAgeCalculator> age_calc,
-                      grpc::CallbackServerContext* context);
+                      grpc::CallbackServerContext* context,
+                      size_t chunk_size);
 
   void OnReadDone(bool ok) override;
   void OnWriteDone(bool ok) override;
@@ -55,8 +57,9 @@ private:
   // The main processing coroutine.
   Task run();
 
-  // Build a response for the given request, dispatching to the handler.
-  Awaitable<ProcessingResponse> handleRequest(const ProcessingRequest& request);
+  // Build responses for the given request, dispatching to the handler.
+  // Returns multiple responses for StreamedImmediateResponse (cache hits).
+  Awaitable<std::vector<ProcessingResponse>> handleRequest(const ProcessingRequest& request);
 
   // Awaitable that wraps StartRead. Resumes coroutine in OnReadDone.
   struct ReadAwaitable {
@@ -93,7 +96,8 @@ public:
   ExtProcCacheService(std::shared_ptr<CacheLookupCoordinator> coordinator,
                       std::shared_ptr<CacheKeyGenerator> key_gen,
                       std::shared_ptr<CacheabilityChecker> cacheability,
-                      std::shared_ptr<CacheAgeCalculator> age_calc);
+                      std::shared_ptr<CacheAgeCalculator> age_calc,
+                      size_t chunk_size = 65536);
 
   grpc::ServerBidiReactor<ProcessingRequest, ProcessingResponse>*
   Process(grpc::CallbackServerContext* context) override;
@@ -103,6 +107,7 @@ private:
   std::shared_ptr<CacheKeyGenerator> key_gen_;
   std::shared_ptr<CacheabilityChecker> cacheability_;
   std::shared_ptr<CacheAgeCalculator> age_calc_;
+  size_t chunk_size_;
 };
 
 // Manages the gRPC server lifecycle.
@@ -112,7 +117,8 @@ public:
              std::shared_ptr<CacheLookupCoordinator> coordinator,
              std::shared_ptr<CacheKeyGenerator> key_gen,
              std::shared_ptr<CacheabilityChecker> cacheability,
-             std::shared_ptr<CacheAgeCalculator> age_calc);
+             std::shared_ptr<CacheAgeCalculator> age_calc,
+             size_t chunk_size = 65536);
   void shutdown();
   void wait();
   int port() const { return listening_port_; }

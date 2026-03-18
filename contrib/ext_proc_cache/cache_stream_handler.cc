@@ -14,11 +14,96 @@ CacheStreamHandler::CacheStreamHandler(std::shared_ptr<CacheLookupCoordinator> c
                                        std::shared_ptr<CacheKeyGenerator> key_gen,
                                        std::shared_ptr<CacheabilityChecker> cacheability,
                                        std::shared_ptr<CacheAgeCalculator> age_calc,
-                                       std::chrono::system_clock::time_point deadline)
+                                       std::chrono::system_clock::time_point deadline,
+                                       size_t chunk_size)
     : coordinator_(std::move(coordinator)), key_gen_(std::move(key_gen)),
-      cacheability_(std::move(cacheability)), age_calc_(std::move(age_calc)), deadline_(deadline) {}
+      cacheability_(std::move(cacheability)), age_calc_(std::move(age_calc)),
+      deadline_(deadline), chunk_size_(chunk_size) {}
 
-Awaitable<ProcessingResponse>
+std::vector<ProcessingResponse>
+CacheStreamHandler::buildStreamedCacheResponse(const CachedEntry& entry,
+                                               std::optional<Seconds> age) {
+  std::vector<ProcessingResponse> responses;
+
+  // First message: headers with :status.
+  ProcessingResponse header_resp;
+  auto* streamed = header_resp.mutable_streamed_immediate_response();
+  auto* http_headers = streamed->mutable_headers_response();
+  auto* header_map = http_headers->mutable_headers();
+
+  // Add :status pseudo-header.
+  auto* status_h = header_map->add_headers();
+  status_h->set_key(":status");
+  status_h->set_raw_value(std::to_string(entry.status_code));
+
+  // Add cached response headers (skip pseudo-headers already in the entry).
+  for (const auto& header : entry.response_headers.headers()) {
+    if (!header.key().empty() && header.key()[0] == ':') {
+      continue;
+    }
+    auto* h = header_map->add_headers();
+    h->set_key(header.key());
+    h->set_raw_value(header.raw_value());
+  }
+
+  // Add Age header if provided.
+  if (age.has_value()) {
+    auto* age_h = header_map->add_headers();
+    age_h->set_key("age");
+    age_h->set_raw_value(std::to_string(age->count()));
+  }
+
+  // If body is empty, set end_of_stream on headers.
+  if (entry.body.empty()) {
+    http_headers->set_end_of_stream(true);
+    responses.push_back(std::move(header_resp));
+    return responses;
+  }
+
+  responses.push_back(std::move(header_resp));
+
+  // Body chunks.
+  const size_t body_size = entry.body.size();
+  const size_t effective_chunk = (chunk_size_ > 0) ? chunk_size_ : body_size;
+
+  for (size_t offset = 0; offset < body_size; offset += effective_chunk) {
+    const size_t this_chunk = std::min(effective_chunk, body_size - offset);
+    const bool is_last = (offset + this_chunk >= body_size);
+
+    ProcessingResponse body_resp;
+    auto* body_streamed = body_resp.mutable_streamed_immediate_response();
+    auto* body_part = body_streamed->mutable_body_response();
+    body_part->set_body(entry.body.substr(offset, this_chunk));
+    body_part->set_end_of_stream(is_last);
+
+    responses.push_back(std::move(body_resp));
+  }
+
+  return responses;
+}
+
+ProcessingResponse
+CacheStreamHandler::buildImmediateCacheResponse(const CachedEntry& entry) {
+  ProcessingResponse response;
+  auto* immediate = response.mutable_immediate_response();
+  immediate->mutable_status()->set_code(
+      static_cast<envoy::type::v3::StatusCode>(entry.status_code));
+  immediate->set_body(entry.body);
+
+  auto* header_mutation = immediate->mutable_headers();
+  for (const auto& header : entry.response_headers.headers()) {
+    if (!header.key().empty() && header.key()[0] == ':') {
+      continue;
+    }
+    auto* hvo = header_mutation->add_set_headers();
+    hvo->mutable_header()->set_key(header.key());
+    hvo->mutable_header()->set_raw_value(header.raw_value());
+  }
+
+  return response;
+}
+
+Awaitable<std::vector<ProcessingResponse>>
 CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers) {
   ProcessingResponse response;
   const auto& proto_headers = headers.headers();
@@ -37,7 +122,7 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
   if (req_cacheability == RequestCacheability::Bypass) {
     // Not cacheable — just continue.
     response.mutable_request_headers();
-    co_return response;
+    co_return std::vector<ProcessingResponse>{std::move(response)};
   }
 
   // Coordinated lookup.
@@ -60,29 +145,8 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
               << " age=" << usability.age.count()
               << " ttl=" << usability.ttl.count() << std::endl;
     if (usability.status == CacheEntryStatus::Ok) {
-      // Serve from cache via ImmediateResponse.
-      auto* immediate = response.mutable_immediate_response();
-      immediate->mutable_status()->set_code(
-          static_cast<envoy::type::v3::StatusCode>(entry.status_code));
-      immediate->set_body(entry.body);
-
-      // Set headers from cached response.
-      auto* header_mutation = immediate->mutable_headers();
-      for (const auto& header : entry.response_headers.headers()) {
-        if (!header.key().empty() && header.key()[0] == ':') {
-          continue;
-        }
-        auto* hvo = header_mutation->add_set_headers();
-        hvo->mutable_header()->set_key(header.key());
-        hvo->mutable_header()->set_raw_value(header.value());
-      }
-
-      // Set Age header.
-      auto* age_hvo = header_mutation->add_set_headers();
-      age_hvo->mutable_header()->set_key("age");
-      age_hvo->mutable_header()->set_raw_value(std::to_string(usability.age.count()));
-
-      co_return response;
+      // Serve from cache via StreamedImmediateResponse.
+      co_return buildStreamedCacheResponse(entry, usability.age);
     }
 
     // Entry is stale/requires validation — forward to upstream with
@@ -109,7 +173,7 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
       hvo->mutable_header()->set_raw_value(last_modified);
     }
 
-    co_return response;
+    co_return std::vector<ProcessingResponse>{std::move(response)};
   }
 
   case LookupStatus::YouFill:
@@ -121,21 +185,21 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
       is_filler_ = false;
     }
     response.mutable_request_headers();
-    co_return response;
+    co_return std::vector<ProcessingResponse>{std::move(response)};
 
   case LookupStatus::TimedOut:
   case LookupStatus::Cancelled:
     // Proceed without caching.
     response.mutable_request_headers();
-    co_return response;
+    co_return std::vector<ProcessingResponse>{std::move(response)};
   }
 
   // Unreachable, but satisfy compiler.
   response.mutable_request_headers();
-  co_return response;
+  co_return std::vector<ProcessingResponse>{std::move(response)};
 }
 
-Awaitable<ProcessingResponse>
+Awaitable<std::vector<ProcessingResponse>>
 CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers) {
   ProcessingResponse response;
 
@@ -185,23 +249,10 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
     std::cerr << "[HANDLER] 304 store result: " << store_ok << std::endl;
 
     // Serve the cached body with refreshed headers via ImmediateResponse.
-    auto* immediate = response.mutable_immediate_response();
-    immediate->mutable_status()->set_code(
-        static_cast<envoy::type::v3::StatusCode>(entry.status_code));
-    immediate->set_body(entry.body);
-
-    auto* header_mutation = immediate->mutable_headers();
-    for (const auto& header : entry.response_headers.headers()) {
-      if (!header.key().empty() && header.key()[0] == ':') {
-        continue;
-      }
-      auto* hvo = header_mutation->add_set_headers();
-      hvo->mutable_header()->set_key(header.key());
-      hvo->mutable_header()->set_raw_value(header.raw_value());
-    }
-
+    // (StreamedImmediateResponse is only valid in response to request_headers.)
+    auto result = buildImmediateCacheResponse(entry);
     stale_entry_.reset();
-    co_return response;
+    co_return std::vector<ProcessingResponse>{std::move(result)};
   }
 
   // Non-304 response during validation — discard stale entry, pass through.
@@ -213,7 +264,7 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
   response.mutable_response_headers();
 
   if (!is_filler_) {
-    co_return response;
+    co_return std::vector<ProcessingResponse>{std::move(response)};
   }
 
   std::cerr << "[HANDLER] Response headers count: " << proto_headers.headers_size() << std::endl;
@@ -262,23 +313,9 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
         const auto& entry = *retry_result.entry;
         std::cerr << "[HANDLER] Retry succeeded, serving from cache" << std::endl;
 
-        // Serve the retried entry via ImmediateResponse (replaces the 5xx).
-        ProcessingResponse retry_response;
-        auto* immediate = retry_response.mutable_immediate_response();
-        immediate->mutable_status()->set_code(
-            static_cast<envoy::type::v3::StatusCode>(entry.status_code));
-        immediate->set_body(entry.body);
-
-        auto* header_mutation = immediate->mutable_headers();
-        for (const auto& header : entry.response_headers.headers()) {
-          if (!header.key().empty() && header.key()[0] == ':') {
-            continue;
-          }
-          auto* hvo = header_mutation->add_set_headers();
-          hvo->mutable_header()->set_key(header.key());
-          hvo->mutable_header()->set_raw_value(header.raw_value());
-        }
-        co_return retry_response;
+        // Serve the retried entry via ImmediateResponse.
+        // (StreamedImmediateResponse is only valid in response to request_headers.)
+        co_return std::vector<ProcessingResponse>{buildImmediateCacheResponse(entry)};
       }
 
       if (retry_result.status == LookupStatus::YouFill) {
@@ -291,7 +328,7 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
     }
   }
 
-  co_return response;
+  co_return std::vector<ProcessingResponse>{std::move(response)};
 }
 
 Awaitable<ProcessingResponse>

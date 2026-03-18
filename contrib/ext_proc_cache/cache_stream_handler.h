@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "envoy/service/ext_proc/v3/external_processor.pb.h"
 
@@ -23,18 +24,21 @@ using ProcessingResponse = envoy::service::ext_proc::v3::ProcessingResponse;
 // Per-stream handler that implements the ext_proc caching protocol state machine.
 class CacheStreamHandler {
 public:
+  // chunk_size controls how large each body chunk is when serving cached entries
+  // via StreamedImmediateResponse. 0 means send the entire body in one chunk.
   CacheStreamHandler(std::shared_ptr<CacheLookupCoordinator> coordinator,
                      std::shared_ptr<CacheKeyGenerator> key_gen,
                      std::shared_ptr<CacheabilityChecker> cacheability,
                      std::shared_ptr<CacheAgeCalculator> age_calc,
-                     std::chrono::system_clock::time_point deadline);
+                     std::chrono::system_clock::time_point deadline,
+                     size_t chunk_size = 65536);
 
-  // Returns response for each ext_proc phase.
-  Awaitable<ProcessingResponse>
+  // Returns one or more responses (multiple for StreamedImmediateResponse).
+  Awaitable<std::vector<ProcessingResponse>>
   onRequestHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers);
 
-  // Handles response headers. May co_await store on 304 revalidation.
-  Awaitable<ProcessingResponse>
+  // Handles response headers. May return multiple responses for cached entries.
+  Awaitable<std::vector<ProcessingResponse>>
   onResponseHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers);
 
   // May co_await store on end_of_stream.
@@ -49,11 +53,24 @@ public:
   void onCancel();
 
 private:
+  // Build a StreamedImmediateResponse sequence for a cached entry.
+  // First message has headers (with :status), followed by body chunks.
+  // Only valid in response to request_headers.
+  std::vector<ProcessingResponse>
+  buildStreamedCacheResponse(const CachedEntry& entry,
+                             std::optional<Seconds> age = std::nullopt);
+
+  // Build a single ImmediateResponse for a cached entry.
+  // Used in response to response_headers (where StreamedImmediateResponse
+  // is not supported).
+  static ProcessingResponse buildImmediateCacheResponse(const CachedEntry& entry);
+
   std::shared_ptr<CacheLookupCoordinator> coordinator_;
   std::shared_ptr<CacheKeyGenerator> key_gen_;
   std::shared_ptr<CacheabilityChecker> cacheability_;
   std::shared_ptr<CacheAgeCalculator> age_calc_;
   std::chrono::system_clock::time_point deadline_;
+  size_t chunk_size_;
 
   // Per-stream state.
   std::string current_key_;
