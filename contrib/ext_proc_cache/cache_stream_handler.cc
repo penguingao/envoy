@@ -20,15 +20,12 @@ CacheStreamHandler::CacheStreamHandler(std::shared_ptr<CacheLookupCoordinator> c
       cacheability_(std::move(cacheability)), age_calc_(std::move(age_calc)),
       deadline_(deadline), chunk_size_(chunk_size) {}
 
-Awaitable<std::vector<ProcessingResponse>>
-CacheStreamHandler::buildStreamedCacheResponse(const CacheEntryMetadata& metadata,
-                                               CacheBodyReader& reader,
-                                               std::optional<Seconds> age) {
-  std::vector<ProcessingResponse> responses;
-
-  // First message: headers with :status.
-  ProcessingResponse header_resp;
-  auto* streamed = header_resp.mutable_streamed_immediate_response();
+HandleResult
+CacheStreamHandler::buildCacheHitResult(const CacheEntryMetadata& metadata,
+                                        std::unique_ptr<CacheBodyReader> reader,
+                                        std::optional<Seconds> age) {
+  HandleResult result;
+  auto* streamed = result.response.mutable_streamed_immediate_response();
   auto* http_headers = streamed->mutable_headers_response();
   auto* header_map = http_headers->mutable_headers();
 
@@ -54,40 +51,16 @@ CacheStreamHandler::buildStreamedCacheResponse(const CacheEntryMetadata& metadat
     age_h->set_raw_value(std::to_string(age->count()));
   }
 
-  // If body is empty, set end_of_stream on headers.
+  // If body is empty, set end_of_stream on headers and skip body streaming.
   if (metadata.content_length == 0) {
     http_headers->set_end_of_stream(true);
-    responses.push_back(std::move(header_resp));
-    co_return responses;
+    return result;
   }
 
-  responses.push_back(std::move(header_resp));
-
-  // Stream body chunks from the reader.
-  const size_t effective_chunk = (chunk_size_ > 0) ? chunk_size_ : metadata.content_length;
-  while (true) {
-    auto chunk = co_await reader.nextChunk(effective_chunk);
-    if (chunk.empty()) {
-      break;
-    }
-    ProcessingResponse body_resp;
-    auto* body_streamed = body_resp.mutable_streamed_immediate_response();
-    auto* body_part = body_streamed->mutable_body_response();
-    body_part->set_body(std::move(chunk));
-    // Peek if there's more data by checking if we got less than requested.
-    // The reader returns empty when exhausted, so set eos after the loop.
-    responses.push_back(std::move(body_resp));
-  }
-
-  // Mark the last body chunk as end_of_stream.
-  if (responses.size() > 1) {
-    responses.back()
-        .mutable_streamed_immediate_response()
-        ->mutable_body_response()
-        ->set_end_of_stream(true);
-  }
-
-  co_return responses;
+  // Pass reader to the reactor for lazy chunk-by-chunk streaming.
+  result.body_reader = std::move(reader);
+  result.chunk_size = (chunk_size_ > 0) ? chunk_size_ : metadata.content_length;
+  return result;
 }
 
 ProcessingResponse
@@ -112,7 +85,7 @@ CacheStreamHandler::buildImmediateCacheResponse(const CacheEntryMetadata& metada
   return response;
 }
 
-Awaitable<std::vector<ProcessingResponse>>
+Awaitable<HandleResult>
 CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers) {
   ProcessingResponse response;
   const auto& proto_headers = headers.headers();
@@ -131,7 +104,7 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
   if (req_cacheability == RequestCacheability::Bypass) {
     // Not cacheable — just continue.
     response.mutable_request_headers();
-    co_return std::vector<ProcessingResponse>{std::move(response)};
+    co_return HandleResult{std::move(response), nullptr, 0};
   }
 
   // Coordinated lookup.
@@ -156,8 +129,8 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
               << " ttl=" << usability.ttl.count() << std::endl;
     if (usability.status == CacheEntryStatus::Ok) {
       // Serve from cache via StreamedImmediateResponse.
-      co_return co_await buildStreamedCacheResponse(metadata, *lookup_result.body_reader,
-                                                    usability.age);
+      co_return buildCacheHitResult(metadata, std::move(lookup_result.body_reader),
+                                    usability.age);
     }
 
     // Entry is stale/requires validation — forward to upstream with
@@ -186,7 +159,7 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
       hvo->mutable_header()->set_raw_value(last_modified);
     }
 
-    co_return std::vector<ProcessingResponse>{std::move(response)};
+    co_return HandleResult{std::move(response), nullptr, 0};
   }
 
   case LookupStatus::YouFill:
@@ -198,21 +171,21 @@ CacheStreamHandler::onRequestHeaders(const envoy::service::ext_proc::v3::HttpHea
       is_filler_ = false;
     }
     response.mutable_request_headers();
-    co_return std::vector<ProcessingResponse>{std::move(response)};
+    co_return HandleResult{std::move(response), nullptr, 0};
 
   case LookupStatus::TimedOut:
   case LookupStatus::Cancelled:
     // Proceed without caching.
     response.mutable_request_headers();
-    co_return std::vector<ProcessingResponse>{std::move(response)};
+    co_return HandleResult{std::move(response), nullptr, 0};
   }
 
   // Unreachable, but satisfy compiler.
   response.mutable_request_headers();
-  co_return std::vector<ProcessingResponse>{std::move(response)};
+  co_return HandleResult{std::move(response), nullptr, 0};
 }
 
-Awaitable<std::vector<ProcessingResponse>>
+Awaitable<HandleResult>
 CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers) {
   ProcessingResponse response;
 
@@ -272,10 +245,10 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
 
     // Serve the cached body with refreshed headers via ImmediateResponse.
     // (StreamedImmediateResponse is only valid in response to request_headers.)
-    auto result = buildImmediateCacheResponse(metadata, body);
+    auto imm = buildImmediateCacheResponse(metadata, body);
     stale_metadata_.reset();
     stale_reader_.reset();
-    co_return std::vector<ProcessingResponse>{std::move(result)};
+    co_return HandleResult{std::move(imm), nullptr, 0};
   }
 
   // Non-304 response during validation — discard stale entry, pass through.
@@ -288,7 +261,7 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
   response.mutable_response_headers();
 
   if (!is_filler_) {
-    co_return std::vector<ProcessingResponse>{std::move(response)};
+    co_return HandleResult{std::move(response), nullptr, 0};
   }
 
   std::cerr << "[HANDLER] Response headers count: " << proto_headers.headers_size() << std::endl;
@@ -340,8 +313,7 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
         // Read the full body and serve via ImmediateResponse.
         // (StreamedImmediateResponse is only valid in response to request_headers.)
         auto body = co_await retry_result.body_reader->readAll();
-        co_return std::vector<ProcessingResponse>{
-            buildImmediateCacheResponse(metadata, body)};
+        co_return HandleResult{buildImmediateCacheResponse(metadata, body), nullptr, 0};
       }
 
       if (retry_result.status == LookupStatus::YouFill) {
@@ -354,7 +326,7 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
     }
   }
 
-  co_return std::vector<ProcessingResponse>{std::move(response)};
+  co_return HandleResult{std::move(response), nullptr, 0};
 }
 
 Awaitable<ProcessingResponse>

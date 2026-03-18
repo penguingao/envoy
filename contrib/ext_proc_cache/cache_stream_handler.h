@@ -4,7 +4,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <vector>
 
 #include "envoy/service/ext_proc/v3/external_processor.pb.h"
 
@@ -21,6 +20,15 @@ namespace ExtProcCache {
 
 using ProcessingResponse = envoy::service::ext_proc::v3::ProcessingResponse;
 
+// Result of handling a request. Contains the initial response to write, and
+// optionally a body reader for streaming cache hits. When body_reader is set,
+// the reactor streams body chunks one at a time instead of buffering them all.
+struct HandleResult {
+  ProcessingResponse response;
+  std::unique_ptr<CacheBodyReader> body_reader;
+  size_t chunk_size = 0;
+};
+
 // Per-stream handler that implements the ext_proc caching protocol state machine.
 class CacheStreamHandler {
 public:
@@ -33,12 +41,12 @@ public:
                      std::chrono::system_clock::time_point deadline,
                      size_t chunk_size = 65536);
 
-  // Returns one or more responses (multiple for StreamedImmediateResponse).
-  Awaitable<std::vector<ProcessingResponse>>
+  // Returns the initial response and optionally a body reader for streaming.
+  Awaitable<HandleResult>
   onRequestHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers);
 
-  // Handles response headers. May return multiple responses for cached entries.
-  Awaitable<std::vector<ProcessingResponse>>
+  // Handles response headers. May return a body reader for streaming.
+  Awaitable<HandleResult>
   onResponseHeaders(const envoy::service::ext_proc::v3::HttpHeaders& headers);
 
   // May co_await store on end_of_stream.
@@ -53,12 +61,12 @@ public:
   void onCancel();
 
 private:
-  // Build a StreamedImmediateResponse sequence by streaming body from reader.
-  // First message has headers (with :status), followed by body chunks.
-  // Only valid in response to request_headers.
-  Awaitable<std::vector<ProcessingResponse>>
-  buildStreamedCacheResponse(const CacheEntryMetadata& metadata, CacheBodyReader& reader,
-                             std::optional<Seconds> age = std::nullopt);
+  // Build the headers-only StreamedImmediateResponse for a cache hit.
+  // Returns HandleResult with the headers response + body reader for the
+  // reactor to stream from. Only valid in response to request_headers.
+  HandleResult buildCacheHitResult(const CacheEntryMetadata& metadata,
+                                   std::unique_ptr<CacheBodyReader> reader,
+                                   std::optional<Seconds> age = std::nullopt);
 
   // Build a single ImmediateResponse for a cached entry.
   // Used in response to response_headers (where StreamedImmediateResponse

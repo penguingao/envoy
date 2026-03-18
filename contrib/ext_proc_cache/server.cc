@@ -87,28 +87,49 @@ Task ExtProcCacheReactor::run() {
     }
 
     std::cerr << "[EXT_PROC_CACHE] Received request: " << request_.request_case() << std::endl;
-    auto responses = co_await handleRequest(request_);
+    auto result = co_await handleRequest(request_);
 
-    bool write_failed = false;
-    for (auto& resp : responses) {
-      response_ = std::move(resp);
-      std::cerr << "[EXT_PROC_CACHE] Sending response: " << response_.response_case() << std::endl;
+    // Write the initial (or only) response.
+    response_ = std::move(result.response);
+    std::cerr << "[EXT_PROC_CACHE] Sending response: " << response_.response_case() << std::endl;
 
-      bool write_ok = co_await WriteAwaitable{this, &response_};
-      if (!write_ok) {
-        std::cerr << "[EXT_PROC_CACHE] Write failed, finishing stream" << std::endl;
-        write_failed = true;
+    bool write_ok = co_await WriteAwaitable{this, &response_};
+    if (!write_ok) {
+      std::cerr << "[EXT_PROC_CACHE] Write failed, finishing stream" << std::endl;
+      break;
+    }
+
+    // If the handler returned a body reader, stream chunks lazily.
+    if (result.body_reader) {
+      bool stream_failed = false;
+      // Read one chunk ahead so we can set end_of_stream on the last one.
+      auto chunk = co_await result.body_reader->nextChunk(result.chunk_size);
+      while (!chunk.empty()) {
+        auto next = co_await result.body_reader->nextChunk(result.chunk_size);
+        const bool is_last = next.empty();
+
+        response_.Clear();
+        auto* body_part = response_.mutable_streamed_immediate_response()->mutable_body_response();
+        body_part->set_body(std::move(chunk));
+        body_part->set_end_of_stream(is_last);
+
+        write_ok = co_await WriteAwaitable{this, &response_};
+        if (!write_ok) {
+          std::cerr << "[EXT_PROC_CACHE] Write failed during body streaming" << std::endl;
+          stream_failed = true;
+          break;
+        }
+        chunk = std::move(next);
+      }
+      if (stream_failed) {
         break;
       }
-    }
-    if (write_failed) {
-      break;
     }
   }
   Finish(grpc::Status::OK);
 }
 
-Awaitable<std::vector<ProcessingResponse>>
+Awaitable<HandleResult>
 ExtProcCacheReactor::handleRequest(const ProcessingRequest& request) {
   if (request.has_request_headers()) {
     co_return co_await handler_->onRequestHeaders(request.request_headers());
@@ -116,10 +137,10 @@ ExtProcCacheReactor::handleRequest(const ProcessingRequest& request) {
     co_return co_await handler_->onResponseHeaders(request.response_headers());
   } else if (request.has_response_body()) {
     auto resp = co_await handler_->onResponseBody(request.response_body());
-    co_return std::vector<ProcessingResponse>{std::move(resp)};
+    co_return HandleResult{std::move(resp), nullptr, 0};
   } else if (request.has_response_trailers()) {
     auto resp = co_await handler_->onResponseTrailers(request.response_trailers());
-    co_return std::vector<ProcessingResponse>{std::move(resp)};
+    co_return HandleResult{std::move(resp), nullptr, 0};
   }
 
   // For request body/trailers or unknown types, just continue.
@@ -129,7 +150,7 @@ ExtProcCacheReactor::handleRequest(const ProcessingRequest& request) {
   } else if (request.has_request_trailers()) {
     response.mutable_request_trailers();
   }
-  co_return std::vector<ProcessingResponse>{std::move(response)};
+  co_return HandleResult{std::move(response), nullptr, 0};
 }
 
 // --- ExtProcCacheService ---

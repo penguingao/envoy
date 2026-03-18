@@ -2,7 +2,6 @@
 
 #include <coroutine>
 #include <memory>
-#include <vector>
 
 #include "envoy/extensions/filters/http/ext_proc/v3/processing_mode.pb.h"
 #include "envoy/service/ext_proc/v3/external_processor.grpc.pb.h"
@@ -57,9 +56,9 @@ private:
   // The main processing coroutine.
   Task run();
 
-  // Build responses for the given request, dispatching to the handler.
-  // Returns multiple responses for StreamedImmediateResponse (cache hits).
-  Awaitable<std::vector<ProcessingResponse>> handleRequest(const ProcessingRequest& request);
+  // Build a response for the given request, dispatching to the handler.
+  // The returned HandleResult may include a body reader for streaming.
+  Awaitable<HandleResult> handleRequest(const ProcessingRequest& request);
 
   // Awaitable that wraps StartRead. Resumes coroutine in OnReadDone.
   struct ReadAwaitable {
