@@ -61,6 +61,7 @@ private:
     bool filling = false;
     bool headers_released = false;
     std::shared_ptr<SharedBodyStream> shared_stream;
+    std::optional<CacheEntryMetadata> released_metadata; // set when headers_released
   };
 
   // Pick waiter with longest remaining deadline, skip expired.

@@ -67,7 +67,17 @@ Awaitable<CoordinatedLookupResult> CacheLookupCoordinator::lookup(
         h.resume();
         return;
       }
-      it->second.waiters.push_back(Waiter{h, deadline, &result});
+      // If headers were already released, give this late waiter a
+      // FollowingBodyReader immediately rather than suspending.
+      auto& pk = it->second;
+      if (pk.headers_released && pk.shared_stream && pk.released_metadata) {
+        result = {LookupStatus::Hit,
+                  CacheEntryMetadata(*pk.released_metadata),
+                  std::make_unique<FollowingBodyReader>(pk.shared_stream)};
+        h.resume();
+        return;
+      }
+      pk.waiters.push_back(Waiter{h, deadline, &result});
     }
 
     CoordinatedLookupResult await_resume() { return std::move(result); }
@@ -89,6 +99,7 @@ void CacheLookupCoordinator::reportHeadersAvailable(
     auto& pk = it->second;
     pk.headers_released = true;
     pk.shared_stream = stream;
+    pk.released_metadata = metadata;
     waiters_to_resume = std::move(pk.waiters);
   }
 
@@ -111,17 +122,13 @@ void CacheLookupCoordinator::reportFillSuccess(
     if (it == pending_.end()) {
       return;
     }
-    if (it->second.headers_released) {
-      // Waiters already released via reportHeadersAvailable. Just clean up.
-      pending_.erase(it);
-      return;
-    }
-    // Fallback: waiters not yet released (e.g. non-cacheable turned cacheable
-    // at store time). Distribute full body.
+    // Grab any remaining waiters (late arrivals after headers were released,
+    // or all waiters if headers were never released).
     waiters_to_resume = std::move(it->second.waiters);
     pending_.erase(it);
   }
 
+  // Resume waiters with the full body.
   for (auto& waiter : waiters_to_resume) {
     *waiter.result_ptr = CoordinatedLookupResult{
         LookupStatus::Hit, CacheEntryMetadata(metadata),
@@ -145,9 +152,10 @@ void CacheLookupCoordinator::reportFillFailure(const std::string& key) {
     pk.filling = false;
 
     if (pk.headers_released) {
-      // Waiters already released and streaming. Signal error on the stream
-      // so FollowingBodyReaders return empty and stop.
+      // Early-released waiters are streaming via FollowingBodyReaders.
+      // Signal error so they stop. Any late arrivals also get TimedOut.
       stream_to_error = std::move(pk.shared_stream);
+      waiters_to_timeout = std::move(pk.waiters);
       pending_.erase(it);
     } else {
       // Waiters not yet released — existing retry logic.
