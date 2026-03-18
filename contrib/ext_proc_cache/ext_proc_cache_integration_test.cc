@@ -421,6 +421,193 @@ TEST_P(ExtProcCacheIntegrationTest, ConditionalRevalidation304) {
   }
 }
 
+// Verifies request coalescing: multiple concurrent requests for the same key
+// result in only one cache miss and one upstream request. The other requests
+// wait and are served from the cached entry once the filler completes.
+TEST_P(ExtProcCacheIntegrationTest, CoalescedCacheFill) {
+  initializeWithExtProc();
+
+  const std::string path = "/test/coalesced";
+  const std::string body = "coalesced response body";
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},
+      {":path", path},
+      {":scheme", "http"},
+      {":authority", "cache-test-host"}};
+  const std::string date = httpDateNow();
+  Http::TestResponseHeaderMapImpl upstream_response_headers{
+      {":status", "200"},
+      {"cache-control", "public, max-age=3600"},
+      {"date", date},
+      {"content-length", std::to_string(body.size())}};
+
+  // Send 3 requests concurrently (non-blocking).
+  auto r1 = codec_client_->makeHeaderOnlyRequest(request_headers);
+  auto r2 = codec_client_->makeHeaderOnlyRequest(request_headers);
+  auto r3 = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  // Only one request should reach upstream (the filler).
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_,
+                                                         fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+
+  // Respond to the single upstream request.
+  upstream_request_->encodeHeaders(upstream_response_headers, false);
+  upstream_request_->encodeData(body, true);
+
+  // All 3 responses should complete.
+  ASSERT_TRUE(r1->waitForEndStream());
+  ASSERT_TRUE(r2->waitForEndStream());
+  ASSERT_TRUE(r3->waitForEndStream());
+
+  // All should get 200 with the same body.
+  EXPECT_EQ("200", r1->headers().getStatusValue());
+  EXPECT_EQ("200", r2->headers().getStatusValue());
+  EXPECT_EQ("200", r3->headers().getStatusValue());
+  EXPECT_EQ(body, r1->body());
+  EXPECT_EQ(body, r2->body());
+  EXPECT_EQ(body, r3->body());
+
+  // Exactly one entry should be in the cache.
+  EXPECT_EQ(store_->size(), 1);
+}
+
+// Verifies filler retry: when the first filler gets a non-cacheable response
+// (500), the coordinator promotes the next waiter to filler, which goes to
+// upstream and successfully fills the cache.
+TEST_P(ExtProcCacheIntegrationTest, FillerFailurePromotesNextFiller) {
+  initializeWithExtProc();
+
+  const std::string path = "/test/filler-retry";
+  const std::string good_body = "successfully cached";
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},
+      {":path", path},
+      {":scheme", "http"},
+      {":authority", "cache-test-host"}};
+
+  // Send 3 requests concurrently.
+  auto r1 = codec_client_->makeHeaderOnlyRequest(request_headers);
+  auto r2 = codec_client_->makeHeaderOnlyRequest(request_headers);
+  auto r3 = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  // First filler reaches upstream.
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_,
+                                                         fake_upstream_connection_));
+  FakeStreamPtr filler1_stream;
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, filler1_stream));
+  ASSERT_TRUE(filler1_stream->waitForEndStream(*dispatcher_));
+
+  // Respond with 500 (not cacheable) — triggers reportFillFailure.
+  Http::TestResponseHeaderMapImpl error_headers{{":status", "500"}};
+  filler1_stream->encodeHeaders(error_headers, true);
+
+  // Second filler is promoted and reaches upstream.
+  FakeStreamPtr filler2_stream;
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, filler2_stream));
+  ASSERT_TRUE(filler2_stream->waitForEndStream(*dispatcher_));
+
+  // Respond with cacheable 200.
+  Http::TestResponseHeaderMapImpl good_headers{
+      {":status", "200"},
+      {"cache-control", "public, max-age=3600"},
+      {"date", httpDateNow()},
+      {"content-length", std::to_string(good_body.size())}};
+  filler2_stream->encodeHeaders(good_headers, false);
+  filler2_stream->encodeData(good_body, true);
+
+  // All 3 should complete. The first filler waits for the retry instead of
+  // forwarding the 500, so all clients get the successful response.
+  ASSERT_TRUE(r1->waitForEndStream());
+  ASSERT_TRUE(r2->waitForEndStream());
+  ASSERT_TRUE(r3->waitForEndStream());
+
+  EXPECT_EQ("200", r1->headers().getStatusValue());
+  EXPECT_EQ("200", r2->headers().getStatusValue());
+  EXPECT_EQ("200", r3->headers().getStatusValue());
+  EXPECT_EQ(good_body, r1->body());
+  EXPECT_EQ(good_body, r2->body());
+  EXPECT_EQ(good_body, r3->body());
+
+  // Cache should have the successful entry.
+  EXPECT_EQ(store_->size(), 1);
+}
+
+// Verifies that when the first filler gets an uncacheable response (no-store),
+// the coordinator promotes the next waiter to filler. The second filler gets
+// a cacheable response and successfully fills the cache for remaining waiters.
+TEST_P(ExtProcCacheIntegrationTest, UncacheableResponseRetries) {
+  initializeWithExtProc();
+
+  const std::string path = "/test/uncacheable-retry";
+  const std::string uncacheable_body = "private data";
+  const std::string cacheable_body = "public data";
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},
+      {":path", path},
+      {":scheme", "http"},
+      {":authority", "cache-test-host"}};
+
+  // Send 3 requests concurrently.
+  auto r1 = codec_client_->makeHeaderOnlyRequest(request_headers);
+  auto r2 = codec_client_->makeHeaderOnlyRequest(request_headers);
+  auto r3 = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  // First filler reaches upstream.
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_,
+                                                         fake_upstream_connection_));
+  FakeStreamPtr filler1_stream;
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, filler1_stream));
+  ASSERT_TRUE(filler1_stream->waitForEndStream(*dispatcher_));
+
+  // Respond with 200 but no-store (uncacheable) — triggers reportFillFailure.
+  Http::TestResponseHeaderMapImpl uncacheable_headers{
+      {":status", "200"},
+      {"cache-control", "no-store"},
+      {"date", httpDateNow()},
+      {"content-length", std::to_string(uncacheable_body.size())}};
+  filler1_stream->encodeHeaders(uncacheable_headers, false);
+  filler1_stream->encodeData(uncacheable_body, true);
+
+  // Second filler is promoted and reaches upstream.
+  FakeStreamPtr filler2_stream;
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, filler2_stream));
+  ASSERT_TRUE(filler2_stream->waitForEndStream(*dispatcher_));
+
+  // Respond with cacheable 200.
+  Http::TestResponseHeaderMapImpl cacheable_headers{
+      {":status", "200"},
+      {"cache-control", "public, max-age=3600"},
+      {"date", httpDateNow()},
+      {"content-length", std::to_string(cacheable_body.size())}};
+  filler2_stream->encodeHeaders(cacheable_headers, false);
+  filler2_stream->encodeData(cacheable_body, true);
+
+  // All 3 should complete.
+  ASSERT_TRUE(r1->waitForEndStream());
+  ASSERT_TRUE(r2->waitForEndStream());
+  ASSERT_TRUE(r3->waitForEndStream());
+
+  // Count responses: 1 got the uncacheable body, 2 got the cacheable body.
+  int uncacheable_count = 0;
+  int cacheable_count = 0;
+  for (auto* r : {r1.get(), r2.get(), r3.get()}) {
+    EXPECT_EQ("200", r->headers().getStatusValue());
+    if (r->body() == uncacheable_body) {
+      uncacheable_count++;
+    } else {
+      EXPECT_EQ(cacheable_body, r->body());
+      cacheable_count++;
+    }
+  }
+  EXPECT_EQ(1, uncacheable_count);
+  EXPECT_EQ(2, cacheable_count);
+
+  // Cache should have the cacheable entry.
+  EXPECT_EQ(store_->size(), 1);
+}
+
 } // namespace
 } // namespace ExtProcCache
 } // namespace Extensions

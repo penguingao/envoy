@@ -241,9 +241,54 @@ CacheStreamHandler::onResponseHeaders(const envoy::service::ext_proc::v3::HttpHe
     // We accumulate them for caching in onResponseBody() and pass them
     // through via StreamedBodyResponse.
   } else {
-    // Not storing — report fill failure.
-    coordinator_->reportFillFailure(current_key_);
+    // Not storing — report fill failure so the coordinator can promote the
+    // next waiter to filler.
     is_filler_ = false;
+    coordinator_->reportFillFailure(current_key_);
+
+    // For server errors (5xx), wait for a retry filler to succeed rather than
+    // forwarding the error to the downstream client.
+    int status_int = 0;
+    (void)absl::SimpleAtoi(status_str, &status_int);
+    if (status_int >= 500) {
+      std::cerr << "[HANDLER] Server error " << status_int
+                << ", waiting for retry filler" << std::endl;
+
+      // Re-enqueue as a waiter by calling lookup() again. If a retry filler
+      // is in progress, we'll suspend until it completes.
+      auto retry_result = co_await coordinator_->lookup(current_key_, deadline_);
+
+      if (retry_result.status == LookupStatus::Hit) {
+        const auto& entry = *retry_result.entry;
+        std::cerr << "[HANDLER] Retry succeeded, serving from cache" << std::endl;
+
+        // Serve the retried entry via ImmediateResponse (replaces the 5xx).
+        ProcessingResponse retry_response;
+        auto* immediate = retry_response.mutable_immediate_response();
+        immediate->mutable_status()->set_code(
+            static_cast<envoy::type::v3::StatusCode>(entry.status_code));
+        immediate->set_body(entry.body);
+
+        auto* header_mutation = immediate->mutable_headers();
+        for (const auto& header : entry.response_headers.headers()) {
+          if (!header.key().empty() && header.key()[0] == ':') {
+            continue;
+          }
+          auto* hvo = header_mutation->add_set_headers();
+          hvo->mutable_header()->set_key(header.key());
+          hvo->mutable_header()->set_raw_value(header.raw_value());
+        }
+        co_return retry_response;
+      }
+
+      if (retry_result.status == LookupStatus::YouFill) {
+        // No fill in progress — give up the accidental filler role.
+        coordinator_->reportFillFailure(current_key_);
+      }
+
+      // Retry failed or timed out — fall through with original error.
+      std::cerr << "[HANDLER] Retry failed, passing through error" << std::endl;
+    }
   }
 
   co_return response;
