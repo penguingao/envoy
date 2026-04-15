@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.parallel_ext_proc.v3;
+
+import "envoy/extensions/filters/http/ext_proc/v3/ext_proc.proto";
+
+import "google/protobuf/duration.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.parallel_ext_proc.v3";
+option java_outer_classname = "ParallelExtProcProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/parallel_ext_proc/v3;parallel_ext_procv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: Parallel External Processing Filter]
+// Parallel External Processing Filter
+// [#extension: envoy.filters.http.parallel_ext_proc]
+
+// Configuration for the parallel external processing filter which sends
+// the same request to multiple external processors in parallel and merges
+// their header mutations by priority.
+message ParallelExternalProcessor {
+  // List of external processor instances to call in parallel.
+  // At least one processor must be configured.
+  repeated ProcessorInstance processors = 1 [(validate.rules).repeated = {min_items: 1}];
+
+  // Policy for handling partial failures when some processors fail.
+  FailurePolicy failure_policy = 2;
+
+  // Overall timeout for all processors to respond. If this timeout is reached
+  // before all processors have responded, the filter will finalize with whatever
+  // results are available, subject to the failure policy.
+  google.protobuf.Duration aggregate_timeout = 3;
+}
+
+// Configuration for a single external processor instance.
+message ProcessorInstance {
+  // A unique name for this processor, used in stats and logging.
+  string name = 1 [(validate.rules).string = {min_len: 1}];
+
+  // Priority for merge ordering. Lower number means higher priority.
+  // When header mutations conflict, the higher-priority processor wins
+  // (its mutations are applied last).
+  uint32 priority = 2;
+
+  // The ext_proc filter configuration for this processor.
+  envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor ext_proc_config = 3
+      [(validate.rules).message = {required: true}];
+
+  // If true, this processor is allowed to modify request/response bodies.
+  // At most one processor should have this set to true.
+  // Other processors will operate in read-only mode for bodies.
+  bool can_modify_body = 4;
+}
+
+// Policy for handling failures when some processors fail to respond.
+message FailurePolicy {
+  // Minimum number of processors that must succeed for the request to proceed.
+  // If set to 0, all processors must succeed (default behavior).
+  uint32 min_success_count = 1;
+
+  // If true, any processor returning an ImmediateResponse will terminate
+  // processing for all processors and send that response downstream.
+  // The highest-priority processor's ImmediateResponse wins if multiple arrive.
+  bool any_immediate_response_terminates = 2;
+
+  // If true, processing continues even when processors fail (fail-open).
+  // If false, any failure beyond the tolerance of min_success_count causes
+  // an error response to be sent downstream.
+  bool failure_mode_allow = 3;
+}
