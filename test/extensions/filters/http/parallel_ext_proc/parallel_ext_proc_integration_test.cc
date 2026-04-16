@@ -69,6 +69,10 @@ protected:
             auto* proc = parallel_config.add_processors();
             proc->set_name(absl::StrCat("processor_", i));
             proc->set_priority(i); // processor_0 has highest priority (lowest number)
+            if (body_modifier_index_.has_value() &&
+                static_cast<int>(body_modifier_index_.value()) == i) {
+              proc->set_can_modify_body(true);
+            }
 
             auto* ext_proc_config = proc->mutable_ext_proc_config();
             std::string cluster_name = absl::StrCat("ext_proc_server_", i);
@@ -157,6 +161,8 @@ protected:
 
   int grpc_upstream_count_ = 2;
   bool failure_mode_allow_ = false;
+  // If set, the processor at this index has can_modify_body=true.
+  absl::optional<uint32_t> body_modifier_index_;
   // Body mode applied to every processor's ext_proc config.
   envoy::extensions::filters::http::ext_proc::v3::ProcessingMode_BodySendMode
       request_body_mode_ =
@@ -431,6 +437,68 @@ TEST_P(ParallelExtProcIntegrationTest, ProcessorsReceiveBodyBeforeResponding) {
   ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
   ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
   EXPECT_EQ(body_data, upstream_request_->body().toString());
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  verifyDownstreamResponse(*response, 200);
+}
+
+// When one processor is designated as the body modifier (can_modify_body=true),
+// its mutated body reaches the upstream. The other processor receives the
+// body as an observer, and its body mutation response is ignored.
+TEST_P(ParallelExtProcIntegrationTest, BodyModifierOutputReachesUpstream) {
+  body_modifier_index_ = 1;
+  request_body_mode_ = envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::BUFFERED;
+  initializeConfig();
+  HttpIntegrationTest::initialize();
+
+  const std::string original_body = "original-body";
+  const std::string observer_ignored_body = "observer-would-have-written-this";
+  const std::string modifier_body = "modifier-output-wins";
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  headers.setMethod("POST");
+  auto encoder_decoder = codec_client_->startRequest(headers);
+  auto& request_encoder = encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(request_encoder, original_body, /*end_stream=*/true);
+
+  for (int i = 0; i < grpc_upstream_count_; ++i) {
+    ProcessingRequest header_req;
+    ASSERT_TRUE(grpc_upstreams_[i]->waitForHttpConnection(*dispatcher_, processor_connections_[i]));
+    ASSERT_TRUE(processor_connections_[i]->waitForNewStream(*dispatcher_, processor_streams_[i]));
+    ASSERT_TRUE(processor_streams_[i]->waitForGrpcMessage(*dispatcher_, header_req));
+    ASSERT_TRUE(header_req.has_request_headers());
+    processor_streams_[i]->startGrpcStream();
+
+    ProcessingResponse header_resp;
+    header_resp.mutable_request_headers();
+    processor_streams_[i]->sendGrpcMessage(header_resp);
+
+    ProcessingRequest body_req;
+    ASSERT_TRUE(processor_streams_[i]->waitForGrpcMessage(*dispatcher_, body_req));
+    ASSERT_TRUE(body_req.has_request_body());
+    // Both processors see the same original body.
+    EXPECT_EQ(original_body, body_req.request_body().body());
+
+    // Observer (processor 0) sends a body mutation that must be ignored.
+    // Modifier (processor 1) sends the body that should reach the upstream.
+    ProcessingResponse body_resp;
+    auto* body_mut = body_resp.mutable_request_body()->mutable_response()->mutable_body_mutation();
+    body_mut->set_body(i == static_cast<int>(body_modifier_index_.value()) ? modifier_body
+                                                                           : observer_ignored_body);
+    processor_streams_[i]->sendGrpcMessage(body_resp);
+  }
+
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+
+  // The modifier's body is what the upstream sees. The observer's body
+  // mutation is discarded, and the original body does not reach upstream
+  // either.
+  EXPECT_EQ(modifier_body, upstream_request_->body().toString());
 
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   verifyDownstreamResponse(*response, 200);

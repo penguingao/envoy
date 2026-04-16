@@ -62,6 +62,10 @@ public:
   std::chrono::milliseconds aggregateTimeout() const { return aggregate_timeout_; }
   ExecutionMode mode() const { return mode_; }
 
+  // Index of the single processor designated as the body modifier, or
+  // absl::nullopt if no processor has can_modify_body=true.
+  absl::optional<uint32_t> bodyModifierIndex() const { return body_modifier_index_; }
+
   uint32_t minSuccessCount() const {
     // 0 means all must succeed.
     return failure_policy_.min_success_count() == 0
@@ -74,6 +78,7 @@ private:
   const envoy::extensions::filters::http::parallel_ext_proc::v3::FailurePolicy failure_policy_;
   const std::chrono::milliseconds aggregate_timeout_;
   ExecutionMode mode_;
+  absl::optional<uint32_t> body_modifier_index_;
 };
 
 using ParallelFilterConfigSharedPtr = std::shared_ptr<ParallelFilterConfig>;

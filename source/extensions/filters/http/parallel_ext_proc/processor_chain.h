@@ -147,11 +147,17 @@ class ProcessorChain : public Http::FilterChainFactory,
                        public Logger::Loggable<Logger::Id::ext_proc> {
 public:
   ProcessorChain(uint32_t index, Http::FilterFactoryCb ext_proc_factory_cb,
-                 uint32_t priority, bool wait_for_end_stream,
+                 uint32_t priority, bool wait_for_end_stream, bool is_body_modifier,
                  ChainCompleteCallback on_complete, ChainErrorCallback on_error,
                  ChainWatermarkCallback on_high_watermark,
                  ChainWatermarkCallback on_low_watermark);
   ~ProcessorChain();
+
+  // Returns the mutated body accumulated by this chain's CaptureFilter.
+  // Only meaningful when the chain was constructed as the body modifier.
+  // Returns an empty buffer otherwise.
+  const Buffer::Instance& modifiedBody() const;
+  bool isBodyModifier() const { return is_body_modifier_; }
 
   // Start processing by copying headers and feeding them through the filter chain.
   void startProcessing(Http::RequestHeaderMap& original_headers, bool end_stream,
@@ -194,6 +200,7 @@ private:
   Http::FilterFactoryCb ext_proc_factory_cb_;
   const uint32_t priority_;
   const bool wait_for_end_stream_;
+  const bool is_body_modifier_;
   ChainCompleteCallback on_complete_;
   ChainErrorCallback on_error_;
   ChainWatermarkCallback on_high_watermark_;

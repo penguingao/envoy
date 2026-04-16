@@ -18,6 +18,30 @@ ParallelFilterConfig::ParallelFilterConfig(
     std::chrono::milliseconds aggregate_timeout)
     : processors_(std::move(processors)), failure_policy_(failure_policy),
       aggregate_timeout_(aggregate_timeout), mode_(ExecutionMode::Buffered) {
+  // Find the designated body modifier (at most one).
+  for (uint32_t i = 0; i < processors_.size(); ++i) {
+    if (processors_[i].can_modify_body) {
+      if (body_modifier_index_.has_value()) {
+        throw EnvoyException(fmt::format(
+            "parallel ext_proc: at most one processor may set can_modify_body=true; "
+            "found it set on both '{}' and '{}'",
+            processors_[body_modifier_index_.value()].name, processors_[i].name));
+      }
+      // The modifier must actually see the body, and must see it in a mode
+      // where ext_proc applies mutations to the filter chain (not streaming).
+      const auto body_mode = processors_[i].processing_mode.request_body_mode();
+      if (body_mode != ExtProcProcessingMode::BUFFERED &&
+          body_mode != ExtProcProcessingMode::STREAMED &&
+          body_mode != ExtProcProcessingMode::BUFFERED_PARTIAL) {
+        throw EnvoyException(fmt::format(
+            "parallel ext_proc: processor '{}' has can_modify_body=true but its "
+            "request_body_mode is not BUFFERED, STREAMED, or BUFFERED_PARTIAL",
+            processors_[i].name));
+      }
+      body_modifier_index_ = i;
+    }
+  }
+
   // Classify execution mode based on aggregate body modes across processors.
   // Streaming mode is selected only if every processor has request_body_mode
   // in {NONE, FULL_DUPLEX_STREAMED}. Any other body mode forces buffered
@@ -44,6 +68,15 @@ ParallelFilterConfig::ParallelFilterConfig(
             p.name));
       }
     }
+  }
+
+  // A body modifier is only supported in buffered mode. If the config
+  // produced streaming mode yet has a modifier, the modifier's body mode
+  // rules above should have already forced buffered mode. Sanity-check and
+  // reject explicitly for clarity.
+  if (body_modifier_index_.has_value() && mode_ == ExecutionMode::Streaming) {
+    throw EnvoyException(
+        "parallel ext_proc: can_modify_body=true is only supported in buffered mode");
   }
 }
 
@@ -75,8 +108,11 @@ ParallelExtProcFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end_s
   const bool wait_for_end_stream = config_->mode() == ExecutionMode::Buffered;
 
   for (uint32_t i = 0; i < processors.size(); ++i) {
+    const bool is_body_modifier =
+        config_->bodyModifierIndex().has_value() && config_->bodyModifierIndex().value() == i;
     auto chain = std::make_unique<ProcessorChain>(
         i, processors[i].ext_proc_factory_cb, processors[i].priority, wait_for_end_stream,
+        is_body_modifier,
         [this](uint32_t idx, Http::RequestHeaderMap& modified) {
           onProcessorComplete(idx, modified);
         },
@@ -250,6 +286,23 @@ void ParallelExtProcFilter::maybeFinalize() {
   if (!completed_deltas_.empty()) {
     HeaderMerger::mergeAndApply(completed_deltas_,
                                 *decoder_callbacks_->requestHeaders());
+  }
+
+  // If a body modifier is designated, replace the main chain's buffered body
+  // with the body accumulated by the modifier's CaptureFilter (i.e. what the
+  // modifier's ext_proc emitted after applying the processor's mutations).
+  // Observer processors' body mutations are ignored.
+  if (config_->bodyModifierIndex().has_value()) {
+    const uint32_t modifier_idx = config_->bodyModifierIndex().value();
+    if (modifier_idx < chains_.size() && chains_[modifier_idx] != nullptr &&
+        chains_[modifier_idx]->completed()) {
+      const Buffer::Instance& modifier_body = chains_[modifier_idx]->modifiedBody();
+      decoder_callbacks_->modifyDecodingBuffer(
+          [&modifier_body](Buffer::Instance& buffer) {
+            buffer.drain(buffer.length());
+            buffer.add(modifier_body);
+          });
+    }
   }
 
   // We are inside a sub-chain FilterManager's decodeHeaders callback (via CaptureFilter).

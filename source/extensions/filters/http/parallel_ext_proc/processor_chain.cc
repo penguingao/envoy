@@ -120,13 +120,20 @@ ChainCallbacks::upstreamStreamOptions() const {
 
 ProcessorChain::ProcessorChain(uint32_t index, Http::FilterFactoryCb ext_proc_factory_cb,
                                uint32_t priority, bool wait_for_end_stream,
-                               ChainCompleteCallback on_complete, ChainErrorCallback on_error,
+                               bool is_body_modifier, ChainCompleteCallback on_complete,
+                               ChainErrorCallback on_error,
                                ChainWatermarkCallback on_high_watermark,
                                ChainWatermarkCallback on_low_watermark)
     : index_(index), ext_proc_factory_cb_(std::move(ext_proc_factory_cb)), priority_(priority),
-      wait_for_end_stream_(wait_for_end_stream), on_complete_(std::move(on_complete)),
-      on_error_(std::move(on_error)), on_high_watermark_(std::move(on_high_watermark)),
+      wait_for_end_stream_(wait_for_end_stream), is_body_modifier_(is_body_modifier),
+      on_complete_(std::move(on_complete)), on_error_(std::move(on_error)),
+      on_high_watermark_(std::move(on_high_watermark)),
       on_low_watermark_(std::move(on_low_watermark)) {}
+
+const Buffer::Instance& ProcessorChain::modifiedBody() const {
+  ASSERT(capture_filter_ != nullptr);
+  return capture_filter_->modifiedBody();
+}
 
 ProcessorChain::~ProcessorChain() { cancel(); }
 
@@ -137,9 +144,11 @@ void ProcessorChain::startProcessing(Http::RequestHeaderMap& original_headers, b
 
   // Create the capture filter with our callback. The trigger mode determines
   // whether the parent is notified on decodeHeaders (streaming) or when
-  // end_stream=true is observed (buffered).
+  // end_stream=true is observed (buffered). If this chain is the designated
+  // body modifier, the CaptureFilter accumulates the post-ext_proc body so
+  // the parent can use it as the body sent upstream.
   capture_filter_ = std::make_shared<CaptureFilter>(
-      index_, wait_for_end_stream_,
+      index_, wait_for_end_stream_, is_body_modifier_,
       [this](uint32_t idx, Http::RequestHeaderMap& hdrs) { onCaptureComplete(idx, hdrs); });
 
   // Create callbacks and filter manager.

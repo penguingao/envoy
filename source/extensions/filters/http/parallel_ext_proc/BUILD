@@ -14,6 +14,7 @@ envoy_cc_library(
     hdrs = ["capture_filter.h"],
     deps = [
         "//envoy/http:filter_interface",
+        "//source/common/buffer:buffer_lib",
     ],
 )
 

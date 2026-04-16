@@ -4,6 +4,8 @@
 
 #include "envoy/http/filter.h"
 
+#include "source/common/buffer/buffer_impl.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
@@ -26,9 +28,16 @@ using CaptureCallback = std::function<void(uint32_t index, Http::RequestHeaderMa
 //   the body stream through independently.
 class CaptureFilter : public Http::StreamDecoderFilter {
 public:
-  CaptureFilter(uint32_t index, bool wait_for_end_stream, CaptureCallback callback)
+  CaptureFilter(uint32_t index, bool wait_for_end_stream, bool is_body_modifier,
+                CaptureCallback callback)
       : index_(index), wait_for_end_stream_(wait_for_end_stream),
-        callback_(std::move(callback)) {}
+        is_body_modifier_(is_body_modifier), callback_(std::move(callback)) {}
+
+  // Returns the body accumulated so far as seen by this filter (i.e. after
+  // ext_proc mutations have been applied). Only populated when this filter
+  // was constructed with is_body_modifier=true.
+  const Buffer::Instance& modifiedBody() const { return modified_body_; }
+  bool isBodyModifier() const { return is_body_modifier_; }
 
   // Http::StreamDecoderFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers,
@@ -41,7 +50,10 @@ public:
     return Http::FilterHeadersStatus::StopIteration;
   }
 
-  Http::FilterDataStatus decodeData(Buffer::Instance&, bool end_stream) override {
+  Http::FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) override {
+    if (is_body_modifier_) {
+      modified_body_.add(data);
+    }
     if (!fired_ && end_stream && headers_ref_ != nullptr) {
       fired_ = true;
       callback_(index_, *headers_ref_);
@@ -66,10 +78,14 @@ public:
 private:
   const uint32_t index_;
   const bool wait_for_end_stream_;
+  const bool is_body_modifier_;
   CaptureCallback callback_;
   Http::StreamDecoderFilterCallbacks* callbacks_{};
   Http::RequestHeaderMap* headers_ref_{};
   bool fired_{false};
+  // Accumulated body bytes as seen after ext_proc mutations. Only populated
+  // when is_body_modifier_ is true.
+  Buffer::OwnedImpl modified_body_;
 };
 
 } // namespace ParallelExtProc
