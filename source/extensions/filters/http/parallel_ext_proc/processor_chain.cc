@@ -1,5 +1,7 @@
 #include "source/extensions/filters/http/parallel_ext_proc/processor_chain.h"
 
+#include "source/common/buffer/buffer_impl.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
@@ -136,6 +138,17 @@ void ProcessorChain::startProcessing(Http::RequestHeaderMap& original_headers, b
   filter_manager_->createFilterChain(*this);
   filter_manager_->requestHeadersInitialized();
   filter_manager_->decodeHeaders(*headers_copy_, end_stream);
+}
+
+void ProcessorChain::forwardData(Buffer::Instance& data, bool end_stream) {
+  if (destroyed_ || completed_ || failed_ || filter_manager_ == nullptr) {
+    return;
+  }
+  // Copy the data so draining/buffering in the sub-chain's FilterManager does
+  // not affect the caller's buffer.
+  Buffer::OwnedImpl data_copy;
+  data_copy.add(data);
+  filter_manager_->decodeData(data_copy, end_stream);
 }
 
 void ProcessorChain::cancel() {

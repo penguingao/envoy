@@ -150,6 +150,9 @@ public:
   void startProcessing(Http::RequestHeaderMap& original_headers, bool end_stream,
                        Http::StreamDecoderFilterCallbacks& parent_callbacks);
 
+  // Forward a copy of request body data to this chain's FilterManager.
+  void forwardData(Buffer::Instance& data, bool end_stream);
+
   // Cancel processing and clean up.
   void cancel();
 

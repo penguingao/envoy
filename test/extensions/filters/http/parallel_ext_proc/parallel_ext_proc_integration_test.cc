@@ -80,6 +80,11 @@ protected:
                 envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::SEND);
             ext_proc_config->mutable_processing_mode()->set_response_header_mode(
                 envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::SKIP);
+            ext_proc_config->mutable_processing_mode()->set_request_body_mode(
+                request_body_mode_);
+            // Use a long message timeout so tests that simulate slow backends
+            // don't trigger the default 200ms ext_proc timeout.
+            ext_proc_config->mutable_message_timeout()->set_seconds(30);
           }
 
           // Apply failure policy if set.
@@ -150,6 +155,10 @@ protected:
 
   int grpc_upstream_count_ = 2;
   bool failure_mode_allow_ = false;
+  // Body mode applied to every processor's ext_proc config.
+  envoy::extensions::filters::http::ext_proc::v3::ProcessingMode_BodySendMode
+      request_body_mode_ =
+          envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::NONE;
   std::vector<FakeUpstream*> grpc_upstreams_;
   std::vector<FakeHttpConnectionPtr> processor_connections_{2};
   std::vector<FakeStreamPtr> processor_streams_{2};
@@ -280,6 +289,145 @@ TEST_P(ParallelExtProcIntegrationTest, NoMutations) {
                         [](const HttpHeaders&, HeadersResponse&) { return true; });
 
   handleUpstreamRequest();
+  verifyDownstreamResponse(*response, 200);
+}
+
+// Verify flow control on the request body: the slowest ext_proc dictates the
+// processing speed. The upstream must not see anything (neither headers nor
+// body) until all ext_proc processors have responded.
+TEST_P(ParallelExtProcIntegrationTest, RequestBodyGatedBySlowestProcessor) {
+  initializeConfig();
+  HttpIntegrationTest::initialize();
+
+  // Start a POST request and send the body.
+  const std::string body_data = "parallel-ext-proc-body-payload";
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  headers.setMethod("POST");
+  auto encoder_decoder = codec_client_->startRequest(headers);
+  auto& request_encoder = encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(request_encoder, body_data, /*end_stream=*/true);
+
+  // Wait for both processors to receive the header request, but do not reply yet.
+  // Processor 0 will be the slow one.
+  ProcessingRequest slow_request;
+  ASSERT_TRUE(grpc_upstreams_[0]->waitForHttpConnection(*dispatcher_, processor_connections_[0]));
+  ASSERT_TRUE(processor_connections_[0]->waitForNewStream(*dispatcher_, processor_streams_[0]));
+  ASSERT_TRUE(processor_streams_[0]->waitForGrpcMessage(*dispatcher_, slow_request));
+  ASSERT_TRUE(slow_request.has_request_headers());
+  processor_streams_[0]->startGrpcStream();
+
+  // Processor 1 (fast) receives the header request and immediately responds.
+  processRequestHeaders(
+      1, /*first_message=*/true, [](const HttpHeaders&, HeadersResponse& resp) {
+        auto* mut = resp.mutable_response()->mutable_header_mutation()->add_set_headers();
+        mut->mutable_header()->set_key("x-from-fast");
+        mut->mutable_header()->set_raw_value("yes");
+        return true;
+      });
+
+  // The main filter chain must still be paused because processor 0 has not
+  // replied yet. Confirm that the upstream cluster sees no connection within
+  // a short window.
+  FakeHttpConnectionPtr premature_upstream_conn;
+  EXPECT_FALSE(fake_upstreams_[0]->waitForHttpConnection(
+      *dispatcher_, premature_upstream_conn, std::chrono::milliseconds(500)));
+  EXPECT_EQ(premature_upstream_conn, nullptr);
+
+  // Now the slow processor replies. This should release the filter chain.
+  ProcessingResponse slow_response;
+  auto* slow_mut = slow_response.mutable_request_headers()
+                       ->mutable_response()
+                       ->mutable_header_mutation()
+                       ->add_set_headers();
+  slow_mut->mutable_header()->set_key("x-from-slow");
+  slow_mut->mutable_header()->set_raw_value("yes");
+  processor_streams_[0]->sendGrpcMessage(slow_response);
+
+  // The upstream should now receive the full request (headers + body).
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+
+  // Body forwarded verbatim, and header mutations from both processors applied.
+  EXPECT_EQ(body_data, upstream_request_->body().toString());
+  EXPECT_THAT(upstream_request_->headers(), ContainsHeader("x-from-fast", "yes"));
+  EXPECT_THAT(upstream_request_->headers(), ContainsHeader("x-from-slow", "yes"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  verifyDownstreamResponse(*response, 200);
+}
+
+// Verify that every ext_proc processor receives the request body (as a
+// ProcessingRequest::request_body message) before it responds, and that the
+// upstream cluster does not see the request until every processor has
+// acknowledged both the headers and the body.
+TEST_P(ParallelExtProcIntegrationTest, ProcessorsReceiveBodyBeforeResponding) {
+  // Configure every processor to receive the body buffered.
+  request_body_mode_ = envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::BUFFERED;
+  initializeConfig();
+  HttpIntegrationTest::initialize();
+
+  // Send a POST with a body.
+  const std::string body_data = "parallel-ext-proc-observed-body";
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  headers.setMethod("POST");
+  auto encoder_decoder = codec_client_->startRequest(headers);
+  auto& request_encoder = encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(request_encoder, body_data, /*end_stream=*/true);
+
+  // Drive each processor: consume the header message, then consume the body
+  // message (which must arrive BEFORE we respond). For each, first check
+  // that the upstream has not yet seen the request.
+  for (int i = 0; i < grpc_upstream_count_; ++i) {
+    ProcessingRequest header_req;
+    ASSERT_TRUE(grpc_upstreams_[i]->waitForHttpConnection(*dispatcher_, processor_connections_[i]));
+    ASSERT_TRUE(processor_connections_[i]->waitForNewStream(*dispatcher_, processor_streams_[i]));
+    ASSERT_TRUE(processor_streams_[i]->waitForGrpcMessage(*dispatcher_, header_req));
+    ASSERT_TRUE(header_req.has_request_headers());
+    processor_streams_[i]->startGrpcStream();
+
+    // Respond to the headers so ext_proc transitions into body processing.
+    ProcessingResponse header_resp;
+    header_resp.mutable_request_headers();
+    processor_streams_[i]->sendGrpcMessage(header_resp);
+
+    // The body message must be delivered to the processor BEFORE the
+    // processor sends its body response.
+    ProcessingRequest body_req;
+    ASSERT_TRUE(processor_streams_[i]->waitForGrpcMessage(*dispatcher_, body_req));
+    ASSERT_TRUE(body_req.has_request_body());
+    EXPECT_EQ(body_data, body_req.request_body().body());
+    EXPECT_TRUE(body_req.request_body().end_of_stream());
+  }
+
+  // At this point every processor has received headers and body but none has
+  // sent a body response. The upstream must still see nothing.
+  FakeHttpConnectionPtr premature_conn;
+  EXPECT_FALSE(fake_upstreams_[0]->waitForHttpConnection(
+      *dispatcher_, premature_conn, std::chrono::milliseconds(500)));
+  EXPECT_EQ(premature_conn, nullptr);
+
+  // Now every processor responds to the body. Only after the last response
+  // should the upstream see the request.
+  for (int i = 0; i < grpc_upstream_count_; ++i) {
+    ProcessingResponse body_resp;
+    body_resp.mutable_request_body();
+    processor_streams_[i]->sendGrpcMessage(body_resp);
+  }
+
+  // Upstream receives the complete request.
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+  EXPECT_EQ(body_data, upstream_request_->body().toString());
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   verifyDownstreamResponse(*response, 200);
 }
 

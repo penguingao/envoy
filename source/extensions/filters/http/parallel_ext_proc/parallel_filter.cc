@@ -48,7 +48,32 @@ ParallelExtProcFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end_s
     aggregate_timer_->enableTimer(config_->aggregateTimeout());
   }
 
+  // StopIteration pauses headers iteration on subsequent filters but still
+  // allows body data to arrive at our decodeData, where we forward it to
+  // every sub-chain so each ext_proc processor sees the body.
   return Http::FilterHeadersStatus::StopIteration;
+}
+
+Http::FilterDataStatus ParallelExtProcFilter::decodeData(Buffer::Instance& data, bool end_stream) {
+  if (finalized_) {
+    return Http::FilterDataStatus::Continue;
+  }
+
+  // Forward a copy of the data to every sub-chain. Each sub-chain's ext_proc
+  // will process the body according to its configured body mode. We pass a
+  // copy so the sub-chain's buffering does not drain or mutate the main
+  // chain's buffer.
+  for (auto& chain : chains_) {
+    if (chain && !chain->failed()) {
+      chain->forwardData(data, end_stream);
+    }
+  }
+
+  // StopIterationAndWatermark buffers the data here and applies flow control
+  // via watermarks. The slowest ext_proc backend therefore dictates body
+  // processing speed: incoming bytes accumulate until the slowest processor
+  // responds and continueDecoding() is posted.
+  return Http::FilterDataStatus::StopIterationAndWatermark;
 }
 
 void ParallelExtProcFilter::onProcessorComplete(uint32_t index,

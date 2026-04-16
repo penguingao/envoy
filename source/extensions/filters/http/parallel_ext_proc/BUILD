@@ -37,6 +37,7 @@ envoy_cc_library(
         ":capture_filter_lib",
         "//envoy/http:filter_interface",
         "//envoy/network:connection_interface",
+        "//source/common/buffer:buffer_lib",
         "//source/common/common:logger_lib",
         "//source/common/http:filter_manager_lib",
         "//source/common/http:header_map_lib",
