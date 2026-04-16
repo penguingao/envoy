@@ -18,10 +18,11 @@ namespace ParallelExtProc {
 
 class ProcessorChain;
 
-// Callback types for chain completion/error.
+// Callback types for chain completion/error/watermark.
 using ChainCompleteCallback =
     std::function<void(uint32_t index, Http::RequestHeaderMap& modified_headers)>;
 using ChainErrorCallback = std::function<void(uint32_t index)>;
+using ChainWatermarkCallback = std::function<void()>;
 
 // FilterManager subclass for processor chains. Follows the UpstreamFilterManager pattern
 // from source/common/router/upstream_request.cc:46-78.
@@ -89,9 +90,13 @@ public:
   OptRef<const Upstream::ClusterInfo> clusterInfo() override;
   Upstream::ClusterInfoConstSharedPtr clusterInfoSharedPtr() override;
 
-  // FilterManagerCallbacks - stream control (mostly no-ops)
-  void onDecoderFilterBelowWriteBufferLowWatermark() override {}
-  void onDecoderFilterAboveWriteBufferHighWatermark() override {}
+  // FilterManagerCallbacks - stream control. The watermark signals bubble up
+  // from the sub-chain's ext_proc when its gRPC sidestream buffer fills up
+  // (processor is slow). We forward them to the ProcessorChain so the parent
+  // parallel filter can aggregate watermarks from every chain and apply
+  // backpressure to the downstream.
+  void onDecoderFilterBelowWriteBufferLowWatermark() override;
+  void onDecoderFilterAboveWriteBufferHighWatermark() override;
   void disarmRequestTimeout() override {}
   void resetIdleTimer() override {}
   void endStream() override {}
@@ -142,8 +147,10 @@ class ProcessorChain : public Http::FilterChainFactory,
                        public Logger::Loggable<Logger::Id::ext_proc> {
 public:
   ProcessorChain(uint32_t index, Http::FilterFactoryCb ext_proc_factory_cb,
-                 uint32_t priority, ChainCompleteCallback on_complete,
-                 ChainErrorCallback on_error);
+                 uint32_t priority, bool wait_for_end_stream,
+                 ChainCompleteCallback on_complete, ChainErrorCallback on_error,
+                 ChainWatermarkCallback on_high_watermark,
+                 ChainWatermarkCallback on_low_watermark);
   ~ProcessorChain();
 
   // Start processing by copying headers and feeding them through the filter chain.
@@ -153,6 +160,9 @@ public:
   // Forward a copy of request body data to this chain's FilterManager.
   void forwardData(Buffer::Instance& data, bool end_stream);
 
+  // Forward request trailers to this chain's FilterManager.
+  void forwardTrailers(Http::RequestTrailerMap& trailers);
+
   // Cancel processing and clean up.
   void cancel();
 
@@ -161,6 +171,11 @@ public:
 
   // Called by ChainFilterManager when sendLocalReply is invoked.
   void onChainError();
+
+  // Called by ChainCallbacks when the sub-chain's ext_proc signals a
+  // sidestream watermark change. Forwarded to the parent via callbacks.
+  void onSubChainAboveHighWatermark();
+  void onSubChainBelowLowWatermark();
 
   uint32_t index() const { return index_; }
   uint32_t priority() const { return priority_; }
@@ -178,8 +193,11 @@ private:
   const uint32_t index_;
   Http::FilterFactoryCb ext_proc_factory_cb_;
   const uint32_t priority_;
+  const bool wait_for_end_stream_;
   ChainCompleteCallback on_complete_;
   ChainErrorCallback on_error_;
+  ChainWatermarkCallback on_high_watermark_;
+  ChainWatermarkCallback on_low_watermark_;
 
   Http::RequestHeaderMapPtr headers_copy_;
   std::unique_ptr<ChainCallbacks> callbacks_;

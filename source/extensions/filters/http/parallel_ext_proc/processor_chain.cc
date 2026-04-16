@@ -43,6 +43,14 @@ ChainCallbacks::ChainCallbacks(ProcessorChain& chain, Http::RequestHeaderMap& re
                                Http::StreamDecoderFilterCallbacks& parent_callbacks)
     : chain_(chain), request_headers_(request_headers), parent_callbacks_(parent_callbacks) {}
 
+void ChainCallbacks::onDecoderFilterAboveWriteBufferHighWatermark() {
+  chain_.onSubChainAboveHighWatermark();
+}
+
+void ChainCallbacks::onDecoderFilterBelowWriteBufferLowWatermark() {
+  chain_.onSubChainBelowLowWatermark();
+}
+
 Http::RequestHeaderMapOptRef ChainCallbacks::requestHeaders() {
   return {request_headers_};
 }
@@ -111,10 +119,14 @@ ChainCallbacks::upstreamStreamOptions() const {
 // --- ProcessorChain ---
 
 ProcessorChain::ProcessorChain(uint32_t index, Http::FilterFactoryCb ext_proc_factory_cb,
-                               uint32_t priority, ChainCompleteCallback on_complete,
-                               ChainErrorCallback on_error)
+                               uint32_t priority, bool wait_for_end_stream,
+                               ChainCompleteCallback on_complete, ChainErrorCallback on_error,
+                               ChainWatermarkCallback on_high_watermark,
+                               ChainWatermarkCallback on_low_watermark)
     : index_(index), ext_proc_factory_cb_(std::move(ext_proc_factory_cb)), priority_(priority),
-      on_complete_(std::move(on_complete)), on_error_(std::move(on_error)) {}
+      wait_for_end_stream_(wait_for_end_stream), on_complete_(std::move(on_complete)),
+      on_error_(std::move(on_error)), on_high_watermark_(std::move(on_high_watermark)),
+      on_low_watermark_(std::move(on_low_watermark)) {}
 
 ProcessorChain::~ProcessorChain() { cancel(); }
 
@@ -123,9 +135,12 @@ void ProcessorChain::startProcessing(Http::RequestHeaderMap& original_headers, b
   // Deep-copy request headers for this chain.
   headers_copy_ = Http::createHeaderMap<Http::RequestHeaderMapImpl>(original_headers);
 
-  // Create the capture filter with our callback.
+  // Create the capture filter with our callback. The trigger mode determines
+  // whether the parent is notified on decodeHeaders (streaming) or when
+  // end_stream=true is observed (buffered).
   capture_filter_ = std::make_shared<CaptureFilter>(
-      index_, [this](uint32_t idx, Http::RequestHeaderMap& hdrs) { onCaptureComplete(idx, hdrs); });
+      index_, wait_for_end_stream_,
+      [this](uint32_t idx, Http::RequestHeaderMap& hdrs) { onCaptureComplete(idx, hdrs); });
 
   // Create callbacks and filter manager.
   callbacks_ = std::make_unique<ChainCallbacks>(*this, *headers_copy_, parent_callbacks);
@@ -141,7 +156,11 @@ void ProcessorChain::startProcessing(Http::RequestHeaderMap& original_headers, b
 }
 
 void ProcessorChain::forwardData(Buffer::Instance& data, bool end_stream) {
-  if (destroyed_ || completed_ || failed_ || filter_manager_ == nullptr) {
+  // Note: completed_ is intentionally NOT checked here. In streaming mode, the
+  // chain is marked "completed" (parent-notified) as soon as headers arrive at
+  // the CaptureFilter, but the sub-chain must continue to receive body chunks
+  // so its ext_proc can stream them to the processor.
+  if (destroyed_ || failed_ || filter_manager_ == nullptr) {
     return;
   }
   // Copy the data so draining/buffering in the sub-chain's FilterManager does
@@ -149,6 +168,31 @@ void ProcessorChain::forwardData(Buffer::Instance& data, bool end_stream) {
   Buffer::OwnedImpl data_copy;
   data_copy.add(data);
   filter_manager_->decodeData(data_copy, end_stream);
+}
+
+void ProcessorChain::forwardTrailers(Http::RequestTrailerMap& trailers) {
+  if (destroyed_ || failed_ || filter_manager_ == nullptr) {
+    return;
+  }
+  filter_manager_->decodeTrailers(trailers);
+}
+
+void ProcessorChain::onSubChainAboveHighWatermark() {
+  if (destroyed_ || failed_) {
+    return;
+  }
+  if (on_high_watermark_) {
+    on_high_watermark_();
+  }
+}
+
+void ProcessorChain::onSubChainBelowLowWatermark() {
+  if (destroyed_ || failed_) {
+    return;
+  }
+  if (on_low_watermark_) {
+    on_low_watermark_();
+  }
 }
 
 void ProcessorChain::cancel() {

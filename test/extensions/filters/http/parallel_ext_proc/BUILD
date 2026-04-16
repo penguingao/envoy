@@ -39,3 +39,20 @@ envoy_extension_cc_test(
         "@envoy_api//envoy/service/ext_proc/v3:pkg_cc_proto",
     ],
 )
+
+envoy_extension_cc_test(
+    name = "parallel_filter_watermark_test",
+    size = "small",
+    srcs = ["parallel_filter_watermark_test.cc"],
+    extension_names = [
+        "envoy.filters.http.parallel_ext_proc",
+        "envoy.filters.http.ext_proc",
+    ],
+    rbe_pool = "4core",
+    tags = ["skip_on_windows"],
+    deps = [
+        "//source/extensions/filters/http/parallel_ext_proc:parallel_ext_proc_lib",
+        "//test/mocks/http:http_mocks",
+        "@envoy_api//envoy/extensions/filters/http/parallel_ext_proc/v3:pkg_cc_proto",
+    ],
+)

@@ -32,6 +32,7 @@ Http::FilterFactoryCb ParallelExtProcFilterFactory::createFilterFactoryFromProto
         proc_instance.priority(),
         std::move(factory_cb_or_error.value()),
         proc_instance.can_modify_body(),
+        proc_instance.ext_proc_config().processing_mode(),
     });
   }
 
