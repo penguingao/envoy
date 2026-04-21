@@ -84,9 +84,6 @@ against a neutral request type.
  │                                              ▼                     │
  │                              Http::AsyncClient → upstream(s)       │
  └────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-                              downstream response
 ```
 
 `AiRequest` is the **shared** neutral model: `RequestDecoder` emits one,
@@ -96,6 +93,69 @@ terminal `*Dispatch` filter for re-encoding. The two sub-chains differ
 only in which `AiFilter` factories they draw from and which `*Dispatch`
 implementation sits at their tail — not in the type that flows through
 them.
+
+### Response path
+
+The response side flows back through the same sub-chain that handled
+the request. Streaming is the common case: each SSE event / chunk is
+processed individually by the chain rather than buffered.
+
+```
+                              downstream response
+                                     ▲
+                                     │
+ ┌────────────────────────────────────────────────────────────────────┐
+ │                  AiProtocolManagerFilter (same instance)           │
+ │                                                                    │
+ │      decoder_callbacks_->encodeHeaders / encodeData / encodeTrailers
+ │                               ▲                                    │
+ │                      ┌────────┴─────────┐                          │
+ │                      │ ResponseEncoder  │  dirty chunks → HTTP/SSE │
+ │                      │                  │  pass-through otherwise  │
+ │                      └────────▲─────────┘                          │
+ │                               │                                    │
+ │                      ┌────────┴─────────┐                          │
+ │                      │ SubChain         │  R3 onResponseEnd        │
+ │                      │  (response       │  R2 onResponseChunk × N  │
+ │                      │   phases over    │     (skip kinds nobody   │
+ │                      │   AiResponse +   │      is interested in)   │
+ │                      │   chunks)        │  R1 onResponseStart      │
+ │                      └────────▲─────────┘                          │
+ │                               │                                    │
+ │          same sub-chain the request picked (Inference | Agent)     │
+ │                               ▲                                    │
+ │                      ┌────────┴─────────┐                          │
+ │                      │ ResponseDecoder  │  upstream headers →      │
+ │                      │  (HTTP/SSE →     │  AiResponse (summary),   │
+ │                      │   AiResponse +   │  then per-event →        │
+ │                      │   AiResponseChunk│  AiResponseChunk stream  │
+ │                      │   stream)        │                          │
+ │                      └────────▲─────────┘                          │
+ │                               │                                    │
+ │                      ┌────────┴─────────┐                          │
+ │                      │ *Dispatch filter │  (owns AsyncStream)      │
+ │                      └────────▲─────────┘                          │
+ │                               │                                    │
+ └────────────────────────────────────────────────────────────────────┘
+                                     ▲
+                                     │
+                               upstream response(s)
+```
+
+The response diagram is drawn flow-up so that **downstream sits at the
+top and upstream at the bottom in both diagrams** — you can stack the
+two and the upstream edges line up, giving one continuous
+downstream→upstream→downstream picture. R1 is at the bottom (earliest,
+closest to the upstream input) and R3 at the top (latest, closest to
+the downstream output), mirroring how request-side Q1 sits near the
+top and dispatch sits at the bottom.
+
+Symmetry with the request side: `AiResponse` plays the envelope role
+(`summary` variant + `headers` + `http_status`), `AiResponseChunk` plays
+the per-item role with the same dirty-flag / skip-optimization
+mechanics. The sub-chain is the same instance as on the request path,
+so per-request `scratch` state set by `onRequestMetadata` is still
+visible to `onResponseStart`.
 
 ## 3. Directory & file layout
 
