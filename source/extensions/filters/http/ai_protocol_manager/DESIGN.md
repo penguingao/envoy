@@ -7,21 +7,29 @@ semantics and config proto are intentionally deferred.
 
 `ai_protocol_manager` is a **decoder-only, terminal** HTTP filter that:
 
-1. Consumes the full HTTP request (headers, body, trailers).
-2. Parses the body as JSON-RPC into a protocol-agnostic internal
+1. Consumes the full HTTP request (method, path, headers, body,
+   trailers). The body may be JSON-RPC (MCP, A2A), REST JSON (OpenAI),
+   or entirely absent (e.g. `GET /v1/responses/{id}`).
+2. Parses that HTTP request into a protocol-agnostic internal
    representation (`AiRequest`) that unifies the common fields of:
-   - **Inference** APIs (OpenAI-style `chat.completions`, `responses`, …)
+   - **Inference** APIs (OpenAI-style `chat.completions`, `responses`,
+     including their non-body verbs like `GET`/`DELETE`/`cancel`).
    - **Agent** protocols (A2A, MCP).
+
+   The representation must hold enough information to reconstruct the
+   original HTTP request semantically without ambiguity — see the
+   **codec round-trip invariant** in §4.3.
 3. Dispatches the `AiRequest` through one of two **sub filter chains**
    exposed to operators:
    - **Inference filter chain** (`inference_chain`) — for model
-     invocations.
+     invocations and response-resource operations.
    - **Agent filter chain** (`agent_chain`) — for agent protocol
      messages.
-4. At the end of each sub-chain, a **terminal dispatch filter** re-encodes
-   the `AiRequest` back into JSON-RPC and forwards it to one or more HTTP
-   backends via `Http::AsyncClient`, then pumps the response(s) back to
-   the downstream caller.
+4. At the end of each sub-chain, a **terminal dispatch filter**
+   re-encodes the `AiRequest` back into a concrete HTTP request (same
+   method/path shape, equivalent body if any) and forwards it to one or
+   more HTTP backends via `Http::AsyncClient`, then pumps the
+   response(s) back to the downstream caller.
 
 The filter replaces what would otherwise be two parallel stacks (one per
 protocol family) and lets AI-aware logic — routing, budgeting, PII
@@ -30,12 +38,13 @@ against a neutral request type.
 
 ### Non-goals (for v0)
 
-- Streaming response translation / SSE fan-in (handled by existing
-  `mcp_router` patterns; can be adopted later).
+- Multi-backend SSE fan-in (merging N upstream SSE streams into one
+  downstream stream — the `mcp_router` fan-in pattern). Single-backend
+  streaming and response-side filter phases **are** in scope; only the
+  N→1 aggregation state machine is deferred.
 - Tokenizer / cost accounting (separate filter, consumes `AiRequest`
   from filter state).
 - gRPC / protobuf transports.
-- Response-side rewriting beyond pass-through (filter is decoder-only).
 
 ## 2. High-level architecture
 
@@ -50,8 +59,9 @@ against a neutral request type.
  │            │                                                       │
  │            ▼                                                       │
  │   ┌──────────────────┐        ┌──────────────────────────────┐     │
- │   │ JsonRpcDecoder   │───────▶│ AiRequest (internal repr.)   │     │
- │   │  (streaming)     │        │  + PayloadRefs → PayloadStore│     │
+ │   │ RequestDecoder   │───────▶│ AiRequest (internal repr.)   │     │
+ │   │ (HTTP + body,    │        │  verb/path/headers + body    │     │
+ │   │  body streamed)  │        │  + PayloadRefs → PayloadStore│     │
  │   └──────────────────┘        └──────────────┬───────────────┘     │
  │                                              │                     │
  │                              classify(protocol) picks ONE chain    │
@@ -68,7 +78,7 @@ against a neutral request type.
  │                      ┌──────────────────┐       ┌──────────────────┐
  │                      │ InferenceDispatch│       │  AgentDispatch   │
  │                      │   (terminal,     │       │    (terminal,    │
- │                      │  JsonRpcEncoder) │       │  JsonRpcEncoder) │
+ │                      │ RequestEncoder)  │       │ RequestEncoder)  │
  │                      └────────┬─────────┘       └────────┬─────────┘
  │                               └──────────────┬───────────┘         │
  │                                              ▼                     │
@@ -79,7 +89,7 @@ against a neutral request type.
                               downstream response
 ```
 
-`AiRequest` is the **shared** neutral model: `JsonRpcDecoder` emits one,
+`AiRequest` is the **shared** neutral model: `RequestDecoder` emits one,
 `classify()` selects which sub-chain runs, and that same `AiRequest`
 (possibly mutated by chain filters) is handed to the sub-chain's
 terminal `*Dispatch` filter for re-encoding. The two sub-chains differ
@@ -103,15 +113,23 @@ ai_protocol_manager/
 ├── filter.h / filter.cc                 # AiProtocolManagerFilter
 ├── filter_config.h / filter_config.cc   # AiProtocolManagerConfig, stats
 │
-│   # Protocol-neutral request model + JSON-RPC codec
+│   # Protocol-neutral request model + HTTP ↔ AiRequest codec
 ├── codec/
-│   ├── ai_request.h / ai_request.cc         # AiRequest, AiResponse, enums
+│   ├── ai_request.h / ai_request.cc         # AiRequest envelope + enums
+│   ├── inference_payload.h / .cc            # InferencePayload variant
+│   ├── agent_payload.h / .cc                # AgentPayload variant
+│   ├── ai_item.h / ai_item.cc               # AiItem + Message/Tool/Attachment
+│   ├── ai_response.h / ai_response.cc       # AiResponse envelope + summaries
+│   ├── ai_response_chunk.h / .cc            # AiResponseChunk + chunk variants
 │   ├── ai_payload.h / ai_payload.cc         # PayloadRef, PayloadStore iface
-│   ├── json_rpc_decoder.h / .cc             # streaming decoder → AiRequest
-│   ├── json_rpc_encoder.h / .cc             # AiRequest → JSON-RPC buffer
-│   ├── inference_mapping.h / .cc            # OpenAI-style ↔ AiRequest
-│   ├── agent_mapping.h / .cc                # A2A + MCP ↔ AiRequest
-│   └── protocol_classifier.h / .cc          # headers+method → ProtocolKind
+│   ├── request_decoder.h / .cc              # HTTP request → AiRequest
+│   ├── request_encoder.h / .cc              # AiRequest → HTTP request
+│   ├── response_decoder.h / .cc             # upstream HTTP/SSE → AiResponse + chunks
+│   ├── response_encoder.h / .cc             # AiResponse + chunks → downstream HTTP/SSE
+│   ├── json_rpc_parser.h / .cc              # streaming JSON-RPC body parser
+│   ├── inference_mapping.h / .cc            # OpenAI ↔ AiRequest/Response
+│   ├── agent_mapping.h / .cc                # A2A + MCP ↔ AiRequest/Response
+│   └── protocol_classifier.h / .cc          # verb+path+headers → ProtocolKind
 │
 │   # Sub-chain machinery (the “ergonomic AI filter chain” surface)
 ├── chain/
@@ -162,20 +180,35 @@ using AiScratch = absl::flat_hash_map<std::string, std::any>;
 
 class AiRequest {
 public:
-  // --- JSON-RPC identity ---
-  std::string jsonrpc_id;       // empty ⇒ notification
-  std::string method;           // raw "method" token
+  // --- HTTP-level identity (always populated; encoder uses these to
+  //     rebuild an equivalent outbound request). ---
+  std::string http_method;   // "GET", "POST", "DELETE", "PATCH", …
+  std::string path;           // e.g. "/v1/responses/resp_abc123"
+  // Parsed path parameters (e.g. {"response_id": "resp_abc123"})
+  // populated by the classifier/mapper from a path pattern.
+  absl::flat_hash_map<std::string, std::string> path_params;
+  // Raw query string key/values.
+  absl::flat_hash_map<std::string, std::string> query_params;
+  // Carried request headers (policy-driven subset: anything that
+  // affects semantics on the backend). The outer filter still owns
+  // the original HeaderMap; this is the filter-visible projection.
+  absl::flat_hash_map<std::string, std::string> headers;
 
-  // --- Protocol discriminator + variant payload ---
+  // --- JSON-RPC identity (populated only for JSON-RPC bodies;
+  //     empty for REST-ish or bodiless requests). ---
+  std::string jsonrpc_id;    // empty ⇒ notification / non-JSON-RPC
+  std::string rpc_method;    // raw "method" token when present
+
+  // --- Protocol discriminator + variant payload. ---
   ProtocolKind protocol{ProtocolKind::Unknown};
   std::variant<std::monostate, InferencePayload, AgentPayload> payload;
 
-  // --- Protocol-neutral small scalars that arrived with the request
-  //     (tenant, user id, request-id, routing hints). Cross-cutting
-  //     filters read from here.
+  // --- Protocol-neutral small scalars (tenant, user id, request-id,
+  //     routing hints). Cross-cutting filters read from here.
   absl::flat_hash_map<std::string, std::string> attributes;
 
-  // --- Streaming intent (OpenAI stream:true, A2A/MCP SSE subscribe). ---
+  // --- Streaming intent (OpenAI stream:true, A2A/MCP SSE subscribe,
+  //     Responses GET with stream=true reattach). ---
   bool streaming{false};
 
   // --- Payload offload: not owned; outer filter owns the store. ---
@@ -197,10 +230,16 @@ public:
 ```cpp
 enum class InferenceInvocation {
   Unknown,
-  ChatCompletion,   // POST /v1/chat/completions
-  Completion,       // POST /v1/completions
-  Responses,        // POST /v1/responses
-  Embeddings,       // POST /v1/embeddings
+  // Bodied creates.
+  ChatCompletion,            // POST /v1/chat/completions
+  Completion,                // POST /v1/completions
+  ResponsesCreate,           // POST /v1/responses
+  Embeddings,                // POST /v1/embeddings
+  // Resource ops on prior responses (body-less or small body).
+  ResponsesRetrieve,         // GET    /v1/responses/{id}
+  ResponsesCancel,           // POST   /v1/responses/{id}/cancel
+  ResponsesDelete,           // DELETE /v1/responses/{id}
+  ResponsesListInputItems,   // GET    /v1/responses/{id}/input_items
   // (Audio, Moderations, Images — added as needed.)
 };
 
@@ -223,6 +262,12 @@ struct SamplingParams {
 struct InferencePayload {
   InferenceInvocation invocation{InferenceInvocation::Unknown};
   ModelTarget         target;
+
+  // Server-side resource identity (populated for ResponsesRetrieve /
+  // Cancel / Delete / ListInputItems; empty for bodied creates).
+  // Sourced from AiRequest::path_params and used by dispatch to route
+  // back to the backend that originally produced the resource.
+  std::string resource_id;
 
   // Potentially large — always PayloadRef so the decoder can offload.
   std::vector<PayloadRef> messages;      // chat turns
@@ -350,46 +395,125 @@ configured byte threshold during streaming, emits an `External` ref
 instead of an `Inline`/`Buffered` one. The encoder resolves refs back
 into the outbound JSON-RPC buffer.
 
-### 4.3 `JsonRpcDecoder` / `JsonRpcEncoder`
+### 4.3 `RequestDecoder` / `RequestEncoder` — HTTP ↔ `AiRequest`
 
-`codec/json_rpc_decoder.h` exposes a streaming interface modeled on the
-existing `McpJsonParser` (see
-`source/extensions/filters/http/mcp/mcp_json_parser.h`). Key properties:
+The codec's job is to translate between a wire-level HTTP request and
+`AiRequest`, regardless of whether there is a body. JSON-RPC / REST
+body parsing is one sub-step driven by the protocol mapper; a bodiless
+request (e.g. `GET /v1/responses/{id}`) is a valid, complete input.
 
 ```cpp
-class JsonRpcDecoder : public Logger::Loggable<Logger::Id::filter> {
+// codec/request_decoder.h
+
+class RequestDecoder : public Logger::Loggable<Logger::Id::filter> {
 public:
-  JsonRpcDecoder(const DecoderConfig&, PayloadStore&);
-  absl::Status onData(absl::string_view chunk);  // incremental
+  RequestDecoder(const DecoderConfig&, PayloadStore&);
+
+  // Called as soon as headers arrive. Populates verb/path/headers on
+  // AiRequest, runs the classifier, picks the mapper, and decides
+  // whether a body is expected.
+  absl::Status onHeaders(const Http::RequestHeaderMap&);
+
+  // Body is streamed incrementally; no-op when no body is expected.
+  absl::Status onData(absl::string_view chunk);
+
+  absl::Status onTrailers(const Http::RequestTrailerMap&);
   absl::Status onEndStream();
-  absl::StatusOr<AiRequest> take();              // owns result
+
+  absl::StatusOr<AiRequest> take();   // owns result
+};
+
+// codec/request_encoder.h
+
+class RequestEncoder {
+public:
+  RequestEncoder(const EncoderConfig&, PayloadStore&);
+
+  // Emits the outbound verb + path + headers + (optional) body buffer.
+  // Body production may require async PayloadStore::fetch calls for
+  // External refs — the caller drives the state machine.
+  struct EncodedRequest {
+    std::string                http_method;
+    std::string                path;
+    Http::RequestHeaderMapPtr  headers;
+    Buffer::InstancePtr        body;       // may be null for bodiless verbs
+  };
+  absl::StatusOr<EncodedRequest> encode(const AiRequest&);
 };
 ```
 
-- Field-level callbacks into a protocol mapper
-  (`InferenceMapping` or `AgentMapping`) which know how to translate
-  OpenAI/A2A/MCP shapes into `AiRequest` fields.
+Implementation notes:
+
+- The JSON-RPC streaming parser from
+  `source/extensions/filters/http/mcp/mcp_json_parser.h` is reused as a
+  helper (`codec/json_rpc_parser.h`); a separate REST-JSON helper
+  handles OpenAI-style bodies. The decoder picks one based on the
+  classifier's output.
 - Streaming sink so large string fields (`messages[*].content`,
   `tool_call.function.arguments`, `attachments[*].data`) can be
   redirected to `PayloadStore` without ever being concatenated in
   memory.
+- For a bodiless request the body helpers are skipped entirely; the
+  mapper populates the variant from `path_params` / `query_params` /
+  `headers`.
 
-`JsonRpcEncoder` is the dual: it writes an `AiRequest` back to a
-`Buffer::Instance`, resolving `PayloadRef`s lazily (supports async
-`fetch()` when a backend demands an inlined body).
+#### Codec round-trip invariant
+
+For any HTTP request R accepted by `RequestDecoder`:
+
+> `RequestEncoder.encode(RequestDecoder(R))` must produce a request R'
+> that a compliant backend interprets **semantically identically** to R.
+
+"Semantically identical" (not byte-identical) means:
+
+- Same HTTP method and the same path (modulo a backend-specific
+  rewrite the dispatch filter may deliberately apply).
+- Same set of semantically meaningful request headers. Hop-by-hop
+  headers and transport-level headers (`Content-Length`, `Host`,
+  `Authorization` for the upstream) may be regenerated.
+- Same JSON body shape when a body is present: every field the mapper
+  modeled appears with the same value, every field it didn't model is
+  carried through `residual_params` verbatim. JSON key order and
+  whitespace are **not** preserved.
+- Bodiless requests round-trip with an empty body.
+
+Any field a mapper cannot losslessly represent must either extend the
+model or be stashed in the variant's residual — dropping is not
+acceptable. This invariant is what makes the filter safe to insert
+transparently in front of AI backends.
 
 ### 4.4 Protocol classification
 
 `codec/protocol_classifier.h`:
 
 ```cpp
-ProtocolKind classify(const Http::RequestHeaderMap&,
-                      absl::string_view jsonrpc_method);
+struct ClassifyInput {
+  absl::string_view http_method;
+  absl::string_view path;
+  const Http::RequestHeaderMap& headers;
+  // JSON-RPC "method" token (empty for REST / bodiless).
+  absl::string_view rpc_method;
+};
+
+struct ClassifyResult {
+  ProtocolKind protocol;
+  // Populated when known from headers/path alone (before body parsing).
+  absl::variant<absl::monostate, InferenceInvocation, AgentInvocation>
+      invocation;
+  // Extracted path params (e.g. response_id), ready to copy into
+  // AiRequest::path_params.
+  absl::flat_hash_map<std::string, std::string> path_params;
+};
+
+ClassifyResult classify(const ClassifyInput&);
 ```
 
-Decides Inference vs Agent (and which agent dialect) from a combination
-of path prefix, `content-type`, an explicit config override, and the
-JSON-RPC `method` token. Output drives which sub-chain runs.
+Classification combines HTTP verb, path pattern, `content-type`, an
+explicit config override, and — when available — the JSON-RPC `method`
+token. Because it runs at `decodeHeaders`, it gets the first shot at
+routing before any body has arrived, which is what lets bodiless
+requests like `GET /v1/responses/{id}` classify correctly without ever
+calling into a body parser.
 
 ### 4.5 `AiItem` — materialized view of a large payload
 
@@ -444,6 +568,127 @@ public:
 
 Filters never construct `AiItem` directly; the runtime does.
 
+### 4.6 `AiResponse` — envelope + variant summary
+
+`codec/ai_response.h`. Applies the same envelope+variant pattern as
+`AiRequest`. The variant holds **summary** scalars only (usage,
+finish_reason, task status) — the actual response content lives in the
+chunk stream (§4.7) because streaming is the common case and buffering
+the whole response before running the chain would defeat the point.
+
+```cpp
+struct InferenceResponseSummary {
+  std::string id;                 // response id echoed from backend
+  std::string model;              // model actually used
+  std::string finish_reason;      // "stop", "length", "tool_calls", "content_filter"
+  struct Usage {
+    absl::optional<int32_t> prompt_tokens;
+    absl::optional<int32_t> completion_tokens;
+    absl::optional<int32_t> total_tokens;
+  } usage;
+  absl::flat_hash_map<std::string, std::string> extra;
+};
+
+struct AgentResponseSummary {
+  AgentDialect dialect{AgentDialect::Unknown};
+  std::string  task_id;           // A2A
+  std::string  task_status;       // "submitted", "working", "completed", "failed"
+  std::string  error_code;        // JSON-RPC error code when applicable
+  absl::flat_hash_map<std::string, std::string> extra;
+};
+
+class AiResponse {
+public:
+  // HTTP-level (populated at onResponseStart).
+  uint32_t http_status{0};
+  absl::flat_hash_map<std::string, std::string> headers;
+
+  // Correlates with the AiRequest that produced this response.
+  std::string jsonrpc_id;
+  ProtocolKind protocol{ProtocolKind::Unknown};
+  std::variant<std::monostate, InferenceResponseSummary, AgentResponseSummary>
+      summary;
+
+  bool streaming{false};
+  PayloadStore* payload_store{nullptr};
+  AiScratch scratch;
+
+  InferenceResponseSummary*       as_inference();
+  const InferenceResponseSummary* as_inference() const;
+  AgentResponseSummary*           as_agent();
+  const AgentResponseSummary*     as_agent() const;
+};
+```
+
+### 4.7 `AiResponseChunk` — materialized streaming chunk
+
+`codec/ai_response_chunk.h`. Symmetric to `AiItem` on the request
+side: a runtime-owned, materialized view that lives only for the
+duration of one `onResponseChunk` call. For streaming responses, one
+chunk per SSE event / delta. For non-streaming responses, a single
+`Final` chunk carrying the whole body.
+
+```cpp
+enum class AiChunkKind {
+  Started,          // response created: id, model, created-at
+  ItemAdded,        // a new output item / choice appeared
+  ContentDelta,     // text/content delta on an item
+  ReasoningDelta,   // reasoning block delta (o1, Responses reasoning)
+  ToolCallDelta,    // tool-call name / arguments delta
+  ItemDone,         // an output item finished
+  Completed,        // response done: finish_reason, usage
+  ErrorEvent,       // upstream error event
+  Final,            // non-streaming: whole body as one chunk
+  Raw,              // protocol event the mapper didn't model
+};
+
+struct ContentDelta {
+  PayloadRef  text;        // offloadable for large deltas / Final bodies
+  std::string content_type;
+};
+
+struct ToolCallDelta {
+  size_t      tool_call_index;
+  std::string name_delta;       // incremental
+  PayloadRef  arguments_delta;  // incremental JSON arguments
+};
+
+struct ItemAdded {
+  std::string role;         // "assistant", "tool", etc.
+  std::string output_type;  // "message", "tool_call", "reasoning", ...
+};
+
+struct Completed {
+  std::string finish_reason;
+  InferenceResponseSummary::Usage usage;
+};
+
+struct FinalBody {
+  PayloadRef body;
+};
+
+class AiResponseChunk {
+public:
+  AiChunkKind kind() const;
+  size_t      item_index() const;     // which output item this chunk belongs to
+  bool        dirty() const;
+  void        markDirty();
+
+  // Typed accessors — populated based on kind().
+  ContentDelta*   as_content_delta();
+  ReasoningDelta* as_reasoning_delta();
+  ToolCallDelta*  as_tool_call_delta();
+  ItemAdded*      as_item_added();
+  Completed*      as_completed();
+  FinalBody*      as_final();
+  // Started / ItemDone / ErrorEvent / Raw accessors likewise.
+};
+```
+
+Filters never construct `AiResponseChunk` directly; the runtime does,
+driven by protocol mappers that translate wire events (OpenAI SSE,
+A2A task events, MCP notifications) into chunks.
+
 ## 5. Filter chain surface (`chain/`)
 
 Operators should be able to write an `AiFilter` in a few dozen lines
@@ -472,35 +717,85 @@ struct AiItemKindSet {
   static AiItemKindSet none();
 };
 
+// Bitset: which response chunk kinds this filter wants onResponseChunk
+// calls for. Same skip-optimization pattern as AiItemKindSet.
+struct AiChunkKindSet {
+  bool started{false};
+  bool item_added{false};
+  bool content_delta{false};
+  bool reasoning_delta{false};
+  bool tool_call_delta{false};
+  bool item_done{false};
+  bool completed{false};
+  bool error_event{false};
+  bool final{false};
+  bool raw{false};
+  static AiChunkKindSet all();
+  static AiChunkKindSet none();
+};
+
 class AiFilter {
 public:
   virtual ~AiFilter() = default;
 
-  // --- Phase 1: scalars only. Always invoked. ---
-  // Sees envelope + variant payload's scalar fields. Does not trigger
-  // payload materialization. Most cross-cutting filters stop here.
+  // ======================== Request side ========================
+
+  // Phase Q1: scalars only. Always invoked. Sees envelope + variant
+  // payload's scalar fields. Does not trigger payload materialization.
+  // Most cross-cutting filters stop here.
   virtual AiFilterStatus onRequestMetadata(AiRequest&, AiFilterCallbacks&) {
     return AiFilterStatus::Continue;
   }
 
-  // --- Phase 2+: per-item, iterated across messages/tools/attachments. ---
-  // Runtime materializes the item from PayloadStore before the call and
-  // re-stores it on return if `item.dirty()`. Only invoked for kinds
-  // this filter declared interest in via itemInterest().
+  // Phase Q2+: per-item, iterated across messages/tools/attachments.
+  // Runtime materializes the item from PayloadStore before the call
+  // and re-stores it on return if `item.dirty()`. Only invoked for
+  // kinds this filter declared interest in via itemInterest().
   virtual AiItemKindSet itemInterest() const { return AiItemKindSet::none(); }
   virtual AiFilterStatus onRequestItem(AiItem&, AiFilterCallbacks&) {
     return AiFilterStatus::Continue;
   }
 
-  // Response path (v0: pass-through; symmetric split added when we
-  // design the response phase).
-  virtual AiFilterStatus onResponse(AiResponse&, AiFilterCallbacks&) {
+  // ======================== Response side =======================
+
+  // Phase R1: upstream response headers arrived. Scalars only:
+  // http_status, response id / model echoed back, early metadata.
+  // Always invoked. No content materialization.
+  virtual AiFilterStatus onResponseStart(AiResponse&, AiFilterCallbacks&) {
+    return AiFilterStatus::Continue;
+  }
+
+  // Phase R2: per-chunk, as chunks arrive from upstream. For streaming
+  // responses: one call per SSE event / delta. For non-streaming
+  // responses: one call with kind=Final carrying the whole body.
+  // Filter declares interest via chunkInterest() — if no filter in
+  // the chain is interested in a kind, chunks of that kind pass
+  // through untouched without materialization.
+  virtual AiChunkKindSet chunkInterest() const {
+    return AiChunkKindSet::none();
+  }
+  virtual AiFilterStatus onResponseChunk(AiResponseChunk&,
+                                         AiFilterCallbacks&) {
+    return AiFilterStatus::Continue;
+  }
+
+  // Phase R3: response complete. Final usage, finish_reason, trailers.
+  // Scalars only. Always invoked after the chunk stream ends.
+  virtual AiFilterStatus onResponseEnd(AiResponse&, AiFilterCallbacks&) {
     return AiFilterStatus::Continue;
   }
 
   virtual void onDestroy() {}
 };
 ```
+
+Assembled-item view on the response side (e.g. "give me the full
+message once all deltas have arrived") is intentionally **not**
+offered in v0. Filters that need complete messages, tool-calls, or
+reasoning blocks for caching / schema validation / output moderation
+buffer across `onResponseChunk` calls themselves. If the buffering
+boilerplate proves common, a gated `onResponseItem` phase can be
+added later. See open questions in §11.
 
 Why one generic `onRequestItem` rather than typed
 `onRequestMessage` / `onRequestTool` / `onRequestAttachment`: most
@@ -522,20 +817,31 @@ public:
   virtual const AiProtocolManagerConfig& config() = 0;
 
   // Resume after StopIteration. Valid at whatever granularity the
-  // pause happened: metadata phase or per-item phase.
+  // pause happened (any request-side or response-side phase).
   virtual void continueRequest() = 0;
   virtual void continueResponse() = 0;
 
-  // Short-circuit the chain and reply directly (e.g. guardrail denial).
-  // Valid in any phase.
+  // Short-circuit BEFORE dispatch: never talks to upstream. Synthesizes
+  // a direct reply (e.g. guardrail denial on the request side).
+  // Valid in any request-side phase.
   virtual void sendLocalReply(AiResponse&&) = 0;
 
+  // Short-circuit DURING/AFTER dispatch: upstream is already engaged;
+  // cut the in-flight response short and emit a synthetic tail
+  // downstream. Valid in any response-side phase.
+  virtual void endResponseEarly(AiResponse&&) = 0;
+
   // --- Per-item callbacks (valid only inside onRequestItem). ---
-  // Drop the current item; it will not be forwarded.
   virtual void dropCurrentItem() = 0;
-  // Queue an item to be inserted after the current one in the same
-  // phase-major position (runs through subsequent filters normally).
   virtual void insertAfter(AiItem&&) = 0;
+
+  // --- Per-chunk callbacks (valid only inside onResponseChunk). ---
+  // Don't forward this chunk downstream.
+  virtual void dropCurrentChunk() = 0;
+  // Inject a chunk after the current one (flows through subsequent
+  // filters, then downstream). Useful e.g. for splicing a synthetic
+  // system message or a guardrail notice into the stream.
+  virtual void insertAfter(AiResponseChunk&&) = 0;
 
   // Emit stats / access-log entries in the AI-manager namespace.
   virtual void recordEvent(AiEvent) = 0;
@@ -557,47 +863,68 @@ sub-chains; the distinction is purely configuration.
 the entire chain before the next begins:
 
 ```
-onRequestMetadata        : f1 → f2 → … → fN
-onRequestItem(msg 0)     : f1 → f2 → … → fN
-onRequestItem(msg 1)     : f1 → f2 → … → fN
-…
-onRequestItem(tool 0)    : f1 → f2 → … → fN
-…
-onRequestItem(attach 0)  : f1 → f2 → … → fN
+Request side
+  onRequestMetadata        : f1 → f2 → … → fN
+  onRequestItem(msg 0)     : f1 → f2 → … → fN
+  onRequestItem(msg 1)     : f1 → f2 → … → fN
+  …
+  onRequestItem(tool 0)    : f1 → f2 → … → fN
+  …
+  onRequestItem(attach 0)  : f1 → f2 → … → fN
+
+(dispatch to upstream; response begins)
+
+Response side
+  onResponseStart          : f1 → f2 → … → fN
+  onResponseChunk(0)       : f1 → f2 → … → fN     ← streaming: one pass per chunk
+  onResponseChunk(1)       : f1 → f2 → … → fN
+  …
+  onResponseEnd            : f1 → f2 → … → fN
 ```
 
 This mirrors the HTTP filter mental model (`decodeHeaders` for all
 filters, then `decodeData` chunks for all filters) and lets the runtime
-stream through large item lists holding only one materialized `AiItem`
-in memory at a time.
+stream through large item lists and chunk streams holding only one
+materialized `AiItem` / `AiResponseChunk` in memory at a time.
 
 **Phase-skip optimization.** At chain-build time the runtime unions
-`itemInterest()` across all filters into a single `AiItemKindSet`. For
-each kind in that union:
+the declared interests across all filters:
 
-- If at least one filter is interested, the runtime iterates that kind,
-  materializing each `AiItem` (via `PayloadStore::fetch`) and running
-  only the interested filters in order.
-- If no filter is interested, the runtime **skips the kind entirely** —
-  the items remain as `PayloadRef`s in the payload variant and are
-  re-encoded by `JsonRpcEncoder` without ever being materialized into
-  filter memory.
+- **Request items** — union of `itemInterest()`. If no filter is
+  interested in a kind (messages / tools / attachments), the runtime
+  **skips the kind entirely** — items remain as `PayloadRef`s in the
+  payload variant and are re-encoded by `RequestEncoder` without ever
+  being materialized into filter memory.
+- **Response chunks** — union of `chunkInterest()`. Chunks of
+  unclaimed kinds pass through untouched to downstream without
+  materialization. A chain full of metadata-only filters never
+  materializes a single streaming delta.
 
 This is the core I/O-hiding guarantee: a chain full of metadata-only
 filters never touches `PayloadStore::fetch`, even when the underlying
 payloads live in external storage.
 
-**Mutation & re-store.** After `onRequestItem` returns, the runtime
-checks `item.dirty()`. Dirty items are written back to `PayloadStore`
-and the owning `PayloadRef` is updated; clean items are left alone. A
-filter paused with `StopIteration` keeps the current item pinned until
-`continueRequest()` is called.
+**Mutation & re-emit.** After `onRequestItem` / `onResponseChunk`
+returns, the runtime checks `.dirty()`. Dirty items are written back
+to `PayloadStore` and the owning `PayloadRef` updated; dirty chunks
+are re-serialized before forwarding downstream. Clean items/chunks
+pass through by reference.
 
 **Pause semantics.** `StopIteration` in any phase pauses the whole
-chain at that point. `continueRequest()` resumes from the same filter
-and same item (if mid-item phase). The runtime serializes per-item
-work — only one item is in flight at a time — to keep the mental model
-simple; parallelism across items is a later optimization.
+chain at that point. `continueRequest()` / `continueResponse()`
+resumes from the same filter and same item/chunk. Per-item and
+per-chunk work is serialized — only one item/chunk is in flight at a
+time — to keep the mental model simple. A slow filter caps end-to-end
+streaming latency by construction; parallelism across chunks is a
+later optimization.
+
+**Early termination — two modes.** `sendLocalReply` (request-side
+phases) never talks to upstream; the chain synthesizes a reply
+directly. `endResponseEarly` (response-side phases) cuts an in-flight
+upstream response short, emits a synthetic tail downstream (e.g. a
+`Completed` chunk with `finish_reason=content_filter`), and tears
+down the upstream stream. Both are terminal — subsequent phases on
+their respective sides are not invoked.
 
 ### 5.4 `InferenceChain` / `AgentChain`
 
@@ -642,48 +969,94 @@ abstraction the way `router` sits outside `http_filters`.
 
 Responsibilities:
 
-1. Invoke `JsonRpcEncoder` to serialize the (possibly rewritten)
-   `AiRequest`.
+1. Invoke `RequestEncoder` to materialize the outbound HTTP request
+   (method, path, headers, optional body) from the possibly-rewritten
+   `AiRequest`. Must honor the §4.3 round-trip invariant.
 2. Resolve per-backend routing: one or N backends (fanout), which
-   cluster / path / auth header set.
+   cluster / path / auth header set. For resource ops
+   (`ResponsesRetrieve` etc.) routing is pinned to the backend that
+   created the resource.
 3. Open streams via `Http::AsyncClient` (reuse the
    `MuxDemux`/`MultiStream` primitives already used by `mcp_router`, see
    `source/extensions/filters/http/mcp_router/backend_stream.h`).
-4. Aggregate / stream responses back to the outer
-   `AiProtocolManagerFilter`, which forwards to the downstream caller.
+4. Feed upstream response headers / body / SSE events into
+   `ResponseDecoder`, which produces `AiResponse` + a stream of
+   `AiResponseChunk`s. The outer `AiProtocolManagerFilter` runs the
+   sub-chain's response-side phases (§5.1) over those chunks and
+   forwards the re-encoded output downstream via
+   `decoder_callbacks_->encodeHeaders/Data/Trailers`.
 
 `InferenceDispatchFilter` and `AgentDispatchFilter` subclass
 `AiDispatchFilter` and supply:
 
-- Backend selection strategy (model-based vs capability-based).
-- Response shape expectations (`chat.completions` chunk framing vs
-  JSON-RPC result / SSE `message` events).
-- Error taxonomy mapping back into `AiResponse`.
+- Backend selection strategy (model-based vs capability-based vs
+  resource-pinned).
+- Response-wire mapping: the protocol-specific translator from
+  upstream SSE / JSON / JSON-RPC events to `AiResponseChunk` kinds
+  (OpenAI `chat.completions` chunk framing, OpenAI Responses typed
+  events, A2A task events, MCP JSON-RPC result/notifications).
+- Error taxonomy mapping back into `AiResponse` / `ErrorEvent`
+  chunks.
 
-## 7. Request lifecycle
+## 7. Request / response lifecycle
 
 ```
-decodeHeaders
-  → classify(protocol) → pick SubChain
-  → install PayloadStore
-  → StopIteration, wait for body
+=============== Request side ===============
 
-decodeData (streaming)
-  → JsonRpcDecoder::onData
+decodeHeaders
+  → RequestDecoder::onHeaders
+     - populates verb/path/path_params/query_params/headers on AiRequest
+     - runs classifier → ProtocolKind + (maybe) invocation → pick SubChain
+  → install PayloadStore
+  → if no body expected (bodiless verb): skip to SubChain dispatch
+  → else: StopIteration, wait for body
+
+decodeData (streaming, only if body present)
+  → RequestDecoder::onData
   → large fields flushed to PayloadStore as External refs
 
 decodeTrailers / end_stream
-  → JsonRpcDecoder::onEndStream → AiRequest
-  → SubChain::run(AiRequest)
-       ├ AiFilter #1 onRequest → Continue
-       ├ AiFilter #2 onRequest → StopIteration … continueRequest()
-       └ …
-  → DispatchFilter
-       ├ JsonRpcEncoder → Buffer
-       ├ Http::AsyncClient → upstream(s)
-       ├ aggregate responses → AiResponse
-       └ SubChain::runResponse(AiResponse)  // v0: no-op
-  → AiProtocolManagerFilter::sendDownstreamResponse
+  → RequestDecoder::onEndStream → AiRequest
+  → SubChain::runRequest(AiRequest)
+       ├ Q1 onRequestMetadata      : f1 → f2 → …
+       ├ Q2 onRequestItem(msg i)   : f1 → f2 → …   (only if any filter
+       │                                            declared interest)
+       ├ Q2' tools / attachments   : same pattern
+       └ any filter may StopIteration → continueRequest()
+         or sendLocalReply → synthesize response, skip dispatch
+
+=============== Dispatch =====================
+
+DispatchFilter
+  ├ RequestEncoder → {method, path, headers, body?}
+  ├ Http::AsyncClient → upstream(s)
+  └ wire up response callbacks → ResponseDecoder
+
+=============== Response side ================
+
+upstream headers arrive
+  → ResponseDecoder::onHeaders → AiResponse (http_status, headers,
+    protocol, summary scalars when known early)
+  → SubChain::runResponse()
+       └ R1 onResponseStart : f1 → f2 → …
+
+upstream body / SSE events arrive (streaming)
+  → ResponseDecoder::onData → one AiResponseChunk per event/delta
+    (or one Final chunk for non-streaming bodies)
+  → for each chunk:
+       R2 onResponseChunk : f1 → f2 → …
+         - chunks of kinds nobody declared interest in are passed
+           through without materialization
+         - dirty chunks are re-serialized by ResponseEncoder before
+           forwarding downstream
+         - any filter may StopIteration (halts the stream) or
+           endResponseEarly (cuts upstream, emits synthetic tail)
+  → ResponseEncoder → forward to downstream via decoder_callbacks
+
+upstream end_stream
+  → ResponseDecoder::onEndStream → AiResponse summary finalized
+  → R3 onResponseEnd : f1 → f2 → …
+  → ResponseEncoder::finalize → downstream end_stream
 ```
 
 ## 8. Stats & observability
@@ -722,8 +1095,12 @@ Plus per-sub-chain histograms for decode/encode/dispatch latency.
 ```
 test/extensions/filters/http/ai_protocol_manager/
 ├── codec/
-│   ├── json_rpc_decoder_test.cc
-│   ├── json_rpc_encoder_test.cc
+│   ├── request_decoder_test.cc
+│   ├── request_encoder_test.cc
+│   ├── response_decoder_test.cc
+│   ├── response_encoder_test.cc
+│   ├── codec_round_trip_test.cc     # invariant from §4.3
+│   ├── json_rpc_parser_test.cc
 │   ├── inference_mapping_test.cc
 │   ├── agent_mapping_test.cc
 │   └── payload_store_test.cc
@@ -752,12 +1129,32 @@ without any HTTP spinup.
 2. **Backpressure to offload**: what is the exact threshold policy —
    per-field byte limit, cumulative budget, or adaptive based on
    cluster memory pressure?
-3. **Response streaming**: v0 treats dispatch as request/response.
-   SSE / chunked streaming (OpenAI stream, A2A events) needs a
-   response-side equivalent of `PayloadRef` and is sketched but not
-   specified.
-4. **Auth / identity propagation**: do we reuse `mcp_router`'s
+3. **Multi-backend SSE fan-in**: v0 dispatch is request/response or
+   single-backend streaming. Merging N upstream SSE streams into one
+   downstream stream (the `mcp_router` fan-in pattern) is deferred;
+   the chunk / `AiResponseChunk` model is designed to accommodate it
+   but the aggregation state machine isn't specified.
+4. **Assembled-item view on the response side**: v0 offers only
+   `onResponseChunk` (streaming deltas) and asks filters that need
+   complete messages / tool-calls to buffer themselves. If the
+   buffering boilerplate becomes common, add an `onResponseItem`
+   phase gated by a declared interest flag, running after all deltas
+   for an item have arrived.
+5. **Auth / identity propagation**: do we reuse `mcp_router`'s
    `SubjectSource` abstraction verbatim, generalize it, or require
-   upstream filters to populate `AiRequest::headers().attributes`?
-5. **Per-route overrides**: probable, modeled after `McpOverrideConfig`;
+   upstream filters to populate `AiRequest::attributes`?
+6. **Per-route overrides**: probable, modeled after `McpOverrideConfig`;
    not yet specified which fields are overridable per route.
+7. **A2A vs MCP split**: `AgentPayload` currently unifies both
+   dialects. Revisit if they diverge more than expected — likely
+   fault line is the `AgentInvocation` enum growing unwieldy.
+8. **`ReasoningDelta` as a distinct chunk kind**: kept separate from
+   `ContentDelta` for strong typing. Alternative is a single
+   `ContentDelta` with a `content_type` sub-field. Decide once there
+   are real filters reading reasoning.
+9. **`Final` chunk kind vs synthetic sequence**: non-streaming
+   responses currently emit a single `Final` chunk. Alternative is
+   to synthesize a `Started` → `ItemAdded` → `ContentDelta` →
+   `ItemDone` → `Completed` sequence so filters see one model. More
+   uniform but adds wire-translation cost on every non-streaming
+   request.
