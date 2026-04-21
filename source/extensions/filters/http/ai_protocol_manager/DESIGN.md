@@ -189,10 +189,12 @@ public:
   absl::flat_hash_map<std::string, std::string> path_params;
   // Raw query string key/values.
   absl::flat_hash_map<std::string, std::string> query_params;
-  // Carried request headers (policy-driven subset: anything that
-  // affects semantics on the backend). The outer filter still owns
-  // the original HeaderMap; this is the filter-visible projection.
-  absl::flat_hash_map<std::string, std::string> headers;
+  // Non-owning view of the downstream request headers (owned by the
+  // outer filter's stream as passed into decodeHeaders). Filters may
+  // read and mutate in place; RequestEncoder reads from this when
+  // building the upstream request. Uses Envoy's native map so we keep
+  // case-insensitivity, inline header slots, and multi-value support.
+  Http::RequestHeaderMap* headers{nullptr};
 
   // --- JSON-RPC identity (populated only for JSON-RPC bodies;
   //     empty for REST-ish or bodiless requests). ---
@@ -601,7 +603,11 @@ class AiResponse {
 public:
   // HTTP-level (populated at onResponseStart).
   uint32_t http_status{0};
-  absl::flat_hash_map<std::string, std::string> headers;
+  // Non-owning view of upstream response headers (owned by the
+  // dispatch filter's AsyncStream). Filters may read/mutate;
+  // ResponseEncoder re-emits downstream from this map. Optional
+  // trailers handled the same way via `trailers` below if needed.
+  Http::ResponseHeaderMap* headers{nullptr};
 
   // Correlates with the AiRequest that produced this response.
   std::string jsonrpc_id;
@@ -848,10 +854,16 @@ public:
 };
 ```
 
-What is **intentionally not exposed**: `Http::RequestHeaderMap`,
-`Buffer::Instance`, route config, cluster manager. If a sub-chain
-filter needs them, it should instead promote the concern into the
-`AiRequest` model — keeps the AI layer HTTP-agnostic.
+What is **intentionally not exposed** through callbacks: raw
+`Buffer::Instance`, route config, cluster manager, direct filter-manager
+plumbing. Headers *are* first-class — `AiRequest::headers` and
+`AiResponse::headers` carry native `Http::RequestHeaderMap` /
+`Http::ResponseHeaderMap` pointers — because HTTP headers are part of
+the request model and wrapping them in a flat map would lose
+case-insensitivity, inline slots, and multi-value support for no
+benefit. The rule is "filters interact through the `AiRequest` /
+`AiResponse` model, not through side-channel HTTP plumbing," not "no
+Envoy HTTP types."
 
 ### 5.3 `AiFilterChain`
 
