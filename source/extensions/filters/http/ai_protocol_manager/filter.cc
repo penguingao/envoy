@@ -49,33 +49,31 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   switch (protocol_) {
   case Codec::ProtocolKind::Unknown:
     config_->stats().rq_classify_unknown_.inc();
-    // Terminal filter — nothing downstream to fall through to. Reject with
-    // 404; operators who want a different status / body can swap it.
-    decoder_callbacks_->sendLocalReply(
-        Http::Code::NotFound, "ai_protocol_manager: path not classified",
-        nullptr, absl::nullopt, "ai_protocol_manager_classify_unknown");
-    return Http::FilterHeadersStatus::StopIteration;
+    // Not AI traffic. Pass through — router handles it as a normal HTTP
+    // route per the HCM config.
+    return Http::FilterHeadersStatus::Continue;
   case Codec::ProtocolKind::Inference:
     config_->stats().rq_inference_.inc();
     break;
   case Codec::ProtocolKind::AgentMcp:
   case Codec::ProtocolKind::AgentA2a:
     config_->stats().rq_agent_.inc();
-    // Agent dispatch lands alongside the agent mapper; until it does, the
-    // terminal-filter contract requires us to reply rather than fall through.
-    decoder_callbacks_->sendLocalReply(
-        Http::Code::NotImplemented, "ai_protocol_manager: agent dispatch not implemented",
-        nullptr, absl::nullopt, "ai_protocol_manager_agent_unimplemented");
-    return Http::FilterHeadersStatus::StopIteration;
+    // Agent dispatch lands alongside the agent mapper. Until then these
+    // requests flow on to the router — operators route them however makes
+    // sense for their topology.
+    return Http::FilterHeadersStatus::Continue;
   }
 
   if (!config_->inferenceDispatchConfigured()) {
-    decoder_callbacks_->sendLocalReply(
-        Http::Code::ServiceUnavailable,
-        "ai_protocol_manager: no inference dispatch configured", nullptr, absl::nullopt,
-        "ai_protocol_manager_no_dispatch");
-    return Http::FilterHeadersStatus::StopIteration;
+    // Inference was classified but no dispatch target is configured on this
+    // filter instance. Pass through — a downstream route / cluster can
+    // still serve it (e.g. proxying to OpenAI without translation).
+    return Http::FilterHeadersStatus::Continue;
   }
+
+  // From here on the filter owns the request: it is an Inference call on a
+  // route where the operator configured an inference_dispatch target.
+  handled_ = true;
 
   payload_store_ = std::make_unique<Codec::InMemoryPayloadStore>();
   Codec::DecoderConfig dc;
@@ -96,12 +94,14 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   if (end_stream) {
     finalizeRequest();
   }
-  // Always StopIteration — the filter is terminal and dispatches itself.
   return Http::FilterHeadersStatus::StopIteration;
 }
 
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data, bool end_stream) {
-  if (!classified_ || decoder_ == nullptr) {
+  if (!handled_) {
+    return Http::FilterDataStatus::Continue;
+  }
+  if (decoder_ == nullptr) {
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
   if (data.length() > 0) {
@@ -127,6 +127,9 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
 
 Http::FilterTrailersStatus
 AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap& /*trailers*/) {
+  if (!handled_) {
+    return Http::FilterTrailersStatus::Continue;
+  }
   finalizeRequest();
   return Http::FilterTrailersStatus::StopIteration;
 }

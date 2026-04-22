@@ -24,27 +24,32 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-// DESIGN.md §2 + §7 — terminal, decoder-only HTTP filter.
+// DESIGN.md §2 + §7 — decoder-only HTTP filter, non-terminal.
 //
 // Lifecycle:
-//   decodeHeaders  → classify; if Unknown / Agent (not yet implemented) /
-//                    no dispatch configured, sendLocalReply and stop.
-//                    Otherwise feed HTTP-level fields into the decoder,
-//                    StopIteration.
-//   decodeData     → feed decoder accumulator.
-//   decodeTrailers → finalizeRequest: decoder.take(), run chain, encode,
-//                    send via Http::AsyncClient to the configured upstream
-//                    cluster.
+//   decodeHeaders  → classify; for Inference-classified requests with a
+//                    dispatch target configured, feed HTTP-level fields
+//                    into the decoder and StopIteration — this request
+//                    will be handled by this filter. Every other path
+//                    (Unknown, Agent-not-yet-implemented, no dispatch
+//                    configured) returns Continue so the router handles
+//                    the request normally.
+//   decodeData     → feed decoder accumulator for handled requests; for
+//                    the Continue path decodeData is a pure pass-through.
+//   decodeTrailers → finalizeRequest on handled requests; Continue
+//                    otherwise.
 //   onSuccess      → build AiResponse, run R1/R2(Final)/R3 through the
 //                    chain, forward to downstream via
 //                    decoder_callbacks_->encodeHeaders / encodeData.
 //   onFailure      → sendLocalReply with a synthesized upstream-error body.
 //
-// Terminal filter: the factory overrides isTerminalFilterByProtoTyped, so
-// Envoy's HCM will not (and must not) accept a router after this filter in
-// the same chain. Every request that reaches decodeHeaders is handled in
-// this filter — either dispatched upstream via AsyncClient or replied to
-// locally.
+// Non-terminal on purpose: a proxy typically carries both AI and non-AI
+// traffic on the same listener, and per-route config decides whether
+// the filter engages (ARCHITECTURE.md §2 / future per-route override).
+// The filter is terminal for the REQUESTS it takes ownership of (those
+// never reach the router), but the chain must contain a terminal filter
+// downstream (typically envoy.filters.http.router) for the requests the
+// filter passes through.
 class AiProtocolManagerFilter : public Http::PassThroughFilter,
                                 public Http::AsyncClient::Callbacks,
                                 public Logger::Loggable<Logger::Id::filter> {
@@ -68,6 +73,13 @@ public:
                                     const Http::ResponseHeaderMap*) override {}
 
 private:
+  // True when this filter has taken ownership of the request (classified
+  // Inference AND an inference_dispatch cluster is configured). False for
+  // every "pass through to router" path: Unknown classification, agent
+  // traffic until the agent mapper lands, or Inference without a dispatch
+  // config. Determines StopIteration vs Continue throughout the request.
+  bool handled_{false};
+
   // Build and send the outbound request. Returns false on error (stats
   // already incremented by the time we return false).
   bool sendUpstream(const Buffer::Instance& encoded_body);

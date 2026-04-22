@@ -32,17 +32,29 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
           stat_prefix: ingress_http
           codec_type: AUTO
-          # ai_protocol_manager is a terminal filter (registered via
-          # isTerminalFilterByProtoTyped=true), so the HCM does not — and
-          # must not — accept a router after it. Every request that lands
-          # here is handled by the filter: classified requests dispatch via
-          # AsyncClient, Unknown / mis-configured requests get a local reply.
-          # route_config is still required by HCM but no route is consulted.
+          # ai_protocol_manager is non-terminal: it takes ownership of
+          # classified Inference requests with a dispatch target, and
+          # passes everything else (Unknown paths, agent traffic until the
+          # agent mapper lands, or Inference without a dispatch configured)
+          # to the router. Non-AI routes on the same listener work as any
+          # normal HTTP proxy route.
           route_config:
-            name: stub_route
+            name: demo_route
             virtual_hosts:
-            - name: stub
+            - name: demo
               domains: ["*"]
+              routes:
+              # AI routes reach this route only if the filter passed them
+              # through (e.g. misconfiguration). Under normal operation the
+              # filter sends them upstream via AsyncClient and injects the
+              # response via encodeHeaders / encodeData — this route is
+              # never consulted.
+              - match: { prefix: "/v1/" }
+                route: { cluster: openai_backend }
+              # Non-AI fallback: anything else on this listener goes to the
+              # same backend. Replace with your real routes.
+              - match: { prefix: "/" }
+                direct_response: { status: 404, body: { inline_string: "no route" } }
           http_filters:
           - name: envoy.filters.http.ai_protocol_manager
             typed_config:
@@ -61,6 +73,11 @@ static_resources:
                   target_schema: OPENAI_PASSTHROUGH
                   upstream_cluster: openai_backend
                   timeout: 30s
+          # Terminal filter — handles everything ai_protocol_manager did not
+          # StopIteration on. Required for any non-trivial HCM config.
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
   clusters:
   - name: openai_backend

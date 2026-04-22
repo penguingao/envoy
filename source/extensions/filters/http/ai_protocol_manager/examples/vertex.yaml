@@ -44,13 +44,17 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
           stat_prefix: ingress_http
           codec_type: AUTO
-          # ai_protocol_manager is a terminal filter; no router after it.
-          # See passthrough.yaml for the rationale.
+          # ai_protocol_manager is non-terminal; router handles anything
+          # the filter does not take ownership of. See passthrough.yaml
+          # for the full rationale.
           route_config:
-            name: stub_route
+            name: demo_route
             virtual_hosts:
-            - name: stub
+            - name: demo
               domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                direct_response: { status: 404, body: { inline_string: "no route" } }
           http_filters:
           - name: envoy.filters.http.ai_protocol_manager
             typed_config:
@@ -73,6 +77,9 @@ static_resources:
                   # what the client put in `model`. Uncomment to lock model:
                   # model_name_override: gemini-2.5-flash
                   timeout: 60s
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
   clusters:
   - name: vertex_backend

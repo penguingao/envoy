@@ -30,16 +30,15 @@ private:
       const std::string& stats_prefix,
       Server::Configuration::ServerFactoryContext& context) override;
 
-  // ai_protocol_manager is terminal: it dispatches to the upstream itself via
-  // Http::AsyncClient and forwards the response via encodeHeaders/encodeData.
-  // The HCM does not need (and rejects) router after this filter. Requests
-  // that the classifier returns Unknown for are handled in-filter with a
-  // local 404 reply rather than passed through. Same pattern as mcp_router.
-  bool isTerminalFilterByProtoTyped(
-      const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager&,
-      Server::Configuration::ServerFactoryContext&) override {
-    return true;
-  }
+  // ai_protocol_manager is NOT a terminal filter. A proxy typically handles
+  // both AI and non-AI traffic on the same ingress; per-route config decides
+  // whether this filter engages. Classified Inference requests that reach
+  // the filter with a dispatch target configured still terminate themselves
+  // (StopIteration + Http::AsyncClient + encodeHeaders), but every other
+  // request path (Unknown classification, no inference_dispatch configured,
+  // the not-yet-implemented agent path) returns Continue so router and the
+  // normal routing machinery handle the request. Operators scope the filter
+  // per-route via typed_per_filter_config (AiProtocolManagerOverride).
 };
 
 } // namespace AiProtocolManager
