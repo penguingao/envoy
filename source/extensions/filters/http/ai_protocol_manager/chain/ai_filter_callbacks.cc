@@ -15,8 +15,11 @@ StreamInfo::StreamInfo& UnreachableCallbacks::streamInfo() { AI_UNREACHABLE(); }
 void UnreachableCallbacks::continueRequest() { AI_UNREACHABLE(); }
 void UnreachableCallbacks::continueResponse() { AI_UNREACHABLE(); }
 void UnreachableCallbacks::sendLocalReply(Codec::AiResponse&&) { AI_UNREACHABLE(); }
+void UnreachableCallbacks::endResponseEarly(Codec::AiResponse&&) { AI_UNREACHABLE(); }
 void UnreachableCallbacks::dropCurrentItem() { AI_UNREACHABLE(); }
 void UnreachableCallbacks::insertAfter(AiItem&&) { AI_UNREACHABLE(); }
+void UnreachableCallbacks::dropCurrentChunk() { AI_UNREACHABLE(); }
+void UnreachableCallbacks::insertAfter(Codec::AiResponseChunk&&) { AI_UNREACHABLE(); }
 void UnreachableCallbacks::recordEvent(const AiEvent&) { AI_UNREACHABLE(); }
 
 #undef AI_UNREACHABLE

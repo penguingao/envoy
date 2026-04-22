@@ -5,6 +5,7 @@
 
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response_chunk.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -19,9 +20,10 @@ class AiItem; // chain/ai_filter_chain.h
 struct AiEvent;
 
 // DESIGN.md §5.2 — narrow interface through which an AiFilter interacts with
-// the world. Intentionally does not expose HTTP primitives (RequestHeaderMap,
-// Buffer, route config, ClusterManager). If a sub-chain filter needs one, the
-// concern should be promoted into AiRequest instead.
+// the world. Filters use the AiRequest / AiResponse model (which exposes
+// real Http::Request/ResponseHeaderMap pointers); they do not get raw
+// Buffer::Instance, route config, or the cluster manager. The rule is "no
+// side-channel HTTP plumbing," not "no Envoy HTTP types."
 class AiFilterCallbacks {
 public:
   virtual ~AiFilterCallbacks() = default;
@@ -30,16 +32,32 @@ public:
   virtual StreamInfo::StreamInfo& streamInfo() = 0;
 
   // Resume after StopIteration. Valid at whatever granularity the pause
-  // happened (metadata or per-item phase).
+  // happened (any request-side or response-side phase).
   virtual void continueRequest() = 0;
   virtual void continueResponse() = 0;
 
-  // Short-circuit the chain and reply directly. Valid in any phase.
+  // Short-circuit BEFORE dispatch: never talks to upstream. Synthesizes a
+  // direct reply (e.g. guardrail denial on the request side). Valid in any
+  // request-side phase.
   virtual void sendLocalReply(Codec::AiResponse&& response) = 0;
+
+  // Short-circuit DURING/AFTER dispatch: upstream is already engaged; cut
+  // the in-flight response short and emit a synthetic tail downstream.
+  // Valid in any response-side phase. Per ARCHITECTURE §2 retry contract,
+  // this is terminal — no re-dispatch after bytes have flowed.
+  virtual void endResponseEarly(Codec::AiResponse&& response) = 0;
 
   // Per-item callbacks (valid only inside onRequestItem).
   virtual void dropCurrentItem() = 0;
   virtual void insertAfter(AiItem&& item) = 0;
+
+  // Per-chunk callbacks (valid only inside onResponseChunk).
+  // Don't forward this chunk downstream.
+  virtual void dropCurrentChunk() = 0;
+  // Inject a chunk after the current one. Flows through subsequent filters,
+  // then downstream. Useful for splicing a synthetic system message or a
+  // guardrail notice into the stream.
+  virtual void insertAfter(Codec::AiResponseChunk&& chunk) = 0;
 
   // Observability entry point.
   virtual void recordEvent(const AiEvent& event) = 0;
@@ -55,8 +73,11 @@ public:
   void continueRequest() override;
   void continueResponse() override;
   void sendLocalReply(Codec::AiResponse&&) override;
+  void endResponseEarly(Codec::AiResponse&&) override;
   void dropCurrentItem() override;
   void insertAfter(AiItem&&) override;
+  void dropCurrentChunk() override;
+  void insertAfter(Codec::AiResponseChunk&&) override;
   void recordEvent(const AiEvent&) override;
 };
 

@@ -14,6 +14,8 @@
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_payload.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request_decoder.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response_chunk.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_config.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 

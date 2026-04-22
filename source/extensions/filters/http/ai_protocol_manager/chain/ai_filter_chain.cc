@@ -16,6 +16,14 @@ AiItemKindSet AiFilterChain::itemInterestUnion() const {
   return out;
 }
 
+AiChunkKindSet AiFilterChain::chunkInterestUnion() const {
+  AiChunkKindSet out = AiChunkKindSet::none();
+  for (const auto& f : filters_) {
+    out = out.unionWith(f->chunkInterest());
+  }
+  return out;
+}
+
 AiFilterStatus AiFilterChain::runMetadata(Codec::AiRequest& req, AiFilterCallbacks& cb) {
   for (auto& f : filters_) {
     const auto s = f->onRequestMetadata(req, cb);
@@ -46,11 +54,35 @@ AiFilterStatus AiFilterChain::runItem(AiItem& item, AiFilterCallbacks& cb) {
   return AiFilterStatus::Continue;
 }
 
-AiFilterStatus AiFilterChain::runResponse(Codec::AiResponse& res, AiFilterCallbacks& cb) {
+AiFilterStatus AiFilterChain::runResponseStart(Codec::AiResponse& res, AiFilterCallbacks& cb) {
   for (auto& f : filters_) {
-    const auto s = f->onResponse(res, cb);
-    if (s == AiFilterStatus::StopIteration) {
-      return s;
+    if (f->onResponseStart(res, cb) == AiFilterStatus::StopIteration) {
+      return AiFilterStatus::StopIteration;
+    }
+  }
+  return AiFilterStatus::Continue;
+}
+
+AiFilterStatus AiFilterChain::runResponseChunk(Codec::AiResponseChunk& chunk,
+                                                AiFilterCallbacks& cb) {
+  // Per ARCHITECTURE §2: chunks of kinds nobody declared interest in must
+  // pass through to downstream without entering the chain. The caller is
+  // responsible for that bypass; the chain itself is the slow path.
+  for (auto& f : filters_) {
+    if (!f->chunkInterest().contains(chunk.kind())) {
+      continue;
+    }
+    if (f->onResponseChunk(chunk, cb) == AiFilterStatus::StopIteration) {
+      return AiFilterStatus::StopIteration;
+    }
+  }
+  return AiFilterStatus::Continue;
+}
+
+AiFilterStatus AiFilterChain::runResponseEnd(Codec::AiResponse& res, AiFilterCallbacks& cb) {
+  for (auto& f : filters_) {
+    if (f->onResponseEnd(res, cb) == AiFilterStatus::StopIteration) {
+      return AiFilterStatus::StopIteration;
     }
   }
   return AiFilterStatus::Continue;

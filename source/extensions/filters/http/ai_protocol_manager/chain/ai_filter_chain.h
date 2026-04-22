@@ -9,6 +9,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/chain/ai_filter_callbacks.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response_chunk.h"
 
 #include "absl/container/flat_hash_map.h"
 
@@ -82,15 +83,26 @@ public:
   // (phase-skip optimization, DESIGN.md §5.3).
   AiItemKindSet itemInterestUnion() const;
 
-  // Run the metadata phase across all filters. Returns the aggregate status:
-  // Continue if every filter continued, StopIteration if any paused.
+  // Compute the union of chunkInterest() across member filters. Same
+  // phase-skip pattern: chunks of unclaimed kinds bypass per-chunk callbacks.
+  AiChunkKindSet chunkInterestUnion() const;
+
+  // Q1: metadata. Returns Continue iff every filter continued.
   AiFilterStatus runMetadata(Codec::AiRequest& req, AiFilterCallbacks& cb);
 
-  // Per-item run: invoke only filters that declared interest in item.kind().
+  // Q2: per-item. Invokes only filters that declared interest in item.kind().
   AiFilterStatus runItem(AiItem& item, AiFilterCallbacks& cb);
 
-  // Response phase (V0 pass-through until the response-side split lands).
-  AiFilterStatus runResponse(Codec::AiResponse& res, AiFilterCallbacks& cb);
+  // R1: upstream response headers arrived. Always invokes every filter.
+  AiFilterStatus runResponseStart(Codec::AiResponse& res, AiFilterCallbacks& cb);
+
+  // R2: per-chunk. Invokes only filters that declared interest in
+  // chunk.kind(). Chunks of unclaimed kinds should be passed through to
+  // downstream by the caller without ever entering the chain.
+  AiFilterStatus runResponseChunk(Codec::AiResponseChunk& chunk, AiFilterCallbacks& cb);
+
+  // R3: response complete. Always invokes every filter.
+  AiFilterStatus runResponseEnd(Codec::AiResponse& res, AiFilterCallbacks& cb);
 
   void onDestroy();
 

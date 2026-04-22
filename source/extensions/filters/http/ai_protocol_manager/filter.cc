@@ -284,26 +284,90 @@ void AiProtocolManagerFilter::onSuccess(const Http::AsyncClient::Request& /*requ
   active_request_ = nullptr;
   config_->stats().rq_dispatch_ok_.inc();
 
-  // Materialize body and capture content-type for the synthetic reply. Phase
-  // 2b is non-streaming: the entire body is buffered and handed to
-  // sendLocalReply. Streaming (SSE) lives in Phase 5.
+  // DESIGN.md §2 + §7: response flows through the sub-chain rather than
+  // bypassing via decoder_callbacks_->sendLocalReply. Phase 4c implements
+  // the non-streaming case — the whole upstream body is wrapped as a
+  // single Final chunk. Streaming (SSE per-event chunks) is a later phase
+  // that swaps the chunk-emission loop without touching the chain surface.
   const uint64_t status = Http::Utility::getResponseStatus(response->headers());
-  std::string body = response->body().toString();
 
-  std::string content_type;
-  const auto* ct_header = response->headers().ContentType();
-  if (ct_header != nullptr) {
-    content_type = std::string(ct_header->value().getStringView());
+  // Take ownership of a copy of the upstream headers so the AiResponse
+  // pointer remains valid after `response` goes out of scope, and so we
+  // can hand the same map to encodeHeaders below.
+  Http::ResponseHeaderMapPtr downstream_headers =
+      Http::createHeaderMap<Http::ResponseHeaderMapImpl>(response->headers());
+
+  Codec::AiResponse ai_response;
+  ai_response.http_status = static_cast<uint32_t>(status);
+  ai_response.headers = downstream_headers.get();
+  ai_response.protocol = protocol_;
+  ai_response.streaming = false;
+  ai_response.payload_store = payload_store_.get();
+
+  Chain::UnreachableCallbacks null_cb;
+
+  // R1 — onResponseStart. Filters see scalars + headers but no body yet.
+  // Empty chain today; this is the hook point real AiFilters land on.
+  if (chain_ != nullptr) {
+    (void)chain_->runResponseStart(ai_response, null_cb);
   }
 
-  decoder_callbacks_->sendLocalReply(
-      static_cast<Http::Code>(status), body,
-      [content_type](Http::ResponseHeaderMap& headers) {
-        if (!content_type.empty()) {
-          headers.setContentType(content_type);
-        }
-      },
-      absl::nullopt, "ai_protocol_manager_dispatch_ok");
+  // R2 — emit a single Final chunk containing the buffered upstream body.
+  // For non-streaming responses (the only path Phase 4c implements) the
+  // whole body must be available before the chain runs: JSON object key
+  // order is unspecified, so a filter that wants to inspect e.g. usage or
+  // tool_calls cannot act on a byte prefix without risking forwarding
+  // unsafe content. The Final-chunk contract is "complete body, parse and
+  // mutate freely; nothing flows downstream until you return."
+  std::string content_type;
+  if (const auto* ct = downstream_headers->ContentType(); ct != nullptr) {
+    content_type = std::string(ct->value().getStringView());
+  }
+  Codec::ChunkFinalBody final_body;
+  final_body.content_type = content_type;
+  if (response->body().length() > 0) {
+    auto buf = std::make_unique<Buffer::OwnedImpl>();
+    buf->add(response->body());
+    final_body.body = Codec::PayloadRef::makeBuffered(std::move(buf), Codec::PayloadKind::Other);
+  }
+  Codec::AiResponseChunk final_chunk = Codec::AiResponseChunk::makeFinal(std::move(final_body));
+  if (chain_ != nullptr) {
+    (void)chain_->runResponseChunk(final_chunk, null_cb);
+  }
+
+  // R3 — onResponseEnd.
+  if (chain_ != nullptr) {
+    (void)chain_->runResponseEnd(ai_response, null_cb);
+  }
+
+  // Forward to downstream via the encode chain. The body bytes come from
+  // the (possibly chain-mutated) Final chunk's PayloadRef — never from the
+  // original upstream buffer — so any markDirty() rewrite by a chain filter
+  // is what the client receives. Per ARCHITECTURE §2 retry contract this is
+  // the point of no return: once headers cross encodeHeaders, mid-stream
+  // failures cannot trigger re-dispatch.
+  Codec::ChunkFinalBody* fb = final_chunk.asFinal();
+  const bool has_body = fb != nullptr && fb->body.size() > 0;
+  decoder_callbacks_->encodeHeaders(std::move(downstream_headers),
+                                    /*end_stream=*/!has_body,
+                                    "ai_protocol_manager_dispatch_ok");
+  if (has_body) {
+    Buffer::OwnedImpl out;
+    switch (fb->body.storage()) {
+    case Codec::PayloadRef::Storage::Inline:
+      out.add(fb->body.inlineView());
+      break;
+    case Codec::PayloadRef::Storage::Buffered:
+      out.add(fb->body.buffered());
+      break;
+    case Codec::PayloadRef::Storage::External:
+      // Async resolution lands with PayloadStore::fetch wiring; for now
+      // External should not appear here because the chain runs synchronously.
+      ENVOY_LOG(error, "ai_protocol_manager: External Final body not yet supported");
+      break;
+    }
+    decoder_callbacks_->encodeData(out, /*end_stream=*/true);
+  }
 }
 
 void AiProtocolManagerFilter::onFailure(const Http::AsyncClient::Request& /*request*/,
