@@ -8,7 +8,9 @@
 #include "source/common/http/headers.h"
 #include "source/common/http/message_impl.h"
 #include "source/common/http/utility.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response_decoder.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/gemini_encoder.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/gemini_response_decoder.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/inference_mapping.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/protocol_classifier.h"
 
@@ -309,22 +311,49 @@ void AiProtocolManagerFilter::onSuccess(const Http::AsyncClient::Request& /*requ
     (void)chain_->runResponseStart(ai_response, null_cb);
   }
 
-  // R2 — emit a single Final chunk containing the buffered upstream body.
-  // For non-streaming responses (the only path Phase 4c implements) the
-  // whole body must be available before the chain runs: JSON object key
-  // order is unspecified, so a filter that wants to inspect e.g. usage or
-  // tool_calls cannot act on a byte prefix without risking forwarding
-  // unsafe content. The Final-chunk contract is "complete body, parse and
-  // mutate freely; nothing flows downstream until you return."
-  std::string content_type;
-  if (const auto* ct = downstream_headers->ContentType(); ct != nullptr) {
-    content_type = std::string(ct->value().getStringView());
+  // Pick the response decoder symmetric to the request encoder. Per
+  // ARCHITECTURE §2 / DESIGN §6 the codec pair is request-tied: whichever
+  // target_schema produced the upstream call is what knows how to decode
+  // the upstream's response back to the downstream client's expected shape.
+  const auto& dispatch = config_->inferenceDispatch();
+  std::unique_ptr<Codec::AiResponseDecoder> response_decoder;
+  switch (dispatch.target_schema) {
+  case InferenceDispatchConfig::TargetSchema::GeminiVertex:
+    response_decoder = std::make_unique<Codec::GeminiResponseDecoder>();
+    break;
+  case InferenceDispatchConfig::TargetSchema::OpenAiPassThrough:
+    response_decoder = std::make_unique<Codec::PassThroughResponseDecoder>();
+    break;
   }
+
+  // Run the upstream body through the decoder to produce the converted
+  // (downstream-shape) body, plus typed summary on AiResponse. Failure here
+  // means the upstream sent something we cannot translate — return 502 so
+  // the client never sees a body in a schema it didn't request.
+  Buffer::OwnedImpl converted;
+  const std::string upstream_body_str = response->body().toString();
+  if (!upstream_body_str.empty()) {
+    auto st = response_decoder->decodeFullBody(upstream_body_str, ai_response, converted);
+    if (!st.ok()) {
+      ENVOY_LOG(warn, "ai_protocol_manager: response decode failed: {}", st.message());
+      decoder_callbacks_->sendLocalReply(Http::Code::BadGateway,
+                                         "upstream response could not be translated", nullptr,
+                                         absl::nullopt, "ai_protocol_manager_response_decode_error");
+      return;
+    }
+  }
+
+  // R2 — wrap the (converted) body as a single Final chunk and run it
+  // through the response chain. Per the JSON-ordering security constraint,
+  // the whole body must be present before any filter sees it; converted
+  // bytes are what flows to downstream after R3 returns.
   Codec::ChunkFinalBody final_body;
-  final_body.content_type = content_type;
-  if (response->body().length() > 0) {
+  // Downstream content-type is always the schema we just decoded into.
+  // Today both target schemas produce JSON; multipart / SSE land later.
+  final_body.content_type = "application/json";
+  if (converted.length() > 0) {
     auto buf = std::make_unique<Buffer::OwnedImpl>();
-    buf->add(response->body());
+    buf->add(converted);
     final_body.body = Codec::PayloadRef::makeBuffered(std::move(buf), Codec::PayloadKind::Other);
   }
   Codec::AiResponseChunk final_chunk = Codec::AiResponseChunk::makeFinal(std::move(final_body));
@@ -344,12 +373,8 @@ void AiProtocolManagerFilter::onSuccess(const Http::AsyncClient::Request& /*requ
   // the point of no return: once headers cross encodeHeaders, mid-stream
   // failures cannot trigger re-dispatch.
   Codec::ChunkFinalBody* fb = final_chunk.asFinal();
-  const bool has_body = fb != nullptr && fb->body.size() > 0;
-  decoder_callbacks_->encodeHeaders(std::move(downstream_headers),
-                                    /*end_stream=*/!has_body,
-                                    "ai_protocol_manager_dispatch_ok");
-  if (has_body) {
-    Buffer::OwnedImpl out;
+  Buffer::OwnedImpl out;
+  if (fb != nullptr && fb->body.size() > 0) {
     switch (fb->body.storage()) {
     case Codec::PayloadRef::Storage::Inline:
       out.add(fb->body.inlineView());
@@ -363,6 +388,22 @@ void AiProtocolManagerFilter::onSuccess(const Http::AsyncClient::Request& /*requ
       ENVOY_LOG(error, "ai_protocol_manager: External Final body not yet supported");
       break;
     }
+  }
+
+  // Re-shape the headers to match the converted body. The upstream's
+  // Content-Length / Content-Type describe the upstream payload, not what
+  // we are about to send downstream — overwrite both. Hop-by-hop transport
+  // headers stay as the upstream sent them.
+  if (fb != nullptr && !fb->content_type.empty()) {
+    downstream_headers->setContentType(fb->content_type);
+  }
+  downstream_headers->setContentLength(out.length());
+
+  const bool has_body = out.length() > 0;
+  decoder_callbacks_->encodeHeaders(std::move(downstream_headers),
+                                    /*end_stream=*/!has_body,
+                                    "ai_protocol_manager_dispatch_ok");
+  if (has_body) {
     decoder_callbacks_->encodeData(out, /*end_stream=*/true);
   }
 }

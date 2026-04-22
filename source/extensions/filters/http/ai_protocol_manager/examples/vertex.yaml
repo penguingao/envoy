@@ -1,14 +1,27 @@
-# ai_protocol_manager — OpenAI → Gemini Vertex translation demo
+# ai_protocol_manager — OpenAI ⇄ Gemini Vertex bidirectional translation
 #
-# Listens on :10000. The client sends an OpenAI chat/completions JSON;
-# the filter parses it, then GeminiEncoder re-emits it as a Gemini
-# generateContent body and rewrites the path to the Vertex template:
-#   /v1/projects/{gcp_project}/locations/{gcp_location}/publishers/google/models/{model}:generateContent
+# Listens on :10000. The full translation:
+#
+#   1. Client sends OpenAI chat/completions JSON.
+#   2. Filter parses → GeminiEncoder re-emits as Gemini generateContent
+#      JSON, path rewritten to the Vertex template
+#         /v1/projects/{gcp_project}/locations/{gcp_location}
+#         /publishers/google/models/{model}:generateContent
+#   3. Vertex (or mock) returns a Gemini generateContent response.
+#   4. GeminiResponseDecoder converts the Gemini response back to an
+#      OpenAI chat.completion JSON (candidates → choices, function calls
+#      → tool_calls, usageMetadata → usage, finishReason mapped per
+#      OPENAI_VERTEX_SPEC.md §4.3).
+#   5. Client receives an OpenAI-shaped chat.completion as if it had
+#      called OpenAI directly — the Gemini schema is invisible to the SDK.
 #
 # Authorization is passed through unchanged; bring your own OAuth bearer.
 #
-# Test against a mock upstream first (see examples/mock_upstream.py with
-# --port 18080), then:
+# Test against the mock upstream (the mock returns a Gemini-shaped reply
+# whenever the inbound path contains "publishers/google/models", which the
+# filter's path rewrite guarantees):
+#
+#   python3 examples/mock_upstream.py     # in another terminal, port 18080
 #   envoy -c vertex.yaml --log-level info
 #   curl -sS http://127.0.0.1:10000/v1/chat/completions \
 #     -H 'content-type: application/json' \
@@ -17,16 +30,20 @@
 #          "messages":[{"role":"system","content":"be concise"},
 #                      {"role":"user","content":"summarize Envoy"}]}'
 #
-# Expected: mock upstream receives a path of the form
-#   /v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent
-# and a Gemini-shaped JSON body with `contents`, `systemInstruction`,
-# and `generationConfig.temperature`. The mock can echo a
-# generateContent-shaped response — Phase 4c does not yet do response
-# translation, so the client sees the upstream body verbatim.
+# What the mock sees: POST /v1/projects/my-project/locations/us-central1
+# /publishers/google/models/gemini-2.5-flash:generateContent with a
+# Gemini body (contents[], systemInstruction, generationConfig).
 #
-# To point at real Vertex, change the cluster to a STRICT_DNS endpoint
-# at us-central1-aiplatform.googleapis.com:443 and add a
-# transport_socket with TLS. Keep the OAuth bearer in the request.
+# What the client sees: a normal OpenAI chat.completion JSON with
+# {id, object: "chat.completion", choices[0].message.content, usage}.
+#
+# Streaming (Gemini streamGenerateContent SSE → OpenAI chat.completion.chunk
+# SSE) is a follow-up phase; this config sets timeout 60s for the
+# non-streaming path.
+#
+# To point at real Vertex, change the cluster to a STRICT_DNS endpoint at
+# {region}-aiplatform.googleapis.com:443 with a TLS transport_socket and
+# keep a real OAuth2 bearer in the request.
 
 admin:
   address:
