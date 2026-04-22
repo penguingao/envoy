@@ -77,15 +77,8 @@ public:
   const AgentPayload* asAgent() const;
 };
 
-// Response envelope — kept minimal for V0. DESIGN.md §4.1.5 notes we apply the
-// same envelope+variant pattern if response-side logic grows protocol-specific.
-struct AiResponse {
-  int status_code{0};
-  absl::flat_hash_map<std::string, std::string> headers;
-  // Response body is left as a raw buffer handle in V0; the response-side
-  // variant is specified when we design the response phase.
-  std::unique_ptr<Buffer::Instance> body;
-};
+// AiResponse moved to codec/ai_response.h as of Phase 4b — it now carries
+// the same envelope + variant-summary shape as AiRequest per DESIGN §4.6.
 
 } // namespace Codec
 } // namespace AiProtocolManager

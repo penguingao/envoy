@@ -110,6 +110,23 @@ struct ResponseFormat {
   std::string regex;
 };
 
+// DESIGN.md §4.6 — protocol-neutral response summary for inference traffic.
+// Scalars only; streaming deltas and the assembled body flow separately as
+// AiResponseChunks (Phase 4c). Filled in by the response-side mapper when
+// upstream headers / a first chunk / the final chunk arrive.
+struct InferenceResponseSummary {
+  std::string id;              // response id echoed from backend
+  std::string model;           // model actually used
+  std::string finish_reason;   // "stop", "length", "tool_calls", "content_filter"
+  struct Usage {
+    absl::optional<int32_t> prompt_tokens;
+    absl::optional<int32_t> completion_tokens;
+    absl::optional<int32_t> total_tokens;
+  };
+  Usage usage;
+  absl::flat_hash_map<std::string, std::string> extra;
+};
+
 // OPENAI_VERTEX_SPEC.md §2.1 rule: system + developer messages merge into a
 // single systemInstruction when encoded for Gemini. We keep them split out
 // here because the OpenAI encoder needs them interleaved with user/assistant

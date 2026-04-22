@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response.h"
 
 namespace Envoy {
 namespace Extensions {

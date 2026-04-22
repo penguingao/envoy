@@ -10,6 +10,7 @@
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request_encoder.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response.h"
 
 #include "absl/status/status.h"
 

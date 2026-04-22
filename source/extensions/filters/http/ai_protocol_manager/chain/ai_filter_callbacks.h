@@ -4,6 +4,7 @@
 #include "envoy/stream_info/stream_info.h"
 
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response.h"
 
 namespace Envoy {
 namespace Extensions {

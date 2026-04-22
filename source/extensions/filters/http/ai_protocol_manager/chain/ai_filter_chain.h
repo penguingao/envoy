@@ -8,6 +8,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/chain/ai_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain/ai_filter_callbacks.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response.h"
 
 #include "absl/container/flat_hash_map.h"
 

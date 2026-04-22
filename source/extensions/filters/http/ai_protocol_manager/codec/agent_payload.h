@@ -5,6 +5,8 @@
 
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_payload.h"
 
+#include "absl/container/flat_hash_map.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
@@ -63,6 +65,16 @@ struct AgentPayload {
   PayloadRef capabilities;        // Initialize
 
   PayloadRef residual_params;
+};
+
+// DESIGN.md §4.6 — protocol-neutral response summary for agent traffic.
+// Scalars only; per-event content flows as AiResponseChunk (Phase 4c).
+struct AgentResponseSummary {
+  AgentDialect dialect{AgentDialect::Unknown};
+  std::string task_id;          // A2A
+  std::string task_status;      // "submitted", "working", "completed", "failed"
+  std::string error_code;       // JSON-RPC error code when applicable
+  absl::flat_hash_map<std::string, std::string> extra;
 };
 
 } // namespace Codec
