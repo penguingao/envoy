@@ -37,8 +37,13 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
                                                                  bool end_stream) {
   config_->stats().rq_total_.inc();
 
-  // DESIGN.md §4.4 — path-prefix classification.
-  protocol_ = Codec::classify(headers, /*method=*/"", config_->classifierPrefixes());
+  // DESIGN.md §4.4 — classify on verb + path + headers. V0 is path-prefix.
+  const Codec::ClassifyInput ci{
+      headers.getMethodValue(), headers.getPathValue(), headers,
+      /*rpc_method=*/"",         config_->classifierPrefixes(),
+  };
+  const Codec::ClassifyResult cr = Codec::classify(ci);
+  protocol_ = cr.protocol;
   classified_ = true;
 
   switch (protocol_) {
@@ -62,18 +67,14 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   decoder_ = std::make_unique<Codec::AiRequestDecoder>(dc, *payload_store_, protocol_);
   chain_ = std::make_unique<Chain::AiFilterChain>(std::vector<Chain::AiFilterPtr>{});
 
-  // Capture request metadata for the outbound call before the request
-  // continues. Some fields (e.g. :path) can be mutated by later filters.
-  request_path_ = std::string(headers.getPathValue());
-  request_host_ = std::string(headers.getHostValue());
-  request_method_ = std::string(headers.getMethodValue());
-  content_type_ = std::string(headers.getContentTypeValue());
-  if (content_type_.empty()) {
-    content_type_ = Http::Headers::get().ContentTypeValues.Json;
-  }
-  const auto auth_header = headers.get(Http::CustomHeaders::get().Authorization);
-  if (!auth_header.empty()) {
-    authorization_ = std::string(auth_header[0]->value().getStringView());
+  // DESIGN.md §4.1 — feed HTTP-level identity into the decoder's internal
+  // AiRequest scaffold; keep a non-owning pointer to the header map for
+  // sendUpstream reads (Authorization / Host / Content-Type). Filter manager
+  // owns `headers` for the stream's lifetime.
+  downstream_headers_ = &headers;
+  if (auto st = decoder_->onHeaders(headers); !st.ok()) {
+    config_->stats().rq_decode_error_.inc();
+    decoder_.reset();
   }
 
   if (config_->inferenceDispatchConfigured()) {
@@ -204,8 +205,25 @@ bool AiProtocolManagerFilter::sendUpstream(const Buffer::Instance& encoded_body)
     return false;
   }
 
+  // All downstream-derived request fields are read off the captured header
+  // map, not a string snapshot. Headers remain valid: the filter manager
+  // owns this map for the whole stream, and we're still inside that stream.
+  const Http::RequestHeaderMap* dh = downstream_headers_;
+  absl::string_view ds_path = dh != nullptr ? dh->getPathValue() : absl::string_view{};
+  absl::string_view ds_host = dh != nullptr ? dh->getHostValue() : absl::string_view{};
+  absl::string_view ds_method = dh != nullptr ? dh->getMethodValue() : absl::string_view{};
+  absl::string_view ds_content_type = dh != nullptr ? dh->getContentTypeValue()
+                                                    : absl::string_view{};
+  absl::string_view ds_auth;
+  if (dh != nullptr) {
+    const auto auth_header = dh->get(Http::CustomHeaders::get().Authorization);
+    if (!auth_header.empty()) {
+      ds_auth = auth_header[0]->value().getStringView();
+    }
+  }
+
   std::string path;
-  std::string host = dispatch.upstream_host.empty() ? request_host_ : dispatch.upstream_host;
+  std::string host = dispatch.upstream_host.empty() ? std::string(ds_host) : dispatch.upstream_host;
   std::string method = "POST";
   std::string content_type = "application/json";
 
@@ -228,9 +246,11 @@ bool AiProtocolManagerFilter::sendUpstream(const Buffer::Instance& encoded_body)
       absl::StrAppend(&path, "?alt=sse");
     }
   } else {
-    path = dispatch.upstream_path_override.empty() ? request_path_ : dispatch.upstream_path_override;
-    method = request_method_.empty() ? "POST" : request_method_;
-    content_type = content_type_;
+    path = dispatch.upstream_path_override.empty() ? std::string(ds_path)
+                                                    : dispatch.upstream_path_override;
+    method = ds_method.empty() ? "POST" : std::string(ds_method);
+    content_type = ds_content_type.empty() ? std::string(Http::Headers::get().ContentTypeValues.Json)
+                                            : std::string(ds_content_type);
   }
 
   auto headers = Http::createHeaderMap<Http::RequestHeaderMapImpl>({
@@ -244,8 +264,8 @@ bool AiProtocolManagerFilter::sendUpstream(const Buffer::Instance& encoded_body)
   // providing an OAuth2 bearer today; proper GCP service-account signing
   // belongs in a companion filter (the existing gcp_authn filter or a
   // dedicated one) and is out of scope for Phase 3a.
-  if (!authorization_.empty()) {
-    headers->addReferenceKey(Http::CustomHeaders::get().Authorization, authorization_);
+  if (!ds_auth.empty()) {
+    headers->addReferenceKey(Http::CustomHeaders::get().Authorization, std::string(ds_auth));
   }
 
   auto message = std::make_unique<Http::RequestMessageImpl>(std::move(headers));

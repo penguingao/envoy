@@ -17,6 +17,19 @@ AiRequestDecoder::AiRequestDecoder(const DecoderConfig& config, PayloadStore& st
     : config_(config), store_(store), protocol_(protocol),
       accumulator_(std::make_unique<Buffer::OwnedImpl>()) {}
 
+absl::Status AiRequestDecoder::onHeaders(Http::RequestHeaderMap& headers) {
+  if (headers_captured_) {
+    return absl::FailedPreconditionError("onHeaders called twice");
+  }
+  headers_captured_ = true;
+  pending_.headers = &headers;
+  pending_.http_method = std::string(headers.getMethodValue());
+  pending_.path = std::string(headers.getPathValue());
+  // path_params / query_params are populated by the classifier; a pattern
+  // extractor for Responses resource ops lands alongside those invocations.
+  return absl::OkStatus();
+}
+
 absl::Status AiRequestDecoder::onData(absl::string_view chunk) {
   if (ended_) {
     return absl::FailedPreconditionError("onData after onEndStream");
@@ -35,7 +48,10 @@ absl::StatusOr<AiRequest> AiRequestDecoder::take() {
     return absl::FailedPreconditionError("take() before onEndStream");
   }
 
-  AiRequest req;
+  // Start from the scaffold onHeaders built (http_method / path / headers*).
+  // onHeaders is expected but not strictly required — a decoder used purely
+  // for body parsing still gets the protocol/payload_store defaults.
+  AiRequest req = std::move(pending_);
   req.protocol = protocol_;
   req.payload_store = &store_;
 

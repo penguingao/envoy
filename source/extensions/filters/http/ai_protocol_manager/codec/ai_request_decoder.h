@@ -46,6 +46,12 @@ class AiRequestDecoder : public Logger::Loggable<Logger::Id::filter> {
 public:
   AiRequestDecoder(const DecoderConfig& config, PayloadStore& store, ProtocolKind protocol);
 
+  // Capture HTTP-level identity onto the internal AiRequest before the body
+  // starts flowing. The headers reference is stored non-owning; the caller
+  // (outer filter) guarantees it outlives take(). Safe to call at most once.
+  // DESIGN.md §4.3.
+  absl::Status onHeaders(Http::RequestHeaderMap& headers);
+
   absl::Status onData(absl::string_view chunk);
   absl::Status onEndStream();
   absl::StatusOr<AiRequest> take();
@@ -56,6 +62,11 @@ private:
   ProtocolKind protocol_;
   std::unique_ptr<Buffer::Instance> accumulator_;
   bool ended_{false};
+
+  // Pre-built AiRequest scaffold populated by onHeaders; finalized into the
+  // return value of take() alongside the parsed body payload.
+  AiRequest pending_;
+  bool headers_captured_{false};
 };
 
 } // namespace Codec

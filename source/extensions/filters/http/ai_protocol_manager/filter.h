@@ -89,12 +89,11 @@ private:
   bool classified_{false};
   bool finalized_{false};
 
-  // Captured request metadata for dispatch.
-  std::string request_path_;   // downstream :path at decodeHeaders time
-  std::string request_host_;   // downstream :authority
-  std::string request_method_;
-  std::string content_type_;
-  std::string authorization_;  // Authorization header, passed through to upstream
+  // Non-owning view of the downstream request headers captured in
+  // decodeHeaders. Valid for the lifetime of the stream; sendUpstream reads
+  // :authority / Authorization / Content-Type off it instead of snapshotting
+  // strings. Same pointer also lives on AiRequest::headers after take().
+  Http::RequestHeaderMap* downstream_headers_{nullptr};
 
   // Parsed during finalizeRequest, consumed by sendUpstream — needed for
   // GeminiVertex URL construction.

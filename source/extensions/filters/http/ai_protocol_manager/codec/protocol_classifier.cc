@@ -8,23 +8,28 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 namespace Codec {
 
-ProtocolKind classify(const Http::RequestHeaderMap& headers, absl::string_view /*jsonrpc_method*/,
-                      const ClassifierPrefixes& prefixes) {
-  const auto path = headers.getPathValue();
-  for (const auto& pfx : prefixes.inference_prefixes) {
-    if (absl::StartsWith(path, pfx)) {
-      return ProtocolKind::Inference;
+ClassifyResult classify(const ClassifyInput& input) {
+  ClassifyResult result;
+  for (const auto& pfx : input.prefixes.inference_prefixes) {
+    if (absl::StartsWith(input.path, pfx)) {
+      result.protocol = ProtocolKind::Inference;
+      // Invocation disambiguation (ChatCompletion vs Responses vs resource
+      // ops) lives alongside the path-template extractor in the phase that
+      // adds Responses resource ops. For now the mapper still derives
+      // invocation from the body.
+      return result;
     }
   }
-  for (const auto& pfx : prefixes.agent_prefixes) {
-    if (absl::StartsWith(path, pfx)) {
+  for (const auto& pfx : input.prefixes.agent_prefixes) {
+    if (absl::StartsWith(input.path, pfx)) {
       // Dialect discrimination (A2a vs Mcp) lives in the agent mapper in V1;
-      // for the classifier's purposes Mcp is the safe default since it is the
-      // JSON-RPC-native dialect.
-      return ProtocolKind::AgentMcp;
+      // for the classifier's purposes Mcp is the safe default since it is
+      // the JSON-RPC-native dialect.
+      result.protocol = ProtocolKind::AgentMcp;
+      return result;
     }
   }
-  return ProtocolKind::Unknown;
+  return result;
 }
 
 } // namespace Codec
