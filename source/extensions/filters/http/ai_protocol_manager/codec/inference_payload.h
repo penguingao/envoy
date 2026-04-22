@@ -50,6 +50,66 @@ struct ChatMessage {
   std::string text;
 };
 
+// Parsed OpenAI tools[] entry. Per OPENAI_VERTEX_SPEC.md §2.2 we model the
+// three Gemini-relevant kinds; image_generation is rejected at parse time.
+enum class ToolKind {
+  Function,
+  GoogleSearch,
+  EnterpriseWebSearch,
+};
+
+struct ToolFunction {
+  std::string name;
+  std::string description;
+  // Raw JSON-Schema for `function.parameters`. Stored as a string so the
+  // encoder can re-parse it into the target proto without losing fields it
+  // does not know about (Gemini 2.5+ takes ParametersJsonSchema verbatim).
+  // Empty when no parameters were specified.
+  std::string parameters_json;
+};
+
+struct Tool {
+  ToolKind kind{ToolKind::Function};
+  ToolFunction function;  // Populated only when kind == Function.
+};
+
+// Parsed OpenAI tool_choice. OPENAI_VERTEX_SPEC.md §2.3:
+//   "auto"     → Mode::Auto
+//   "none"     → Mode::None
+//   "required" → Mode::Required
+//   {type:"function", function:{name:"foo"}} → Mode::NamedFunction with
+//                                              function_name="foo".
+// Mode::Unset means the field was absent.
+struct ToolChoice {
+  enum class Mode { Unset, Auto, None, Required, NamedFunction };
+  Mode mode{Mode::Unset};
+  std::string function_name;  // Populated only when mode == NamedFunction.
+};
+
+// Parsed response_format / guided_* directive.
+// OPENAI_VERTEX_SPEC.md §2.4 + §2 rows for guided_choice / guided_regex /
+// guided_json. At most one of these may be set at a time; the parser enforces
+// the mutual-exclusion rule and returns an error otherwise.
+struct ResponseFormat {
+  enum class Kind {
+    Unset,
+    Text,         // {type: "text"}
+    JsonObject,   // {type: "json_object"}
+    JsonSchema,   // {type: "json_schema", json_schema:{schema: ...}}
+    GuidedChoice, // guided_choice: ["a", "b"]
+    GuidedRegex,  // guided_regex: "..."
+    GuidedJson,   // guided_json: {...}
+  };
+  Kind kind{Kind::Unset};
+
+  // Raw JSON for json_schema / guided_json. Empty otherwise.
+  std::string schema_json;
+  // For guided_choice.
+  std::vector<std::string> choices;
+  // For guided_regex.
+  std::string regex;
+};
+
 // OPENAI_VERTEX_SPEC.md §2.1 rule: system + developer messages merge into a
 // single systemInstruction when encoded for Gemini. We keep them split out
 // here because the OpenAI encoder needs them interleaved with user/assistant
@@ -65,9 +125,12 @@ struct InferencePayload {
   std::vector<ChatMessage> chat;
   std::vector<std::string> system_instructions;
 
-  // Phase 3b: tools, tool_choice, response_format. Phase 3c: multimodal
-  // attachments. Phase 3d: thinking / reasoning_effort. For 3a these are
-  // carried forward only as residual bytes.
+  // Phase 3b — tools / tool_choice / response_format.
+  std::vector<Tool> tools;
+  ToolChoice tool_choice;
+  ResponseFormat response_format;
+
+  // Phase 3c: multimodal attachments. Phase 3d: thinking / reasoning_effort.
 
   SamplingParams sampling;
 
