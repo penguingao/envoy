@@ -91,7 +91,7 @@ request→response cycle without re-entering the Envoy HTTP filter chain.
  │                               │ AiRequest                │ AiRequest │
  │                               ▼                          ▼           │
  │                      ┌──────────────────┐       ┌──────────────────┐ │
- │                      │ InferenceDispatch│       │  AgentDispatch   │ │
+ │                      │ InferenceDispatch│       │  AgenticDispatch │ │
  │                      │   (terminal,     │       │    (terminal,    │ │
  │                      │ RequestEncoder)  │       │ RequestEncoder)  │ │
  │                      └────────┬─────────┘       └────────┬─────────┘ │
@@ -135,7 +135,7 @@ The response flows back through `AiProtocolManagerFilter`'s encoder side.
  │                      └────────┬─────────┘       └────────┬─────────┘ │
  │                               ▼                          ▼           │
  │                      ┌──────────────────┐       ┌──────────────────┐ │
- │                      │ InferenceDispatch│       │  AgentDispatch   │ │
+ │                      │ InferenceDispatch│       │  AgenticDispatch │ │
  │                      │ (non-terminal,   │       │  (non-terminal,  │ │
  │                      │ RequestEncoder)  │       │ RequestEncoder)  │ │
  │                      └────────┬─────────┘       └────────┬─────────┘ │
@@ -204,7 +204,7 @@ response for non-streaming response.
  │                      │   chunks)        │  R1 onResponseStart      │
  │                      └────────▲─────────┘                          │
  │                               │                                    │
- │          same sub-chain the request picked (Inference | Agentic)     │
+ │          same sub-chain the request picked (Inference | Agentic)   │
  │                               ▲                                    │
  │                      ┌────────┴─────────┐                          │
  │                      │ ResponseDecoder  │  upstream headers →      │
@@ -286,7 +286,7 @@ ai_protocol_manager/
 └── dispatch/
     ├── ai_dispatch_filter.h / .cc           # shared base (encode + async client)
     ├── inference_dispatch.h / .cc           # InferenceDispatchFilter
-    └── agent_dispatch.h / .cc               # AgentDispatchFilter
+    └── agentic_dispatch.h / .cc             # AgenticDispatchFilter
 ```
 
 ### Namespace
@@ -1103,11 +1103,11 @@ AiProtocolManager
 │   └── dispatch         // InferenceDispatchConfig
 ├── agentic_chain
 │   ├── filters []
-│   └── dispatch         // AgentDispatchConfig
+│   └── dispatch         // AgenticDispatchConfig
 ├── dispatch_mode        // FALLOUT (default) | CHAIN_FORWARD
 │                        // CHAIN_FORWARD: backend_cluster/routing fields
 │                        //   in InferenceDispatchConfig /
-│                        //   AgentDispatchConfig are ignored (router owns it)
+│                        //   AgenticDispatchConfig are ignored (router owns it)
 ├── codec
 │   ├── max_inline_bytes
 │   ├── payload_store    // InMemory | FileApi { uri, creds, … }
@@ -1183,7 +1183,7 @@ interfaces. In fallout mode only the decoder interface is needed.
 
 ### 6.4 Subclass structure
 
-`InferenceDispatchFilter` and `AgentDispatchFilter` subclass
+`InferenceDispatchFilter` and `AgenticDispatchFilter` subclass
 `AiDispatchFilter` and supply protocol-specific behaviour that is
 independent of the dispatch mode:
 
