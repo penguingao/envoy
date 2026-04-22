@@ -25,11 +25,21 @@ semantics and config proto are intentionally deferred.
      invocations and response-resource operations.
    - **Agentic filter chain** (`agentic_chain`) — for agent protocol
      messages.
-4. At the end of each sub-chain, a **terminal dispatch filter**
-   re-encodes the `AiRequest` back into a concrete HTTP request (same
-   method/path shape, equivalent body if any) and forwards it to one or
-   more HTTP backends via `Http::AsyncClient`, then pumps the
-   response(s) back to the downstream caller.
+4. At the end of each sub-chain, a **dispatch filter** re-encodes the
+   `AiRequest` back into a concrete HTTP request (same method/path
+   shape, equivalent body if any) and forwards it upstream. Two
+   dispatch modes are supported:
+   - **Fallout mode** (terminal dispatch): the dispatch filter owns an
+     `Http::AsyncClient`, bypasses the rest of the Envoy HTTP filter
+     chain, and drives the full request→response cycle internally.
+     This is the original mode and is described in §6.1.
+   - **Chain-forward mode** (non-terminal dispatch): the dispatch
+     filter re-encodes the request back into Envoy's native header/body
+     structures and calls `continueDecoding()`, handing control to the
+     remaining Envoy HTTP filter chain (including the `router` filter)
+     for upstream delivery. The response flows back through
+     `encodeHeaders` / `encodeData` / `encodeTrailers` on the same
+     `AiProtocolManagerFilter` instance. This is described in §6.2.
 
 The filter replaces what would otherwise be two parallel stacks (one per
 protocol family) and lets AI-aware logic — routing, budgeting, PII
@@ -48,43 +58,112 @@ against a neutral request type.
 
 ## 2. High-level architecture
 
+### 2.1 Fallout mode (terminal dispatch)
+
+The dispatch filter owns `Http::AsyncClient` and drives the full
+request→response cycle without re-entering the Envoy HTTP filter chain.
+
 ```
                             downstream HTTP request
                                      │
                                      ▼
- ┌────────────────────────────────────────────────────────────────────┐
- │                  AiProtocolManagerFilter (terminal)                │
- │                                                                    │
- │   decodeHeaders / decodeData / decodeTrailers                      │
- │            │                                                       │
- │            ▼                                                       │
- │   ┌──────────────────┐        ┌──────────────────────────────┐     │
- │   │ RequestDecoder   │───────▶│ AiRequest (internal repr.)   │     │
- │   │ (HTTP + body,    │        │  verb/path/headers + body    │     │
- │   │  body streamed)  │        │  + PayloadRefs → PayloadStore│     │
- │   └──────────────────┘        └──────────────┬───────────────┘     │
- │                                              │                     │
- │                              classify(protocol) picks ONE chain    │
- │                               ┌──────────────┴──────────────┐      │
- │                               ▼                             ▼      │
- │                      ┌──────────────────┐       ┌──────────────────┐
- │                      │ InferenceChain   │       │   AgenticChain     │
- │                      │ (ordered         │       │  (ordered        │
- │                      │  AiFilters over  │       │   AiFilters over │
- │                      │  AiRequest)      │       │   AiRequest)     │
- │                      └────────┬─────────┘       └────────┬─────────┘
- │                               │ AiRequest                │ AiRequest│
- │                               ▼                          ▼          │
- │                      ┌──────────────────┐       ┌──────────────────┐
- │                      │ InferenceDispatch│       │  AgentDispatch   │
- │                      │   (terminal,     │       │    (terminal,    │
- │                      │ RequestEncoder)  │       │ RequestEncoder)  │
- │                      └────────┬─────────┘       └────────┬─────────┘
- │                               └──────────────┬───────────┘         │
- │                                              ▼                     │
- │                              Http::AsyncClient → upstream(s)       │
- └────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │                  AiProtocolManagerFilter (terminal)                  │
+ │                                                                      │
+ │   decodeHeaders / decodeData / decodeTrailers                        │
+ │            │                                                         │
+ │            ▼                                                         │
+ │   ┌──────────────────┐        ┌──────────────────────────────┐       │
+ │   │ RequestDecoder   │───────▶│ AiRequest (internal repr.)   │       │
+ │   │ (HTTP + body,    │        │  verb/path/headers + body    │       │
+ │   │  body streamed)  │        │  + PayloadRefs → PayloadStore│       │
+ │   └──────────────────┘        └──────────────┬───────────────┘       │
+ │                                              │                       │
+ │                              classify(protocol) picks ONE chain      │
+ │                               ┌──────────────┴──────────────┐        │
+ │                               ▼                             ▼        │
+ │                      ┌──────────────────┐       ┌──────────────────┐ │
+ │                      │ InferenceChain   │       │   AgenticChain   │ │
+ │                      │ (ordered         │       │  (ordered        │ │
+ │                      │  AiFilters over  │       │   AiFilters over │ │
+ │                      │  AiRequest)      │       │   AiRequest)     │ │
+ │                      └────────┬─────────┘       └────────┬─────────┘ │
+ │                               │ AiRequest                │ AiRequest │
+ │                               ▼                          ▼           │
+ │                      ┌──────────────────┐       ┌──────────────────┐ │
+ │                      │ InferenceDispatch│       │  AgentDispatch   │ │
+ │                      │   (terminal,     │       │    (terminal,    │ │
+ │                      │ RequestEncoder)  │       │ RequestEncoder)  │ │
+ │                      └────────┬─────────┘       └────────┬─────────┘ │
+ │                               └──────────────┬───────────┘           │
+ │                                              ▼                       │
+ │                                        Http::AsyncClient             │
+ └──────────────────────────────────────────────┼───────────────────────┘
+                                                ▼
+                                           upstream(s)
 ```
+
+### 2.2 Chain-forward mode (non-terminal dispatch)
+
+The dispatch filter re-encodes the `AiRequest` back into Envoy's native
+HTTP structures and calls `continueDecoding()`. The remaining Envoy HTTP
+filter chain (including the `router` filter) handles upstream delivery.
+The response flows back through `AiProtocolManagerFilter`'s encoder side.
+
+```
+                            downstream HTTP request
+                                     │
+                                     ▼
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │                  AiProtocolManagerFilter                             │
+ │                                                                      │
+ │   decodeHeaders / decodeData / decodeTrailers                        │
+ │            │                                                         │
+ │            ▼                                                         │
+ │   ┌──────────────────┐        ┌──────────────────────────────┐       │
+ │   │ RequestDecoder   │───────▶│ AiRequest (internal repr.)   │       │
+ │   │ (HTTP + body,    │        │  verb/path/headers + body    │       │
+ │   │  body streamed)  │        │  + PayloadRefs → PayloadStore│       │
+ │   └──────────────────┘        └──────────────┬───────────────┘       │
+ │                                              │                       │
+ │                              classify(protocol) picks ONE chain      │
+ │                               ┌──────────────┴──────────────┐        │
+ │                               ▼                             ▼        │
+ │                      ┌──────────────────┐       ┌──────────────────┐ │
+ │                      │ InferenceChain   │       │   AgenticChain   │ │
+ │                      │  (AiFilters)     │       │   (AiFilters)    │ │
+ │                      └────────┬─────────┘       └────────┬─────────┘ │
+ │                               ▼                          ▼           │
+ │                      ┌──────────────────┐       ┌──────────────────┐ │
+ │                      │ InferenceDispatch│       │  AgentDispatch   │ │
+ │                      │ (non-terminal,   │       │  (non-terminal,  │ │
+ │                      │ RequestEncoder)  │       │ RequestEncoder)  │ │
+ │                      └────────┬─────────┘       └────────┬─────────┘ │
+ │                               └───────────┬──────────────┘           │
+ │                                           │                          │
+ │                        decoder_callbacks_->continueDecoding()        │
+ └───────────────────────────────────────────┼──────────────────────────┘
+                                             │
+                                             ▼
+                               [other Envoy HTTP filters]
+                                             │
+                                             ▼
+                               [Envoy router filter → upstream]
+```
+
+**Key differences from fallout mode:**
+
+| Aspect | Fallout mode | Chain-forward mode |
+|---|---|---|
+| Dispatch owns `AsyncClient` | Yes | No |
+| Remaining Envoy filters run | No (bypassed) | Yes |
+| `router` filter drives upstream | No | Yes |
+| Response arrives via | `AsyncClient` callbacks | `encodeHeaders`/`encodeData`/`encodeTrailers` |
+
+**When to choose chain-forward mode:** operators want other Envoy filters to
+see the re-encoded and/or transcoded request, or want to reuse existing cluster 
+and route config with the Envoy router rather than duplicating backend selection
+in the dispatch filter.
 
 `AiRequest` is the **shared** neutral model: `RequestDecoder` emits one,
 `classify()` selects which sub-chain runs, and that same `AiRequest`
@@ -104,9 +183,9 @@ Note: In addition to SSE, we also need to support JSON/JSON-RPC
 response for non-streaming response.
 
 ```
-                              downstream response
-                                     ▲
-                                     │
+                          downstream response
+                                 ▲
+                                 │
  ┌────────────────────────────────────────────────────────────────────┐
  │                  AiProtocolManagerFilter (same instance)           │
  │                                                                    │
@@ -140,9 +219,9 @@ response for non-streaming response.
  │                      └────────▲─────────┘                          │
  │                               │                                    │
  └────────────────────────────────────────────────────────────────────┘
-                                     ▲
-                                     │
-                               upstream response(s)
+                                 ▲
+                                 │
+                        upstream response(s)
 ```
 
 The response diagram is drawn flow-up so that **downstream sits at the
@@ -1025,6 +1104,10 @@ AiProtocolManager
 ├── agentic_chain
 │   ├── filters []
 │   └── dispatch         // AgentDispatchConfig
+├── dispatch_mode        // FALLOUT (default) | CHAIN_FORWARD
+│                        // CHAIN_FORWARD: backend_cluster/routing fields
+│                        //   in InferenceDispatchConfig /
+│                        //   AgentDispatchConfig are ignored (router owns it)
 ├── codec
 │   ├── max_inline_bytes
 │   ├── payload_store    // InMemory | FileApi { uri, creds, … }
@@ -1036,47 +1119,93 @@ Each `AiFilterConfig` is `{ name, typed_config }` matching existing
 Envoy idioms; factories register against
 `Envoy::Registry::FactoryRegistry<Chain::AiFilterFactory>`.
 
-## 6. Terminal dispatch (`dispatch/`)
+## 6. Dispatch (`dispatch/`)
 
 `AiDispatchFilter` is the tail of a sub-chain. It is **not** an
-`AiFilter` — it owns the async client, so it sits outside the chain
-abstraction the way `router` sits outside `http_filters`.
+`AiFilter` — it sits outside the chain abstraction the way `router` sits
+outside `http_filters`. The mode (fallout vs chain-forward) is a
+per-instance configuration choice; both modes share the same
+`RequestEncoder` step and the same `AiDispatchFilter` class hierarchy.
 
-Responsibilities:
+### 6.1 Shared responsibilities (both modes)
 
 1. Invoke `RequestEncoder` to materialize the outbound HTTP request
    (method, path, headers, optional body) from the possibly-rewritten
    `AiRequest`. Must honor the §4.3 round-trip invariant.
-2. Resolve per-backend routing: one or N backends (fanout), which
+2. Mutate `AiRequest::headers` and the body buffer in place so the
+   re-encoded values are what propagates downstream (whether via
+   `AsyncClient` in fallout mode or via `continueDecoding()` in
+   chain-forward mode).
+
+### 6.2 Fallout mode
+
+The dispatch filter also owns the full upstream transport:
+
+3. Resolve per-backend routing: one or N backends (fanout), which
    cluster / path / auth header set. For resource ops
    (`ResponsesRetrieve` etc.) routing is pinned to the backend that
    created the resource.
-3. Open streams via `Http::AsyncClient` (reuse the
+4. Open streams via `Http::AsyncClient` (reuse the
    `MuxDemux`/`MultiStream` primitives already used by `mcp_router`, see
    `source/extensions/filters/http/mcp_router/backend_stream.h`).
-4. Feed upstream response headers / body / SSE events into
+5. Feed upstream response headers / body / SSE events into
    `ResponseDecoder`, which produces `AiResponse` + a stream of
    `AiResponseChunk`s. The outer `AiProtocolManagerFilter` runs the
    sub-chain's response-side phases (§5.1) over those chunks and
    forwards the re-encoded output downstream via
    `decoder_callbacks_->encodeHeaders/Data/Trailers`.
 
+### 6.3 Chain-forward mode
+
+After step 2 the dispatch filter does **not** open an `AsyncClient`.
+Instead:
+
+3. Write the re-encoded method, path, and headers back into the
+   downstream request header map already owned by
+   `decoder_callbacks_`. If the body changed, drain the existing
+   `Buffer::Instance` and append the new encoded body.
+4. Call `decoder_callbacks_->continueDecoding()`. Control returns to
+   the Envoy HTTP filter manager, which runs the remaining filter
+   chain (e.g. `ext_authz`, `rate_limit`, `router`).
+5. Upstream delivery and response buffering are handled entirely by the
+   Envoy `router` filter using the route and cluster config already
+   wired to this listener.
+6. The upstream response arrives at `AiProtocolManagerFilter` via the
+   encoder callbacks (`encodeHeaders`, `encodeData`, `encodeTrailers`).
+   These feed `ResponseDecoder` → sub-chain response phases →
+   `ResponseEncoder`, then call `encoder_callbacks_->continueEncoding()`
+   to pass the mutated response downstream.
+
+Because the response arrives on the encode side (not via an owned
+`AsyncClient`), `AiProtocolManagerFilter` must implement both
+`Http::StreamDecoderFilter` **and** `Http::StreamEncoderFilter`
+interfaces. In fallout mode only the decoder interface is needed.
+
+### 6.4 Subclass structure
+
 `InferenceDispatchFilter` and `AgentDispatchFilter` subclass
-`AiDispatchFilter` and supply:
+`AiDispatchFilter` and supply protocol-specific behaviour that is
+independent of the dispatch mode:
 
 - Backend selection strategy (model-based vs capability-based vs
-  resource-pinned).
+  resource-pinned) — used only in fallout mode; chain-forward relies
+  on route config.
 - Response-wire mapping: the protocol-specific translator from
   upstream SSE / JSON / JSON-RPC events to `AiResponseChunk` kinds
   (OpenAI `chat.completions` chunk framing, OpenAI Responses typed
-  events, A2A task events, MCP JSON-RPC result/notifications).
+  events, A2A task events, MCP JSON-RPC result/notifications). This
+  mapping is invoked from whichever response path delivers bytes
+  (AsyncClient callbacks in fallout mode, `encodeData` in
+  chain-forward mode).
 - Error taxonomy mapping back into `AiResponse` / `ErrorEvent`
   chunks.
 
 ## 7. Request / response lifecycle
 
+The request side is identical for both modes up to the dispatch step.
+
 ```
-=============== Request side ===============
+=============== Request side (both modes) ===============
 
 decodeHeaders
   → RequestDecoder::onHeaders
@@ -1099,17 +1228,21 @@ decodeTrailers / end_stream
        ├ Q2' tools / attachments   : same pattern
        └ any filter may StopIteration → continueRequest()
          or sendLocalReply → synthesize response, skip dispatch
+```
 
-=============== Dispatch =====================
+### 7.1 Fallout mode lifecycle
+
+```
+=============== Dispatch (fallout) =====================
 
 DispatchFilter
   ├ RequestEncoder → {method, path, headers, body?}
   ├ Http::AsyncClient → upstream(s)
   └ wire up response callbacks → ResponseDecoder
 
-=============== Response side ================
+=============== Response side (fallout) ================
 
-upstream headers arrive
+upstream headers arrive (via AsyncClient callback)
   → ResponseDecoder::onHeaders → AiResponse (http_status, headers,
     protocol, summary scalars when known early)
   → SubChain::runResponse()
@@ -1126,13 +1259,61 @@ upstream body / SSE events arrive (streaming)
            forwarding downstream
          - any filter may StopIteration (halts the stream) or
            endResponseEarly (cuts upstream, emits synthetic tail)
-  → ResponseEncoder → forward to downstream via decoder_callbacks
+  → ResponseEncoder → forward to downstream via decoder_callbacks_
 
 upstream end_stream
   → ResponseDecoder::onEndStream → AiResponse summary finalized
   → R3 onResponseEnd : f1 → f2 → …
   → ResponseEncoder::finalize → downstream end_stream
 ```
+
+### 7.2 Chain-forward mode lifecycle
+
+```
+=============== Dispatch (chain-forward) =====================
+
+DispatchFilter
+  ├ RequestEncoder → {method, path, headers, body?}
+  ├ Mutate decoder_callbacks_ header map in place
+  │   (method, path, content-type, content-length, etc.)
+  ├ Replace body buffer via decoder_callbacks_
+  └ decoder_callbacks_->continueDecoding()
+       → Envoy filter manager runs remaining HTTP filters
+       → Envoy router filter contacts upstream
+
+=============== Response side (chain-forward) ================
+
+upstream headers arrive (via Envoy filter manager → encodeHeaders)
+  → ResponseDecoder::onHeaders → AiResponse (http_status, headers,
+    protocol, summary scalars when known early)
+  → SubChain::runResponse()
+       └ R1 onResponseStart : f1 → f2 → …
+  → mutate encoder_callbacks_ header map in place
+  → encoder_callbacks_->continueEncoding() (or hold for body)
+
+upstream body / SSE events arrive (via encodeData, one call per chunk)
+  → ResponseDecoder::onData → one AiResponseChunk per event/delta
+    (or one Final chunk for non-streaming bodies)
+  → for each chunk:
+       R2 onResponseChunk : f1 → f2 → …
+         (same dirty/skip/stop semantics as fallout mode)
+  → ResponseEncoder → inject re-serialized bytes into the encode Buffer
+  → encoder_callbacks_->continueEncoding()
+
+upstream end_stream (encodeTrailers or end_stream flag on encodeData)
+  → ResponseDecoder::onEndStream → AiResponse summary finalized
+  → R3 onResponseEnd : f1 → f2 → …
+  → ResponseEncoder::finalize → encoder_callbacks_ end_stream
+```
+
+**Streaming in chain-forward mode.** Because `encodeData` may be called
+many times (once per SSE frame from the router), `ResponseDecoder` runs
+its SSE/JSON-RPC frame splitter incrementally across `encodeData` calls,
+exactly as `RequestDecoder` does across `decodeData` calls. This means
+`onResponseChunk` fires inside `encodeData` — one invocation per
+complete frame, regardless of how TCP segments the bytes. The encode
+buffer is drained (or replaced) on each `encodeData` return so the
+router's backpressure signal naturally propagates upstream.
 
 ## 8. Stats & observability
 
@@ -1233,3 +1414,20 @@ without any HTTP spinup.
    `ItemDone` → `Completed` sequence so filters see one model. More
    uniform but adds wire-translation cost on every non-streaming
    request.
+10. **`sendLocalReply` / `endResponseEarly` in chain-forward mode**:
+    in fallout mode these are straightforward because the dispatch
+    filter owns the stream. In chain-forward mode `sendLocalReply`
+    must suppress `continueDecoding()` and write a synthetic response
+    via `decoder_callbacks_->sendLocalReply`, while `endResponseEarly`
+    must drain the in-flight encode buffer and inject a synthetic
+    tail — both require careful interaction with the Envoy filter
+    manager's encode/decode state machine. Exact protocol TBD.
+11. **`encodeHeaders` hold semantics in chain-forward mode**: to run
+    `onResponseStart` and potentially mutate response headers before
+    they reach downstream filters, `AiProtocolManagerFilter` must
+    return `Http::FilterHeadersStatus::StopIteration` from
+    `encodeHeaders` until the sub-chain phase completes. If the sub-chain
+    is purely synchronous this is a single-tick hold; if a filter calls
+    `StopIteration` the hold extends. The interaction with Envoy's
+    watermark / flow-control on the encode side needs a prototype to
+    confirm there are no deadlock paths.
