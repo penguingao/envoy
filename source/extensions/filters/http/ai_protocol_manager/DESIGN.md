@@ -100,6 +100,8 @@ The response side flows back through the same sub-chain that handled
 the request. Streaming is the common case: each SSE event / chunk is
 processed individually by the chain rather than buffered.
 
+Note: we also need to support JSON-RPC response for non-stream case.
+
 ```
                               downstream response
                                      ▲
