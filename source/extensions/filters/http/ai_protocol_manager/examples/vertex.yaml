@@ -1,0 +1,92 @@
+# ai_protocol_manager — OpenAI → Gemini Vertex translation demo
+#
+# Listens on :10000. The client sends an OpenAI chat/completions JSON;
+# the filter parses it, then GeminiEncoder re-emits it as a Gemini
+# generateContent body and rewrites the path to the Vertex template:
+#   /v1/projects/{gcp_project}/locations/{gcp_location}/publishers/google/models/{model}:generateContent
+#
+# Authorization is passed through unchanged; bring your own OAuth bearer.
+#
+# Test against a mock upstream first (see examples/mock_upstream.py with
+# --port 18080), then:
+#   envoy -c vertex.yaml --log-level info
+#   curl -sS http://127.0.0.1:10000/v1/chat/completions \
+#     -H 'content-type: application/json' \
+#     -H 'authorization: Bearer fake-oauth-token' \
+#     -d '{"model":"gemini-2.5-flash","temperature":0.2,
+#          "messages":[{"role":"system","content":"be concise"},
+#                      {"role":"user","content":"summarize Envoy"}]}'
+#
+# Expected: mock upstream receives a path of the form
+#   /v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent
+# and a Gemini-shaped JSON body with `contents`, `systemInstruction`,
+# and `generationConfig.temperature`. The mock can echo a
+# generateContent-shaped response — Phase 4c does not yet do response
+# translation, so the client sees the upstream body verbatim.
+#
+# To point at real Vertex, change the cluster to a STRICT_DNS endpoint
+# at us-central1-aiplatform.googleapis.com:443 and add a
+# transport_socket with TLS. Keep the OAuth bearer in the request.
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+  - name: ingress
+    address:
+      socket_address: { address: 0.0.0.0, port_value: 10000 }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: AUTO
+          route_config:
+            name: noop_route
+            virtual_hosts:
+            - name: noop
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                direct_response: { status: 404, body: { inline_string: "no route" } }
+          http_filters:
+          - name: envoy.filters.http.ai_protocol_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+              classifier:
+                inference_path_prefixes:
+                - /v1/chat/completions
+                - /v1/completions
+                - /v1/embeddings
+              codec:
+                max_inline_bytes: 65536
+              inference_chain:
+                filters: []
+                dispatch:
+                  target_schema: GEMINI_VERTEX
+                  upstream_cluster: vertex_backend
+                  gcp_project: my-project
+                  gcp_location: us-central1
+                  # When set, every request goes to this model regardless of
+                  # what the client put in `model`. Uncomment to lock model:
+                  # model_name_override: gemini-2.5-flash
+                  timeout: 60s
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  - name: vertex_backend
+    type: STATIC
+    connect_timeout: 5s
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: vertex_backend
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: 127.0.0.1, port_value: 18080 }
