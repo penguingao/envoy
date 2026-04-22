@@ -49,16 +49,32 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   switch (protocol_) {
   case Codec::ProtocolKind::Unknown:
     config_->stats().rq_classify_unknown_.inc();
-    // Not AI traffic. Stay out of the way.
-    return Http::FilterHeadersStatus::Continue;
+    // Terminal filter — nothing downstream to fall through to. Reject with
+    // 404; operators who want a different status / body can swap it.
+    decoder_callbacks_->sendLocalReply(
+        Http::Code::NotFound, "ai_protocol_manager: path not classified",
+        nullptr, absl::nullopt, "ai_protocol_manager_classify_unknown");
+    return Http::FilterHeadersStatus::StopIteration;
   case Codec::ProtocolKind::Inference:
     config_->stats().rq_inference_.inc();
     break;
   case Codec::ProtocolKind::AgentMcp:
   case Codec::ProtocolKind::AgentA2a:
     config_->stats().rq_agent_.inc();
-    // Agent dispatch lands alongside the agent mapper; observe only for now.
-    return Http::FilterHeadersStatus::Continue;
+    // Agent dispatch lands alongside the agent mapper; until it does, the
+    // terminal-filter contract requires us to reply rather than fall through.
+    decoder_callbacks_->sendLocalReply(
+        Http::Code::NotImplemented, "ai_protocol_manager: agent dispatch not implemented",
+        nullptr, absl::nullopt, "ai_protocol_manager_agent_unimplemented");
+    return Http::FilterHeadersStatus::StopIteration;
+  }
+
+  if (!config_->inferenceDispatchConfigured()) {
+    decoder_callbacks_->sendLocalReply(
+        Http::Code::ServiceUnavailable,
+        "ai_protocol_manager: no inference dispatch configured", nullptr, absl::nullopt,
+        "ai_protocol_manager_no_dispatch");
+    return Http::FilterHeadersStatus::StopIteration;
   }
 
   payload_store_ = std::make_unique<Codec::InMemoryPayloadStore>();
@@ -77,28 +93,16 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     decoder_.reset();
   }
 
-  if (config_->inferenceDispatchConfigured()) {
-    mode_ = Mode::Dispatch;
-  } else {
-    mode_ = Mode::PassThrough;
-  }
-
   if (end_stream) {
     finalizeRequest();
-    return mode_ == Mode::Dispatch ? Http::FilterHeadersStatus::StopIteration
-                                   : Http::FilterHeadersStatus::Continue;
   }
-
-  // For Dispatch mode we intend to terminate the request ourselves and do
-  // not want headers/body forwarded to the router. For PassThrough mode we
-  // let the request continue so downstream filters / router can handle it.
-  return mode_ == Mode::Dispatch ? Http::FilterHeadersStatus::StopIteration
-                                 : Http::FilterHeadersStatus::Continue;
+  // Always StopIteration — the filter is terminal and dispatches itself.
+  return Http::FilterHeadersStatus::StopIteration;
 }
 
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data, bool end_stream) {
-  if (!classified_ || protocol_ == Codec::ProtocolKind::Unknown || decoder_ == nullptr) {
-    return Http::FilterDataStatus::Continue;
+  if (!classified_ || decoder_ == nullptr) {
+    return Http::FilterDataStatus::StopIterationNoBuffer;
   }
   if (data.length() > 0) {
     const uint64_t len64 = data.length();
@@ -118,15 +122,13 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
   if (end_stream) {
     finalizeRequest();
   }
-  return mode_ == Mode::Dispatch ? Http::FilterDataStatus::StopIterationNoBuffer
-                                 : Http::FilterDataStatus::Continue;
+  return Http::FilterDataStatus::StopIterationNoBuffer;
 }
 
 Http::FilterTrailersStatus
 AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap& /*trailers*/) {
   finalizeRequest();
-  return mode_ == Mode::Dispatch ? Http::FilterTrailersStatus::StopIteration
-                                 : Http::FilterTrailersStatus::Continue;
+  return Http::FilterTrailersStatus::StopIteration;
 }
 
 void AiProtocolManagerFilter::finalizeRequest() {
@@ -175,19 +177,11 @@ void AiProtocolManagerFilter::finalizeRequest() {
   auto enc_st = encoder->encode(req, encoded);
   if (!enc_st.ok()) {
     config_->stats().rq_encode_error_.inc();
-    if (mode_ == Mode::Dispatch) {
-      decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError, "encode failed", nullptr,
-                                         absl::nullopt, "ai_protocol_manager_encode_error");
-    }
+    decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError, "encode failed", nullptr,
+                                       absl::nullopt, "ai_protocol_manager_encode_error");
     return;
   }
   config_->stats().rq_roundtrip_ok_.inc();
-
-  if (mode_ != Mode::Dispatch) {
-    // PassThrough: Phase 2a semantics. Do not alter or terminate the request;
-    // the original body already flowed (or is being forwarded unchanged).
-    return;
-  }
 
   if (!sendUpstream(encoded)) {
     // Stat already incremented; respond 502.

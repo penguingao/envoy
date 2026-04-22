@@ -26,22 +26,25 @@ namespace AiProtocolManager {
 
 // DESIGN.md §2 + §7 — terminal, decoder-only HTTP filter.
 //
-// Phase 2b lifecycle:
-//   decodeHeaders  → classify; build per-stream state; capture request
-//                    headers for later dispatch; StopIteration (we intend to
-//                    terminate the request ourselves).
+// Lifecycle:
+//   decodeHeaders  → classify; if Unknown / Agent (not yet implemented) /
+//                    no dispatch configured, sendLocalReply and stop.
+//                    Otherwise feed HTTP-level fields into the decoder,
+//                    StopIteration.
 //   decodeData     → feed decoder accumulator.
 //   decodeTrailers → finalizeRequest: decoder.take(), run chain, encode,
 //                    send via Http::AsyncClient to the configured upstream
 //                    cluster.
-//   onSuccess      → pump upstream response headers + body back downstream
-//                    via decoder_callbacks_->encodeHeaders / encodeData.
+//   onSuccess      → build AiResponse, run R1/R2(Final)/R3 through the
+//                    chain, forward to downstream via
+//                    decoder_callbacks_->encodeHeaders / encodeData.
 //   onFailure      → sendLocalReply with a synthesized upstream-error body.
 //
-// The filter is terminal for Inference-classified requests when an
-// inference dispatch target is configured. Requests classified Unknown
-// (no matching prefix) fall through — the filter stays out of the way,
-// preserving the Phase 2a pass-through-observer behavior.
+// Terminal filter: the factory overrides isTerminalFilterByProtoTyped, so
+// Envoy's HCM will not (and must not) accept a router after this filter in
+// the same chain. Every request that reaches decodeHeaders is handled in
+// this filter — either dispatched upstream via AsyncClient or replied to
+// locally.
 class AiProtocolManagerFilter : public Http::PassThroughFilter,
                                 public Http::AsyncClient::Callbacks,
                                 public Logger::Loggable<Logger::Id::filter> {
@@ -65,11 +68,6 @@ public:
                                     const Http::ResponseHeaderMap*) override {}
 
 private:
-  enum class Mode {
-    PassThrough,  // Unknown protocol or no dispatch configured — observe only.
-    Dispatch,     // Inference classified and upstream cluster set — terminal.
-  };
-
   // Build and send the outbound request. Returns false on error (stats
   // already incremented by the time we return false).
   bool sendUpstream(const Buffer::Instance& encoded_body);
@@ -81,7 +79,6 @@ private:
   void cancelActiveRequest();
 
   AiProtocolManagerConfigSharedPtr config_;
-  Mode mode_{Mode::PassThrough};
 
   // Per-stream state.
   std::unique_ptr<Codec::PayloadStore> payload_store_;
