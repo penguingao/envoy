@@ -56,7 +56,56 @@ Two decouplings do the heavy lifting:
    `AiFilterCallbacks` deliberately exposes zero HTTP types — no headers,
    no buffers, no cluster manager.
 
-## 2. Extension axes
+## 2. Dispatch invariants — inference vs agent
+
+These invariants shape what the filter does and, more importantly, what
+it does **not** do. Everything else in the file assumes them.
+
+- **Inference is single-backend per request.** An inference sub-chain
+  dispatches to exactly one cluster. Fan-out has no valid semantics
+  for model invocation — two backends return two different
+  completions, not one merged answer, and tokens / billing /
+  finish_reason / tool_call ids do not compose.
+  `InferenceDispatch.upstream_cluster` is singular on purpose; keep
+  it that way. The chunk stream (§4.7 of DESIGN.md) is therefore
+  strictly one-in / one-out — no stream-index, no reordering, no
+  merge buffer on the dispatch side.
+- **Fan-out / fan-in is an agent concern.** `AgentDispatch` is where
+  multi-server MCP orchestration or A2A sub-agent fan-in lives if we
+  ever need it. The shared chain / chunk infrastructure is designed
+  to accommodate that **inside `AgentDispatch` only** — not at the
+  `AiFilterChain` level.
+- **Fallback and retry delegate to Envoy clusters.** The filter does
+  **not** implement retry logic, host-level failover, or priority
+  groups. Operators get that through standard Envoy primitives:
+  aggregate clusters, priority-aware routing, per-route
+  `RetryPolicy`, outlier detection, circuit breakers, active/passive
+  health. The filter knows one logical cluster name; what sits
+  behind that name is an operator-config detail.
+- **The retry contract is narrow, and LLM-specific.** Retry is only
+  safe before the first response byte has reached the downstream
+  client.
+  - Safe retry classes: `connect-failure`,
+    `reset-before-request-complete`, pre-header 5xx,
+    `429 Too Many Requests` with `Retry-After`.
+  - Unsafe: anything after `onResponseStart` has forwarded headers
+    downstream. Mid-stream failure is terminal — the filter will
+    not attempt re-dispatch once bytes have flowed, because partial
+    SSE output to the client cannot be unsent.
+  - Idempotency: inference create verbs (`POST /v1/chat/completions`,
+    `POST /v1/responses`, …) are **not** idempotent. Retry-on-5xx on
+    the route risks a duplicate generation (and a duplicate bill) if
+    the backend accepted the request but failed to respond. Document
+    this for operators; do not silently change their retry policy.
+- **Schema fallback is per-filter-instance, not per-cluster.**
+  Failing over from an OpenAI primary to a Gemini fallback means
+  swapping the `AiRequestEncoder`; an Envoy aggregate cluster cannot
+  do that for you. The supported pattern is one filter instance per
+  target schema, selected by route predicate or tenant header.
+  "Schema-adaptive dispatch" that picks the encoder per selected
+  host is explicitly out of scope.
+
+## 3. Extension axes
 
 Ordered by how often they are touched:
 
@@ -68,7 +117,7 @@ Ordered by how often they are touched:
 | **Add an agent protocol** (A2A streaming, new MCP verbs) | Extend `AgentInvocation` enum + add mapping in `agent_mapping.cc` + dispatch encoder | sketched in DESIGN §4.1 agent variant |
 | **Add payload offload** (GCS, S3, FileAPI) | Implement `PayloadStore` interface | `InMemoryPayloadStore` is the reference; `fetch()` can be async |
 
-## 3. Walkthrough — adding Anthropic as a target backend
+## 4. Walkthrough — adding Anthropic as a target backend
 
 1. `codec/anthropic_encoder.{h,cc}` — subclass `AiRequestEncoder`. Map
    `InferencePayload::chat` to `messages[]` (Anthropic alternates
@@ -85,7 +134,7 @@ Ordered by how often they are touched:
 Nothing else moves. The parser, chain, `AiFilter`s, stats, and outer
 filter all stay put — that is the whole point of the neutral `AiRequest`.
 
-## 4. Walkthrough — adding a PII-scrub filter
+## 5. Walkthrough — adding a PII-scrub filter
 
 1. `chain/pii_scrub_filter.{h,cc}` —
    `class PiiScrubFilter : public AiFilter`. Declare
@@ -100,7 +149,7 @@ No decoder, encoder, or outer filter changes. And because the filter
 never sees HTTP primitives, it is trivially unit-testable against
 synthetic `AiRequest`s.
 
-## 5. What the architecture intentionally makes hard
+## 6. What the architecture intentionally makes hard
 
 - Filters cannot read raw headers or add HTTP buffers — forces
   structured data to live on `AiRequest::attributes` (observable by
@@ -112,7 +161,7 @@ synthetic `AiRequest`s.
   kind (e.g. fine-tuning jobs) requires touching every `std::visit` —
   on purpose, so no codepath silently drops unknown kinds.
 
-## 6. Known gap — response path
+## 7. Known gap — response path
 
 V0 dispatch is buffer-then-reply. Streaming (SSE for OpenAI, Gemini
 `streamGenerateContent`, A2A events) needs a symmetric `AiResponse` +
