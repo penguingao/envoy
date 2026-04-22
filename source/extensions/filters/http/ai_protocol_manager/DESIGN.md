@@ -14,7 +14,7 @@ semantics and config proto are intentionally deferred.
    representation (`AiRequest`) that unifies the common fields of:
    - **Inference** APIs (OpenAI-style `chat.completions`, `responses`,
      including their non-body verbs like `GET`/`DELETE`/`cancel`).
-   - **Agent** protocols (A2A, MCP).
+   - **Agentic** protocols (A2A, MCP).
 
    The representation must hold enough information to reconstruct the
    original HTTP request semantically without ambiguity — see the
@@ -23,7 +23,7 @@ semantics and config proto are intentionally deferred.
    exposed to operators:
    - **Inference filter chain** (`inference_chain`) — for model
      invocations and response-resource operations.
-   - **Agent filter chain** (`agent_chain`) — for agent protocol
+   - **Agentic filter chain** (`agentic_chain`) — for agent protocol
      messages.
 4. At the end of each sub-chain, a **terminal dispatch filter**
    re-encodes the `AiRequest` back into a concrete HTTP request (same
@@ -68,7 +68,7 @@ against a neutral request type.
  │                               ┌──────────────┴──────────────┐      │
  │                               ▼                             ▼      │
  │                      ┌──────────────────┐       ┌──────────────────┐
- │                      │ InferenceChain   │       │   AgentChain     │
+ │                      │ InferenceChain   │       │   AgenticChain     │
  │                      │ (ordered         │       │  (ordered        │
  │                      │  AiFilters over  │       │   AiFilters over │
  │                      │  AiRequest)      │       │   AiRequest)     │
@@ -125,7 +125,7 @@ response for non-streaming response.
  │                      │   chunks)        │  R1 onResponseStart      │
  │                      └────────▲─────────┘                          │
  │                               │                                    │
- │          same sub-chain the request picked (Inference | Agent)     │
+ │          same sub-chain the request picked (Inference | Agentic)     │
  │                               ▲                                    │
  │                      ┌────────┴─────────┐                          │
  │                      │ ResponseDecoder  │  upstream headers →      │
@@ -201,7 +201,7 @@ ai_protocol_manager/
 │   ├── ai_filter_chain.h / .cc              # ordered runner, shared by both kinds
 │   ├── ai_filter_factory.h                  # registration for sub-chain filters
 │   ├── inference_chain.h / .cc              # InferenceChain (typed façade)
-│   └── agent_chain.h / .cc                  # AgentChain (typed façade)
+│   └── agentic_chain.h / .cc                  # AgenticChain (typed façade)
 │
 │   # Terminal dispatch filters at the tail of each sub-chain
 └── dispatch/
@@ -235,7 +235,7 @@ filters pull out the variant they expect.
 ```cpp
 // codec/ai_request.h
 
-enum class ProtocolKind { Unknown, Inference, AgentA2a, AgentMcp };
+enum class ProtocolKind { Unknown, Inference, AgenticA2a, AgenticMcp };
 
 // Per-filter scratch shared across sub-chain filters (not cross-request,
 // not serialized back out).
@@ -1001,16 +1001,16 @@ upstream response short, emits a synthetic tail downstream (e.g. a
 down the upstream stream. Both are terminal — subsequent phases on
 their respective sides are not invoked.
 
-### 5.4 `InferenceChain` / `AgentChain`
+### 5.4 `InferenceChain` / `AgenticChain`
 
-`chain/inference_chain.h` and `chain/agent_chain.h` are thin typed
+`chain/inference_chain.h` and `chain/agentic_chain.h` are thin typed
 façades over `AiFilterChain`. They exist so:
 
 - Registration factories live in separate namespaces
   (`InferenceFilterFactoryRegistry`, `AgentFilterFactoryRegistry`) and
   can be searched independently.
 - Future protocol-specific helpers (e.g. `InferenceChain::modelTarget()`
-  accessor, `AgentChain::sessionId()`) have a natural home without
+  accessor, `AgenticChain::sessionId()`) have a natural home without
   polluting the shared base.
 
 ### 5.5 Sub-chain configuration
@@ -1022,7 +1022,7 @@ AiProtocolManager
 ├── inference_chain
 │   ├── filters []       // repeated AiFilterConfig
 │   └── dispatch         // InferenceDispatchConfig
-├── agent_chain
+├── agentic_chain
 │   ├── filters []
 │   └── dispatch         // AgentDispatchConfig
 ├── codec
