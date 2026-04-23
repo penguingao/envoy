@@ -263,7 +263,7 @@ public:
 
   // --- Protocol discriminator + variant payload. ---
   ProtocolKind protocol{ProtocolKind::Unknown};
-  std::variant<std::monostate, InferencePayload, AgentPayload> payload;
+  std::variant<std::monostate, InferencePayload, AgentA2aPayload, AgentMcpPayload> payload;
 
   // --- Protocol-neutral small scalars (tenant, user id, request-id,
   //     routing hints). Cross-cutting filters read from here.
@@ -282,8 +282,10 @@ public:
   // --- Typed accessors. Return nullptr on wrong variant. ---
   InferencePayload*       as_inference();
   const InferencePayload* as_inference() const;
-  AgentPayload*           as_agent();
-  const AgentPayload*     as_agent() const;
+  AgentA2aPayload*        as_agent_a2a();
+  const AgentA2aPayload*  as_agent_a2a() const;
+  AgentMcpPayload*        as_agent_mcp();
+  const AgentMcpPayload*  as_agent_mcp() const;
 };
 ```
 
@@ -347,48 +349,58 @@ struct InferencePayload {
 };
 ```
 
-#### Agent variant — `codec/agent_payload.h`
+#### Agent A2A variant — `codec/agent_a2a_payload.h`
 
 ```cpp
-enum class AgentDialect { Unknown, A2a, Mcp };
-
-enum class AgentInvocation {
+enum class AgentA2aInvocation {
   Unknown,
-  // MCP
+  MessageSend, MessageStream,
+  TaskSubmit, TaskGet, TaskCancel,
+};
+
+struct AgentA2aTarget {
+  std::string agent_id;
+  std::string session_id;
+  std::string task_id;
+};
+
+struct AgentA2aPayload {
+  AgentA2aInvocation invocation{AgentA2aInvocation::Unknown};
+  AgentA2aTarget     target;
+
+  std::vector<PayloadRef> parts;
+  PayloadRef residual_params;
+};
+```
+
+#### Agent MCP variant — `codec/agent_mcp_payload.h`
+
+```cpp
+enum class AgentMcpInvocation {
+  Unknown,
   Initialize, Ping,
   ToolsList, ToolsCall,
   ResourcesList, ResourcesRead, ResourcesSubscribe, ResourcesUnsubscribe,
   PromptsList, PromptsGet,
   SamplingCreateMessage, CompletionComplete, LoggingSetLevel,
-  // A2A
-  MessageSend, MessageStream,
-  TaskSubmit, TaskGet, TaskCancel,
-  // Notifications folded in here (NotificationInitialized, …) when we
-  // need to route them.
 };
 
-struct AgentTarget {
-  std::string agent_id;     // logical agent / skill id for routing
-  std::string session_id;   // MCP session / A2A context id (may be empty)
-  std::string task_id;      // A2A task id (empty outside task ops)
+struct AgentMcpTarget {
+  std::string session_id;
 };
 
-struct AgentPayload {
-  AgentDialect     dialect{AgentDialect::Unknown};
-  AgentInvocation  invocation{AgentInvocation::Unknown};
-  AgentTarget      target;
+struct AgentMcpPayload {
+  AgentMcpInvocation invocation{AgentMcpInvocation::Unknown};
+  AgentMcpTarget     target;
 
-  // Selector fields — small, protocol-specific, filled based on
-  // invocation. Only the ones relevant to `invocation` are populated.
-  std::string tool_name;       // ToolsCall
-  std::string resource_uri;    // Resources*
-  std::string prompt_name;     // PromptsGet
-  std::string completion_ref;  // CompletionComplete ("ref/prompt" | "ref/resource")
+  std::string tool_name;
+  std::string resource_uri;
+  std::string prompt_name;
+  std::string completion_ref;
 
-  // Potentially large — offloadable.
-  std::vector<PayloadRef> parts;        // A2A Parts | MCP content[]
-  PayloadRef              arguments;    // ToolsCall.arguments, PromptsGet.arguments
-  PayloadRef              capabilities; // Initialize
+  std::vector<PayloadRef> parts;
+  PayloadRef arguments;
+  PayloadRef capabilities;
 
   PayloadRef residual_params;
 };
@@ -417,10 +429,8 @@ struct AgentPayload {
 5. **`AiResponse`**: unified for v0 (status + headers + body). Apply
    the same envelope+variant pattern if response-side logic grows
    protocol-specific (OpenAI chunk framing vs A2A event types).
-6. **Open**: should `AgentPayload` split into `A2aPayload` /
-   `McpPayload`? Kept unified because fields overlap heavily and
-   `dialect` is already a discriminator; revisit if MCP/A2A diverge
-   more than expected.
+6. **Resolved**: `AgentPayload` was split into `AgentA2aPayload` and
+   `AgentMcpPayload` to avoid sparse structs and improve type safety.
 
 ### 4.2 `PayloadRef` + `PayloadStore` — offload boundary
 
@@ -560,7 +570,7 @@ struct ClassifyInput {
 struct ClassifyResult {
   ProtocolKind protocol;
   // Populated when known from headers/path alone (before body parsing).
-  absl::variant<absl::monostate, InferenceInvocation, AgentInvocation>
+  absl::variant<absl::monostate, InferenceInvocation, AgentA2aInvocation, AgentMcpInvocation>
       invocation;
   // Extracted path params (e.g. response_id), ready to copy into
   // AiRequest::path_params.
