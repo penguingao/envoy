@@ -19,7 +19,7 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 namespace Codec {
 
-enum class ProtocolKind { Unknown, Inference, AgenticA2a, AgenticMcp };
+enum class ProtocolKind { NonAi, Inference, AgenticA2a, AgenticMcp };
 
 // Per-filter scratch shared across sub-chain filters. Not serialized out.
 using AiScratch = absl::flat_hash_map<std::string, std::any>;
@@ -160,7 +160,7 @@ public:
   std::string jsonrpc_id;   // empty ⇒ notification / non-JSON-RPC
   std::string rpc_method;   // raw "method" token when present
 
-  ProtocolKind protocol{ProtocolKind::Unknown};
+  ProtocolKind protocol{ProtocolKind::NonAi};
   std::variant<std::monostate, InferencePayload, AgentPayload> payload;
 
   // Protocol-neutral scalars (tenant, user id, request-id, routing hints).

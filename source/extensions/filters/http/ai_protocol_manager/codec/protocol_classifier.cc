@@ -192,7 +192,7 @@ ClassifyResult classify(const ClassifyInput& input) {
     return r;
   }
 
-  // Unknown.
+  // NonAi — does not match any AI protocol pattern.
   return ClassifyResult{};
 }
 
