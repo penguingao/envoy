@@ -43,6 +43,7 @@ namespace AiProtocolManager {
 class AiProtocolManagerFilter : public Http::StreamFilter,
                                  public Logger::Loggable<Logger::Id::filter> {
 public:
+  enum class DispatchResult { Error, NonAiTraffic, AiTraffic };
   explicit AiProtocolManagerFilter(AiProtocolManagerConfigSharedPtr config);
   ~AiProtocolManagerFilter() override;
 
@@ -81,7 +82,7 @@ private:
   // decodeTrailers — when end_stream is set). Finalises RequestDecoder,
   // builds the appropriate sub-chain, runs all request-side chain phases,
   // then triggers dispatch.
-  void onEndStreamAndDispatch();
+  DispatchResult onEndStreamAndDispatch();
 
   // Creates InferenceChain or AgenticChain from config depending on the
   // classified protocol in request_.protocol. Analogous to
