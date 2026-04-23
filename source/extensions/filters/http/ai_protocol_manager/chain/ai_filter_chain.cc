@@ -21,11 +21,9 @@ public:
   CallbacksImpl(AiFilterChain& chain, Event::Dispatcher& dispatcher,
                 StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& cfg,
                 AiFilterChain::Phase phase, AiFilterChain::OnRequestReady* req_ready,
-                AiFilterChain::OnResponseReady* resp_ready,
-                AiFilterChain::OnLocalReply* local_reply_cb = nullptr)
+                 AiFilterChain::OnResponseReady* resp_ready)
       : chain_(chain), dispatcher_(dispatcher), stream_info_(stream_info), config_(cfg),
-        phase_(phase), req_ready_(req_ready), resp_ready_(resp_ready),
-        local_reply_cb_(local_reply_cb) {}
+        phase_(phase), req_ready_(req_ready), resp_ready_(resp_ready) {}
 
   Event::Dispatcher& dispatcher() override { return dispatcher_; }
   StreamInfo::StreamInfo& streamInfo() override { return stream_info_; }
@@ -39,7 +37,7 @@ public:
     chain_.paused_ = false;
     // Resume from the filter after the one that called StopIteration.
     size_t resume_from = chain_.paused_at_ + 1;
-    bool done = chain_.iterateFrom(resume_from, phase_, *current_req_payload_, [&](AiFilter& f) {
+    bool done = chain_.iterateFrom(resume_from, phase_, [&](AiFilter& f) {
       return invokeRequestPhase(f);
     });
     if (done && req_ready_) {
@@ -53,7 +51,7 @@ public:
     ASSERT(chain_.paused_);
     chain_.paused_ = false;
     size_t resume_from = chain_.paused_at_ + 1;
-    bool done = chain_.iterateFrom(resume_from, phase_, *current_resp_payload_, [&](AiFilter& f) {
+    bool done = chain_.iterateFrom(resume_from, phase_, [&](AiFilter& f) {
       return invokeResponsePhase(f);
     });
     if (done && resp_ready_) {
@@ -135,7 +133,6 @@ private:
   Phase                           phase_;
   AiFilterChain::OnRequestReady*  req_ready_;
   AiFilterChain::OnResponseReady* resp_ready_;
-  AiFilterChain::OnLocalReply*    local_reply_cb_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,9 +179,8 @@ void AiFilterChain::finalizeInterests() {
 // Returns true if the entire range [start_idx, filters_.size()) ran to
 // completion (all returned Continue). Returns false and sets paused_ if any
 // filter returned StopIteration.
-template <typename Payload, typename InvokeFn>
-bool AiFilterChain::iterateFrom(size_t start_idx, Phase phase, Payload& payload,
-                                InvokeFn&& invoke) {
+template <typename InvokeFn>
+bool AiFilterChain::iterateFrom(size_t start_idx, Phase phase, InvokeFn&& invoke) {
   for (size_t i = start_idx; i < filters_.size(); ++i) {
     AiFilter& f = *filters_[i];
     AiFilterStatus status = invoke(f);
@@ -200,21 +196,18 @@ bool AiFilterChain::iterateFrom(size_t start_idx, Phase phase, Payload& payload,
 
 // ── Request side ──────────────────────────────────────────────────────────────
 
-void AiFilterChain::runRequestMetadata(Codec::AiRequest& req, OnRequestReady on_ready,
-                                       OnLocalReply on_local_reply) {
+void AiFilterChain::runRequestMetadata(Codec::AiRequest& req, Event::Dispatcher& dispatcher,
+                                       StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                                       OnRequestReady on_ready, OnLocalReply on_local_reply) {
   ASSERT(interests_finalized_);
   ASSERT(!paused_);
 
-  // Stack-allocate callbacks for this run.
-  // TODO: pass real dispatcher/stream_info/config from the outer filter.
-  CallbacksImpl cb(*this, *static_cast<Event::Dispatcher*>(nullptr),
-                   *static_cast<StreamInfo::StreamInfo*>(nullptr),
-                   *static_cast<const AiProtocolManagerConfig*>(nullptr),
-                   Phase::RequestMetadata, &on_ready, nullptr, &on_local_reply);
+  CallbacksImpl cb(*this, dispatcher, stream_info, config,
+                   Phase::RequestMetadata, &on_ready, nullptr);
   cb.current_req_payload_ = &req;
   active_callbacks_ = &cb;
 
-  bool done = iterateFrom(0, Phase::RequestMetadata, req, [&](AiFilter& f) -> AiFilterStatus {
+  bool done = iterateFrom(0, Phase::RequestMetadata, [&](AiFilter& f) -> AiFilterStatus {
     cb.current_req_payload_ = &req;
     return f.onRequestMetadata(req, cb);
   });
@@ -237,18 +230,18 @@ void AiFilterChain::runRequestMetadata(Codec::AiRequest& req, OnRequestReady on_
   // continueRequest() will resume iteration and eventually fire on_ready.
 }
 
-void AiFilterChain::runRequestItem(Codec::AiItem& item, OnRequestReady on_ready) {
+void AiFilterChain::runRequestItem(Codec::AiItem& item, Event::Dispatcher& dispatcher,
+                                    StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                                    OnRequestReady on_ready) {
   ASSERT(interests_finalized_);
   ASSERT(!paused_);
 
-  CallbacksImpl cb(*this, *static_cast<Event::Dispatcher*>(nullptr),
-                   *static_cast<StreamInfo::StreamInfo*>(nullptr),
-                   *static_cast<const AiProtocolManagerConfig*>(nullptr),
+  CallbacksImpl cb(*this, dispatcher, stream_info, config,
                    Phase::RequestItem, &on_ready, nullptr);
   cb.current_resp_payload_ = &item;  // AiItem passed via resp_payload slot
   active_callbacks_ = &cb;
 
-  bool done = iterateFrom(0, Phase::RequestItem, item, [&](AiFilter& f) -> AiFilterStatus {
+  bool done = iterateFrom(0, Phase::RequestItem, [&](AiFilter& f) -> AiFilterStatus {
     if (!f.itemInterest().any()) {
       return AiFilterStatus::Continue;
     }
@@ -263,17 +256,17 @@ void AiFilterChain::runRequestItem(Codec::AiItem& item, OnRequestReady on_ready)
 
 // ── Response side ─────────────────────────────────────────────────────────────
 
-void AiFilterChain::runResponseStart(Codec::AiResponse& resp, OnResponseReady on_ready) {
+void AiFilterChain::runResponseStart(Codec::AiResponse& resp, Event::Dispatcher& dispatcher,
+                                      StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                                      OnResponseReady on_ready) {
   ASSERT(interests_finalized_);
 
-  CallbacksImpl cb(*this, *static_cast<Event::Dispatcher*>(nullptr),
-                   *static_cast<StreamInfo::StreamInfo*>(nullptr),
-                   *static_cast<const AiProtocolManagerConfig*>(nullptr),
+  CallbacksImpl cb(*this, dispatcher, stream_info, config,
                    Phase::ResponseStart, nullptr, &on_ready);
   cb.current_resp_payload_ = &resp;
   active_callbacks_ = &cb;
 
-  bool done = iterateFrom(0, Phase::ResponseStart, resp, [&](AiFilter& f) -> AiFilterStatus {
+  bool done = iterateFrom(0, Phase::ResponseStart, [&](AiFilter& f) -> AiFilterStatus {
     return f.onResponseStart(resp, cb);
   });
 
@@ -283,17 +276,17 @@ void AiFilterChain::runResponseStart(Codec::AiResponse& resp, OnResponseReady on
   }
 }
 
-void AiFilterChain::runResponseChunk(Codec::AiResponseChunk& chunk, OnResponseReady on_ready) {
+void AiFilterChain::runResponseChunk(Codec::AiResponseChunk& chunk, Event::Dispatcher& dispatcher,
+                                      StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                                      OnResponseReady on_ready) {
   ASSERT(interests_finalized_);
 
-  CallbacksImpl cb(*this, *static_cast<Event::Dispatcher*>(nullptr),
-                   *static_cast<StreamInfo::StreamInfo*>(nullptr),
-                   *static_cast<const AiProtocolManagerConfig*>(nullptr),
+  CallbacksImpl cb(*this, dispatcher, stream_info, config,
                    Phase::ResponseChunk, nullptr, &on_ready);
   cb.current_resp_payload_ = &chunk;
   active_callbacks_ = &cb;
 
-  bool done = iterateFrom(0, Phase::ResponseChunk, chunk, [&](AiFilter& f) -> AiFilterStatus {
+  bool done = iterateFrom(0, Phase::ResponseChunk, [&](AiFilter& f) -> AiFilterStatus {
     if (!f.chunkInterest().any()) {
       return AiFilterStatus::Continue;
     }
@@ -306,17 +299,17 @@ void AiFilterChain::runResponseChunk(Codec::AiResponseChunk& chunk, OnResponseRe
   }
 }
 
-void AiFilterChain::runResponseEnd(Codec::AiResponse& resp, OnResponseReady on_ready) {
+void AiFilterChain::runResponseEnd(Codec::AiResponse& resp, Event::Dispatcher& dispatcher,
+                                    StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                                    OnResponseReady on_ready) {
   ASSERT(interests_finalized_);
 
-  CallbacksImpl cb(*this, *static_cast<Event::Dispatcher*>(nullptr),
-                   *static_cast<StreamInfo::StreamInfo*>(nullptr),
-                   *static_cast<const AiProtocolManagerConfig*>(nullptr),
+  CallbacksImpl cb(*this, dispatcher, stream_info, config,
                    Phase::ResponseEnd, nullptr, &on_ready);
   cb.current_resp_payload_ = &resp;
   active_callbacks_ = &cb;
 
-  bool done = iterateFrom(0, Phase::ResponseEnd, resp, [&](AiFilter& f) -> AiFilterStatus {
+  bool done = iterateFrom(0, Phase::ResponseEnd, [&](AiFilter& f) -> AiFilterStatus {
     return f.onResponseEnd(resp, cb);
   });
 

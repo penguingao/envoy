@@ -76,18 +76,23 @@ public:
   // `on_local_reply` (optional) is invoked instead of on_ready when any filter
   // calls sendLocalReply() — the outer filter then skips dispatch and sends the
   // HTTP response directly.
-  void runRequestMetadata(Codec::AiRequest& req, OnRequestReady on_ready,
-                          OnLocalReply on_local_reply = nullptr);
+  void runRequestMetadata(Codec::AiRequest& req, Event::Dispatcher& dispatcher,
+                          StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                          OnRequestReady on_ready, OnLocalReply on_local_reply = nullptr);
 
-  // Phase Q2: run onRequestItem for all filters that declared interest.
-  // Called once per item. `on_ready` is invoked after fN returns Continue.
-  void runRequestItem(Codec::AiItem& item, OnRequestReady on_ready);
+  void runRequestItem(Codec::AiItem& item, Event::Dispatcher& dispatcher,
+                      StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                      OnRequestReady on_ready);
 
-  // ── Response-side entry points ────────────────────────────────────────────
-
-  void runResponseStart(Codec::AiResponse& resp, OnResponseReady on_ready);
-  void runResponseChunk(Codec::AiResponseChunk& chunk, OnResponseReady on_ready);
-  void runResponseEnd(Codec::AiResponse& resp, OnResponseReady on_ready);
+  void runResponseStart(Codec::AiResponse& resp, Event::Dispatcher& dispatcher,
+                        StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                        OnResponseReady on_ready);
+  void runResponseChunk(Codec::AiResponseChunk& chunk, Event::Dispatcher& dispatcher,
+                        StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                        OnResponseReady on_ready);
+  void runResponseEnd(Codec::AiResponse& resp, Event::Dispatcher& dispatcher,
+                      StreamInfo::StreamInfo& stream_info, const AiProtocolManagerConfig& config,
+                      OnResponseReady on_ready);
 
   // Combined interest queries — result of finalizeInterests().
   const AiItemKindSet&  combinedItemInterest()  const { return combined_item_interest_;  }
@@ -103,8 +108,8 @@ private:
   // filters returned Continue; false if one stopped (paused).
   enum class Phase { RequestMetadata, RequestItem, ResponseStart, ResponseChunk, ResponseEnd };
 
-  template <typename Payload, typename InvokeFn>
-  bool iterateFrom(size_t start_idx, Phase phase, Payload& payload, InvokeFn&& invoke);
+  template <typename InvokeFn>
+  bool iterateFrom(size_t start_idx, Phase phase, InvokeFn&& invoke);
 
   // ── State ──────────────────────────────────────────────────────────────────
 

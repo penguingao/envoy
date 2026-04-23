@@ -9,14 +9,7 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-namespace {
 
-AiProtocolManagerStats generateStats(const std::string& prefix, Stats::Scope& scope) {
-  const std::string p = absl::StrCat(prefix, "ai_protocol_manager.");
-  return {AI_PROTOCOL_MANAGER_STATS(POOL_COUNTER_PREFIX(scope, p))};
-}
-
-} // namespace
 
 AiProtocolManagerConfig::AiProtocolManagerConfig(
     ChainConfig inference_chain_config, ChainConfig agentic_chain_config,

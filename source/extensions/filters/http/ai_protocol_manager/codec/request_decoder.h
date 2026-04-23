@@ -48,7 +48,7 @@ struct DecoderConfig {
 class RequestDecoder : public Logger::Loggable<Logger::Id::filter> {
 public:
   RequestDecoder(const DecoderConfig& config, PayloadStore& store);
-  ~RequestDecoder() = default;
+  ~RequestDecoder();
 
   RequestDecoder(const RequestDecoder&) = delete;
   RequestDecoder& operator=(const RequestDecoder&) = delete;

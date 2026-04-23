@@ -203,7 +203,8 @@ void AiProtocolManagerFilter::runChainRequest() {
   // on_local_reply fires instead when any filter called sendLocalReply() —
   // the outer filter sends the HTTP response and skips dispatch entirely.
   active_chain_->runRequestMetadata(
-      request_,
+      request_, decoder_callbacks_->dispatcher(),
+      decoder_callbacks_->streamInfo(), *config_,
       [this](Codec::AiRequest& /*req*/) {
         // Q1 complete. Move to Q2 if any filter declared item interest.
         if (!active_chain_->combinedItemInterest().any()) {
@@ -287,6 +288,14 @@ Http::FilterTrailersStatus
 AiProtocolManagerFilter::encodeTrailers(Http::ResponseTrailerMap& /*trailers*/) {
   // TODO: feed into ResponseDecoder → run R3 (onResponseEnd) across chain.
   return Http::FilterTrailersStatus::Continue;
+}
+
+Http::Filter1xxHeadersStatus AiProtocolManagerFilter::encode1xxHeaders(Http::ResponseHeaderMap& /*headers*/) {
+  return Http::Filter1xxHeadersStatus::Continue;
+}
+
+Http::FilterMetadataStatus AiProtocolManagerFilter::encodeMetadata(Http::MetadataMap& /*metadata_map*/) {
+  return Http::FilterMetadataStatus::Continue;
 }
 
 void AiProtocolManagerFilter::onUpstreamHeaders(Http::ResponseHeaderMap& /*headers*/,

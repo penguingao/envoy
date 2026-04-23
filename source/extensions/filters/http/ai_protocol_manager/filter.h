@@ -39,8 +39,7 @@ namespace AiProtocolManager {
 // Implements StreamDecoderFilter + StreamEncoderFilter so it handles both the
 // request path (decode*) and the response path (encode*) in chain-forward mode.
 // In fallout mode the encode side is unused (AsyncClient owns the response).
-class AiProtocolManagerFilter : public Http::StreamDecoderFilter,
-                                 public Http::StreamEncoderFilter,
+class AiProtocolManagerFilter : public Http::StreamFilter,
                                  public Logger::Loggable<Logger::Id::filter> {
 public:
   explicit AiProtocolManagerFilter(AiProtocolManagerConfigSharedPtr config);
@@ -66,6 +65,9 @@ public:
                                            bool end_stream) override;
   Http::FilterDataStatus     encodeData(Buffer::Instance& data, bool end_stream) override;
   Http::FilterTrailersStatus encodeTrailers(Http::ResponseTrailerMap& trailers) override;
+
+  Http::Filter1xxHeadersStatus encode1xxHeaders(Http::ResponseHeaderMap& headers) override;
+  Http::FilterMetadataStatus encodeMetadata(Http::MetadataMap& metadata_map) override;
 
   void setEncoderFilterCallbacks(Http::StreamEncoderFilterCallbacks& callbacks) override {
     encoder_callbacks_ = &callbacks;

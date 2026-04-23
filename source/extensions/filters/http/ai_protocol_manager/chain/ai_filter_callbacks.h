@@ -11,9 +11,9 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 
 namespace Codec {
-class AiResponse;
-class AiResponseChunk;
-class AiItem;
+struct AiResponse;
+struct AiResponseChunk;
+struct AiItem;
 } // namespace Codec
 
 // Forward declare config (defined in filter_config.h) to avoid a circular dep.
