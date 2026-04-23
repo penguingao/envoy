@@ -586,17 +586,279 @@ public:
 };
 ```
 
-Implementation notes:
+#### RequestDecoder — internal design
 
-- The JSON-RPC streaming parser from
-  `source/extensions/filters/http/mcp/mcp_json_parser.h` is reused as a
-  helper (`codec/json_rpc_parser.h`); a separate REST-JSON helper
-  handles OpenAI-style bodies. The decoder picks one based on the
-  classifier's output.
-- Streaming sink so large string fields (`messages[*].content`,
-  `tool_call.function.arguments`, `attachments[*].data`) can be
-  redirected to `PayloadStore` without ever being concatenated in
-  memory.
+##### State machine
+
+```cpp
+enum class DecodeState {
+  AwaitingHeaders,
+  BodilessComplete,       // no body expected; AiRequest is ready after onHeaders
+  ParsingInferenceBody,   // streaming JSON → InferenceBodyParser
+  ParsingAgentBody,       // streaming JSON-RPC → AgentBodyParser
+  BodyComplete,           // onEndStream received; take() is valid
+  Error,
+};
+
+class RequestDecoder {
+  DecodeState state_{DecodeState::AwaitingHeaders};
+  AiRequest   request_;
+  PayloadStore& payload_store_;
+
+  // Exactly one is non-null after onHeaders picks a body parser.
+  std::unique_ptr<InferenceBodyParser> inference_parser_;
+  std::unique_ptr<AgentBodyParser>     agent_parser_;
+};
+```
+
+##### `onHeaders`
+
+```
+1. Copy http_method and path into request_.
+
+2. Parse path into segments; extract raw query string.
+   Populate request_.query_params from the query string.
+
+3. Run ProtocolClassifier::classify({http_method, path, headers, ""})
+   → ClassifyResult { protocol, maybe invocation, path_params }
+   Copy path_params into request_.path_params.
+
+4. Set request_.protocol.
+
+5. Determine whether a body is expected:
+
+   Bodiless verbs (GET, DELETE) or body-free POSTs (e.g. cancel):
+     → Call the appropriate mapper with path_params + query_params
+       to populate the payload variant (e.g. ResponsesRetrieve,
+       ResponsesDelete, AgentInvocation::TaskCancel).
+     → state_ = BodilessComplete
+     → return OK
+
+   POST / PATCH with body expected:
+     → Inspect Content-Type:
+         "application/json"          → pick InferenceBodyParser (if
+                                         protocol == Inference)
+         "application/json" (RPC)    → pick AgentBodyParser (if
+                                         protocol == Agentic*)
+         (classifier drives the choice; Content-Type is a hint)
+     → Construct the chosen parser.
+     → state_ = ParsingInferenceBody | ParsingAgentBody
+```
+
+##### `onData` — streaming body
+
+Each `decodeData` call delivers a chunk of raw body bytes (any size;
+TCP may fragment arbitrarily). Both body parsers implement a
+streaming SAX-style JSON interface: they consume bytes incrementally
+and emit structured field events without buffering the whole JSON
+document.
+
+```
+switch (state_) {
+  case ParsingInferenceBody: inference_parser_->feed(chunk); break;
+  case ParsingAgentBody:     agent_parser_->feed(chunk);     break;
+  default:                   /* no body expected, ignore */   break;
+}
+```
+
+Large-field offload happens inside the parser (see below): as soon as
+a string field crosses the configured byte threshold the parser
+calls `payload_store_.store(...)` and keeps only the returned
+`PayloadRef`, never holding the full bytes in filter memory.
+
+##### `onEndStream`
+
+```
+switch (state_) {
+  case BodilessComplete:     break;  // already populated by onHeaders
+  case ParsingInferenceBody:
+    inference_parser_->finish();     // validate JSON is complete
+    // InferencePayload is now fully populated in request_.payload
+    break;
+  case ParsingAgentBody:
+    agent_parser_->finish();
+    // AgentPayload is now fully populated in request_.payload
+    break;
+  default: return error;
+}
+state_ = BodyComplete;
+request_.payload_store = &payload_store_;
+```
+
+Trailers (`onTrailers`) are forwarded to the active parser for any
+trailer-encoded metadata; in practice AI APIs do not use trailers on
+the request side, so this is a no-op.
+
+---
+
+##### `InferenceBodyParser` — JSON body → `InferencePayload`
+
+Used when `request_.protocol == ProtocolKind::Inference`.
+The body is an OpenAI-style REST JSON object:
+
+```json
+{
+  "model":        "gpt-4o",
+  "messages":     [...],
+  "tools":        [...],
+  "stream":       true,
+  "temperature":  0.7,
+  "max_tokens":   1024,
+  ...
+}
+```
+
+The parser walks the top-level object using a streaming JSON event
+loop. Field dispatch table:
+
+| JSON key           | Maps to                                    | Offloadable |
+|--------------------|--------------------------------------------|-------------|
+| `"model"`          | `InferencePayload::target.name`            | no          |
+| `"messages"`       | `InferencePayload::messages` (PayloadRef[])| **yes**     |
+| `"tools"`          | `InferencePayload::tools` (PayloadRef[])   | **yes**     |
+| `"stream"`         | `AiRequest::streaming`                     | no          |
+| `"temperature"`    | `SamplingParams::temperature`              | no          |
+| `"top_p"`          | `SamplingParams::top_p`                    | no          |
+| `"max_tokens"`     | `SamplingParams::max_tokens`               | no          |
+| `"n"`              | `SamplingParams::n`                        | no          |
+| `"seed"`           | `SamplingParams::seed`                     | no          |
+| `"stop"`           | `SamplingParams::stop`                     | no          |
+| `"stream_options"` | `InferencePayload::extra_params`           | no          |
+| everything else    | `InferencePayload::residual_params`        | **yes**     |
+
+**Array-element offload** (`"messages"` and `"tools"`):
+
+Each array element is streamed into a local `Buffer::OwnedImpl`.
+When the element's closing `}` arrives, the accumulated buffer is
+evaluated:
+
+```
+if (element_buffer.length() > config_.max_inline_bytes) {
+  PayloadRef ref = payload_store_.store(std::move(element_buffer),
+                                        PayloadKind::JsonObject);
+  // ref.storage() == External
+} else {
+  PayloadRef ref = PayloadRef::inline(element_buffer.toString());
+  // ref.storage() == Inline
+}
+messages.push_back(ref);
+```
+
+This means filters downstream never see more than
+`max_inline_bytes` of a single message in filter memory; the rest is
+referenced by handle and fetched only when a filter calls
+`AiFilterCallbacks` methods that trigger `PayloadStore::fetch`.
+
+**Multimodal content** (`"messages[i].content"` as array):
+
+When a message's `content` field is itself an array of parts (text /
+image_url / audio / file), each part is offloaded independently
+using the same threshold logic. The in-memory `PayloadRef` list
+replaces the content array on the `Message` struct; the
+`RequestEncoder` reassembles the JSON array from refs at re-encode
+time.
+
+**`"stream"` detection**:
+
+`AiRequest::streaming` is set to `true` as soon as the boolean value
+is parsed (it is a top-level scalar so it arrives early in the
+stream, before `"messages"`).
+
+---
+
+##### `AgentBodyParser` — JSON-RPC body → `AgentPayload`
+
+Used when `request_.protocol == ProtocolKind::AgenticMcp` or
+`AgenticA2a`. The body is a JSON-RPC 2.0 object:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id":      "42",
+  "method":  "tools/call",
+  "params":  { ... }
+}
+```
+
+The parser has two stages:
+
+**Stage 1 — envelope parsing** (runs until `"params"` key is seen):
+
+| JSON key    | Maps to                 | Action                          |
+|-------------|-------------------------|---------------------------------|
+| `"jsonrpc"` | version check           | warn if not `"2.0"`             |
+| `"id"`      | `AiRequest::jsonrpc_id` | copy value (string or number)   |
+| `"method"`  | `AiRequest::rpc_method` | → **re-run classifier** (below) |
+| `"params"`  | *transitions to stage 2*| select `AgentParamsParser`      |
+
+**Re-running the classifier on `"method"`**:
+
+Because MCP and A2A use the same `Content-Type: application/json`,
+the HTTP headers alone may not uniquely identify the invocation.
+When the `"method"` token arrives:
+
+```
+ClassifyResult r2 = classify({
+    request_.http_method, request_.path, *request_.headers,
+    request_.rpc_method   // now non-empty
+});
+// Merge r2 into request_: refine protocol, set invocation
+AgentPayload& ap = std::get<AgentPayload>(request_.payload);
+ap.invocation = std::get<AgentInvocation>(r2.invocation);
+ap.dialect    = (r2.protocol == ProtocolKind::AgenticMcp)
+                    ? AgentDialect::Mcp : AgentDialect::A2a;
+// Select the correct AgentParamsParser for this invocation.
+params_parser_ = makeParamsParser(ap.invocation);
+```
+
+**Stage 2 — `"params"` parsing** (dispatched per invocation):
+
+Each `AgentParamsParser` knows the schema for its invocation.
+Examples:
+
+```
+MCP ToolsCall  (AgentInvocation::ToolsCall):
+  "name"        → AgentPayload::tool_name  (scalar, no offload)
+  "arguments"   → AgentPayload::arguments  (PayloadRef, offloadable)
+  else          → AgentPayload::residual_params
+
+MCP Initialize  (AgentInvocation::Initialize):
+  "protocolVersion" → extra attributes
+  "capabilities"    → AgentPayload::capabilities (PayloadRef whole object)
+  "clientInfo"      → AgentPayload::residual_params
+
+MCP ResourcesRead  (AgentInvocation::ResourcesRead):
+  "uri"         → AgentPayload::resource_uri
+  else          → AgentPayload::residual_params
+
+A2A MessageSend  (AgentInvocation::MessageSend):
+  "message.role"     → AgentTarget / extra
+  "message.parts[i]" → AgentPayload::parts[i]  (offloadable per-part)
+  "message.messageId"→ attributes
+  else               → AgentPayload::residual_params
+
+A2A TaskSubmit  (AgentInvocation::TaskSubmit):
+  "id"               → AgentPayload::target.task_id
+  "message.parts[i]" → AgentPayload::parts[i]  (offloadable)
+  else               → AgentPayload::residual_params
+```
+
+**JSON-RPC notification** (no `"id"` field):
+
+`jsonrpc_id` remains empty; `AiRequest::streaming` is set `false`.
+Notifications are dispatched through the chain identically to
+method calls; the dispatch filter checks `jsonrpc_id.empty()` to
+decide whether to expect a response.
+
+**Implementation notes on parser choice:**
+
+- The JSON-RPC streaming parser is adapted from
+  `source/extensions/filters/http/mcp/mcp_json_parser.h`
+  (`codec/json_rpc_parser.h`). It drives `AgentBodyParser`.
+- `InferenceBodyParser` uses a separate REST-JSON streaming helper
+  (does not share the JSON-RPC envelope logic).
+- Both parsers expose the same `feed(absl::string_view) / finish()`
+  interface to `RequestDecoder`, making `onData` dispatch uniform.
 - For a bodiless request the body helpers are skipped entirely; the
   mapper populates the variant from `path_params` / `query_params` /
   `headers`.

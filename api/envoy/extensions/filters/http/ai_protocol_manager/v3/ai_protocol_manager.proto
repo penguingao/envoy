@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.ai_protocol_manager.v3;
+
+import "envoy/config/core/v3/extension.proto";
+
+import "udpa/annotations/status.proto";
+import "xds/annotations/v3/status.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.ai_protocol_manager.v3";
+option java_outer_classname = "AiProtocolManagerProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ai_protocol_manager/v3;ai_protocol_managerv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: AI Protocol Manager]
+// [#extension: envoy.filters.http.ai_protocol_manager]
+
+// Top-level configuration for the AI Protocol Manager HTTP filter.
+//
+// The AI Protocol Manager classifies each incoming AI request (inference vs.
+// agentic), builds the appropriate AI filter chain, and dispatches through it.
+message AiProtocolManager {
+  // Ordered list of AI filters to run for each AI request.
+  //
+  // Mirrors the ``http_filters`` list in HCM: filters are instantiated and
+  // run in declaration order. Each entry's ``typed_config`` is unpacked
+  // and passed to the corresponding ``NamedAiFilterConfigFactory``.
+  repeated config.core.v3.TypedExtensionConfig ai_filters = 1;
+}
