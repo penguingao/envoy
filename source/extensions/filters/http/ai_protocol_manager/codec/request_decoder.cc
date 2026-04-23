@@ -281,6 +281,8 @@ private:
 // RequestDecoder
 // ─────────────────────────────────────────────────────────────────────────────
 
+RequestDecoder::~RequestDecoder() = default;
+
 RequestDecoder::RequestDecoder(const DecoderConfig& config, PayloadStore& store)
     : config_(config), payload_store_(store) {}
 

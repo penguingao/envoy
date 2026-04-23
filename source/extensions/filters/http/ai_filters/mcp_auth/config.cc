@@ -3,6 +3,7 @@
 #include "envoy/registry/registry.h"
 
 #include "source/common/protobuf/utility.h"
+#include "source/common/protobuf/message_validator_impl.h"
 #include "source/extensions/filters/http/ai_filters/mcp_auth/filter.h"
 
 #include "envoy/extensions/filters/http/ai_filters/mcp_auth/v3/mcp_auth.pb.h"
@@ -79,7 +80,8 @@ void McpAuthFilterFactory::createAiFilter(
 // Registers the factory under "envoy.ai_filters.mcp_auth" in the AiFilterFactory
 // registry so AiProtocolManagerConfig::buildChain() can find it by name.
 
-REGISTER_FACTORY(McpAuthFilterFactory, AiProtocolManager::Chain::AiFilterFactory);
+static Envoy::Registry::RegisterInternalFactory<McpAuthFilterFactory, AiProtocolManager::Chain::AiFilterFactory>
+    mcp_auth_filter_factory_registered;
 
 } // namespace McpAuth
 } // namespace AiFilters

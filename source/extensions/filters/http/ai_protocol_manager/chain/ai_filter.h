@@ -11,9 +11,9 @@ namespace AiProtocolManager {
 
 // Forward declarations from codec (response side, implemented later).
 namespace Codec {
-class AiResponse;
-class AiResponseChunk;
-class AiItem;
+struct AiResponse;
+struct AiResponseChunk;
+struct AiItem;
 } // namespace Codec
 
 namespace Chain {
