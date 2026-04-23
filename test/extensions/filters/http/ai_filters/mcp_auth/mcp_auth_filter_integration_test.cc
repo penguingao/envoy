@@ -221,9 +221,8 @@ TEST_P(McpAuthFilterIntegrationTest, AdminMethodAdminPrincipalPasses) {
 // ── 6. Non-MCP traffic passes through without auth ───────────────────────────
 //
 // A GET request has no JSON-RPC body and cannot be classified as AgenticMcp.
-// The AiProtocolManagerFilter marks it Unknown and calls continueDecoding()
-// directly — AgenticChain (and McpAuthFilter) never runs.
-
+// The AiProtocolManagerFilter marks it Unknown and return Continue directly
+// without invoking AgenticChain.
 TEST_P(McpAuthFilterIntegrationTest, NonMcpGetRequestPassesThrough) {
   initialize();
 
