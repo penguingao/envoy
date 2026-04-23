@@ -26,7 +26,7 @@ struct ClassifyInput {
 };
 
 struct ClassifyResult {
-  ProtocolKind protocol{ProtocolKind::Unknown};
+  ProtocolKind protocol{ProtocolKind::NonAi};
   // Populated when known from path/method/rpc_method; monostate otherwise.
   std::variant<std::monostate, InferenceInvocation, AgentInvocation> invocation;
   // Path parameters extracted by pattern matching (e.g. {"id": "resp_abc"}).

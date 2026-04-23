@@ -33,10 +33,15 @@ void AiProtocolManagerFilter::onDestroy() {
 //
 // Analogous to ActiveStream::decodeHeaders() in conn_manager_impl.cc:
 //   - Hands headers to the codec (RequestDecoder::onHeaders).
+//   - If the request cannot be classified as AI traffic (NonAi protocol or any
+//     header-parse error), sets non_ai_traffic_ = true and returns Continue so
+//     the request falls through to upstream unchanged. This is important because
+//     the classifier's MCP heuristic (POST + application/json) has false-positive
+//     risk — genuine non-AI traffic must not be rejected.
 //   - If end_stream: builds the chain and runs it (like the path where
 //     filter_manager_.createDownstreamFilterChain() is called immediately).
-//   - If body is expected: returns StopIterationAndBuffer so the filter manager
-//     buffers data and calls decodeData() / decodeTrailers() later.
+//   - If body is expected: returns StopIteration so the filter manager calls
+//     decodeData() / decodeTrailers() later.
 
 Http::FilterHeadersStatus
 AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end_stream) {
@@ -44,23 +49,17 @@ AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end
 
   auto status = decoder_.onHeaders(headers);
   if (!status.ok()) {
-    ENVOY_STREAM_LOG(warn, "ai_protocol_manager: request decode error: {}", *decoder_callbacks_,
-                     status.message());
-    config_->stats().rq_decode_error_.inc();
-    decoder_callbacks_->sendLocalReply(Http::Code::BadRequest,
-                                       "AI protocol decode error", nullptr, absl::nullopt, "");
-    return Http::FilterHeadersStatus::StopIteration;
-  }
-
-  std::cout << "tyxia_Decoder protocol: " << std::endl;
-
-  if (decoder_.protocol() == Codec::ProtocolKind::Unknown) {
-    std::cout << "tyxia_Decoder Unknown: " << std::endl;
+    ENVOY_STREAM_LOG(debug, "ai_protocol_manager: header decode failed, passing through: {}",
+                     *decoder_callbacks_, status.message());
+    config_->stats().rq_classify_unknown_.inc();
     non_ai_traffic_ = true;
     return Http::FilterHeadersStatus::Continue;
   }
 
-  std::cout << "tyxia_Decoder_after_protocol: " << std::endl;
+  if (decoder_.protocol() == Codec::ProtocolKind::NonAi) {
+    non_ai_traffic_ = true;
+    return Http::FilterHeadersStatus::Continue;
+  }
 
   if (end_stream) {
     onEndStreamAndDispatch();
@@ -80,6 +79,13 @@ AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end
 }
 
 // ── decodeData ────────────────────────────────────────────────────────────────
+//
+// Body parse failures fall through to upstream (non_ai_traffic_ = true +
+// Continue) rather than rejecting with 400. This handles false positives from
+// the header-only classifier: e.g. a webhook POST application/json that was
+// tentatively classified as AgenticMcp but whose body is not JSON-RPC.
+// Returning Continue from StopSingleIteration state causes the FM to deliver
+// headers + data to subsequent filters via commonContinue().
 
 Http::FilterDataStatus
 AiProtocolManagerFilter::decodeData(Buffer::Instance& data, bool end_stream) {
@@ -88,13 +94,11 @@ AiProtocolManagerFilter::decodeData(Buffer::Instance& data, bool end_stream) {
   }
   auto status = decoder_.onData(data.toString());
   if (!status.ok()) {
-    ENVOY_STREAM_LOG(warn, "ai_protocol_manager: body decode error: {}", *decoder_callbacks_,
-                     status.message());
-    config_->stats().rq_decode_error_.inc();
-    decoder_callbacks_->sendLocalReply(Http::Code::BadRequest,
-                                       "AI protocol body decode error", nullptr, absl::nullopt,
-                                       "");
-    return Http::FilterDataStatus::StopIterationNoBuffer;
+    ENVOY_STREAM_LOG(debug, "ai_protocol_manager: body decode failed, passing through: {}",
+                     *decoder_callbacks_, status.message());
+    config_->stats().rq_classify_unknown_.inc();
+    non_ai_traffic_ = true;
+    return Http::FilterDataStatus::Continue;
   }
 
   if (end_stream) {
@@ -113,9 +117,11 @@ AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap& trailers) {
   }
   auto status = decoder_.onTrailers(trailers);
   if (!status.ok()) {
-    ENVOY_STREAM_LOG(warn, "ai_protocol_manager: trailer decode error: {}", *decoder_callbacks_,
-                     status.message());
-    config_->stats().rq_decode_error_.inc();
+    ENVOY_STREAM_LOG(debug, "ai_protocol_manager: trailer decode failed, passing through: {}",
+                     *decoder_callbacks_, status.message());
+    config_->stats().rq_classify_unknown_.inc();
+    non_ai_traffic_ = true;
+    return Http::FilterTrailersStatus::Continue;
   }
   // onTrailers delegates to onEndStream internally, so the chain has already run.
   return Http::FilterTrailersStatus::StopIteration;
@@ -133,6 +139,8 @@ AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap& trailers) {
 
 void AiProtocolManagerFilter::onEndStreamAndDispatch() {
   auto end_status = decoder_.onEndStream();
+  // TODO(tyxia) The client send genuinely malformed AI protocol traffic.
+  // reject it here for now, look into this later.
   if (!end_status.ok()) {
     ENVOY_STREAM_LOG(warn, "ai_protocol_manager: end stream error: {}", *decoder_callbacks_,
                      end_status.message());
@@ -163,10 +171,12 @@ void AiProtocolManagerFilter::onEndStreamAndDispatch() {
     config_->stats().rq_agent_.inc();
     break;
   default:
-    // config_->stats().rq_classify_unknown_.inc();
-    // ENVOY_STREAM_LOG(warn, "ai_protocol_manager: unknown protocol, passing through",
-    //                  *decoder_callbacks_);
-    // decoder_callbacks_->continueDecoding();
+    // The decoder finished successfully but produced a protocol we don't handle.
+    // Treat as non-AI and fall through so the stream is not silently hung.
+    config_->stats().rq_classify_unknown_.inc();
+    ENVOY_STREAM_LOG(debug, "ai_protocol_manager: unhandled protocol after decode, passing through",
+                     *decoder_callbacks_);
+    dispatch();
     return;
   }
 

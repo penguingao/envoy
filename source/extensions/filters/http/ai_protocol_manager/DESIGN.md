@@ -344,7 +344,7 @@ public:
   std::string rpc_method;    // raw "method" token when present
 
   // --- Protocol discriminator + variant payload. ---
-  ProtocolKind protocol{ProtocolKind::Unknown};
+  ProtocolKind protocol{ProtocolKind::NonAi};
   std::variant<std::monostate, InferencePayload, AgentPayload> payload;
 
   // --- Protocol-neutral small scalars (tenant, user id, request-id,
@@ -1015,7 +1015,7 @@ public:
 
   // Correlates with the AiRequest that produced this response.
   std::string jsonrpc_id;
-  ProtocolKind protocol{ProtocolKind::Unknown};
+  ProtocolKind protocol{ProtocolKind::NonAi};
   std::variant<std::monostate, InferenceResponseSummary, AgentResponseSummary>
       summary;
 

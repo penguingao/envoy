@@ -23,10 +23,11 @@
 //   ValidIdentityHeaderPassesThrough   tools/call   x-mcp-identity: alice     Reaches upstream, body has myTool
 //   AdminMethodNonAdminPrincipalRej…   admin/restart x-mcp-identity: bob      403 + -32003 JSON-RPC error
 //   AdminMethodAdminPrincipalPasses    admin/restart x-mcp-identity: admin    Reaches upstream
-//   NonMcpGetRequestPassesThrough      GET /                                  Classified Unknown, passes without auth
+//   NonMcpGetRequestPassesThrough      GET /                                  Classified NonAi, passes without auth
 //   InferenceTrafficSkipsAgenticAuth   POST /v1/chat/completions              InferenceChain (empty), passes through
 //   NotificationErrorOmitsIdField      tools/list   (no id field, no header)  401, error body omits "id" per spec
 //   ResourcesListWithValidIdentity…    resources/list x-mcp-identity: svc     Reaches upstream
+//   NonJsonRpcBodyFallsThrough         POST /mcp app/json, non-JSON-RPC body  Body parse fails → falls through
 
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/extensions/filters/http/ai_filters/mcp_auth/v3/mcp_auth.pb.h"
@@ -221,7 +222,7 @@ TEST_P(McpAuthFilterIntegrationTest, AdminMethodAdminPrincipalPasses) {
 // ── 6. Non-MCP traffic passes through without auth ───────────────────────────
 //
 // A GET request has no JSON-RPC body and cannot be classified as AgenticMcp.
-// The AiProtocolManagerFilter marks it Unknown and return Continue directly
+// The AiProtocolManagerFilter marks it NonAi and returns Continue directly
 // without invoking AgenticChain.
 TEST_P(McpAuthFilterIntegrationTest, NonMcpGetRequestPassesThrough) {
   initialize();
@@ -311,6 +312,39 @@ TEST_P(McpAuthFilterIntegrationTest, ResourcesListWithValidIdentityPasses) {
 
   waitForNextUpstreamRequest();
   EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("resources/list"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── 10. Non-JSON-RPC body falls through to upstream ──────────────────────────
+//
+// The MCP classifier uses POST + application/json as a header-only heuristic,
+// so any such request is tentatively classified as AgenticMcp. When the body
+// arrives and fails JSON-RPC parsing (no "jsonrpc" / "method" fields), the
+// filter marks the stream as non-AI and falls through rather than returning 400.
+// AgenticChain (and McpAuthFilter) must NOT run on this request.
+
+TEST_P(McpAuthFilterIntegrationTest, NonJsonRpcBodyFallsThrough) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  // A plain JSON body that is NOT a JSON-RPC message — simulates a webhook or
+  // other application/json endpoint sharing the same listener.
+  const std::string body = R"({"type":"webhook","event":"user.created","user_id":"u_123"})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  // The request must reach upstream — the filter fell through on body parse failure.
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("webhook"));
 
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());
