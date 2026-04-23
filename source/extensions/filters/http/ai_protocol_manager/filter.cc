@@ -6,6 +6,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response.h"
 
 #include "absl/strings/str_cat.h"
+#include "codec/ai_request.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -13,8 +14,7 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 
 AiProtocolManagerFilter::AiProtocolManagerFilter(AiProtocolManagerConfigSharedPtr config)
-    : config_(std::move(config)),
-      payload_store_(config_->decoderConfig().max_inline_bytes),
+    : config_(std::move(config)), payload_store_(config_->decoderConfig().max_inline_bytes),
       decoder_(config_->decoderConfig(), payload_store_) {}
 
 AiProtocolManagerFilter::~AiProtocolManagerFilter() = default;
@@ -43,8 +43,8 @@ void AiProtocolManagerFilter::onDestroy() {
 //   - If body is expected: returns StopIteration so the filter manager calls
 //     decodeData() / decodeTrailers() later.
 
-Http::FilterHeadersStatus
-AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end_stream) {
+Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers,
+                                                                 bool end_stream) {
   config_->stats().rq_total_.inc();
 
   auto status = decoder_.onHeaders(headers);
@@ -62,15 +62,19 @@ AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end
   }
 
   if (end_stream) {
-    onEndStreamAndDispatch();
-    // In chain-forward mode dispatch() calls continueDecoding() internally;
-    // we return StopIteration so the filter manager waits for that call.
+    const DispatchResult result = onEndStreamAndDispatch();
+    if (result == DispatchResult::NonAiTraffic) {
+      return Http::FilterHeadersStatus::Continue;
+    }
     return Http::FilterHeadersStatus::StopIteration;
   }
 
   if (!decoder_.needsBody()) {
     // Bodiless classification completed in onHeaders (GET, DELETE, etc.).
-    onEndStreamAndDispatch();
+    const DispatchResult result = onEndStreamAndDispatch();
+    if (result == DispatchResult::NonAiTraffic) {
+      return Http::FilterHeadersStatus::Continue;
+    }
     return Http::FilterHeadersStatus::StopIteration;
   }
 
@@ -87,8 +91,8 @@ AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end
 // Returning Continue from StopSingleIteration state causes the FM to deliver
 // headers + data to subsequent filters via commonContinue().
 
-Http::FilterDataStatus
-AiProtocolManagerFilter::decodeData(Buffer::Instance& data, bool end_stream) {
+Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data,
+                                                           bool end_stream) {
   if (non_ai_traffic_) {
     return Http::FilterDataStatus::Continue;
   }
@@ -102,7 +106,10 @@ AiProtocolManagerFilter::decodeData(Buffer::Instance& data, bool end_stream) {
   }
 
   if (end_stream) {
-    onEndStreamAndDispatch();
+    const DispatchResult result = onEndStreamAndDispatch();
+    if (result == DispatchResult::NonAiTraffic) {
+      return Http::FilterDataStatus::Continue;
+    }
   }
 
   return Http::FilterDataStatus::StopIterationNoBuffer;
@@ -137,17 +144,15 @@ AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap& trailers) {
 //   4. Run chain phase Q2 (onRequestItem for each item, for filters that asked).
 //   5. Dispatch (continueDecoding in chain-forward mode; AsyncClient in fallout).
 
-void AiProtocolManagerFilter::onEndStreamAndDispatch() {
+AiProtocolManagerFilter::DispatchResult AiProtocolManagerFilter::onEndStreamAndDispatch() {
   auto end_status = decoder_.onEndStream();
-  // TODO(tyxia) The client send genuinely malformed AI protocol traffic.
-  // reject it here for now, look into this later.
   if (!end_status.ok()) {
     ENVOY_STREAM_LOG(warn, "ai_protocol_manager: end stream error: {}", *decoder_callbacks_,
                      end_status.message());
     config_->stats().rq_decode_error_.inc();
-    decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, "AI protocol error",
-                                       nullptr, absl::nullopt, "");
-    return;
+    decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, "AI protocol error", nullptr,
+                                       absl::nullopt, "");
+    return DispatchResult::Error;
   }
 
   auto take_result = decoder_.take();
@@ -157,9 +162,20 @@ void AiProtocolManagerFilter::onEndStreamAndDispatch() {
     config_->stats().rq_decode_error_.inc();
     decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError,
                                        "AI protocol internal error", nullptr, absl::nullopt, "");
-    return;
+    return DispatchResult::Error;
   }
   request_ = std::move(take_result.value());
+
+  if ((request_.protocol == Codec::ProtocolKind::AgenticA2a ||
+       request_.protocol == Codec::ProtocolKind::AgenticMcp) &&
+      request_.rpc_method.empty()) {
+    non_ai_traffic_ = true;
+    config_->stats().rq_classify_unknown_.inc();
+    ENVOY_STREAM_LOG(debug,
+                     "ai_protocol_manager: agentic protocol but no method found, passing through",
+                     *decoder_callbacks_);
+    return DispatchResult::NonAiTraffic;
+  }
 
   // Update stats by protocol.
   switch (request_.protocol) {
@@ -171,13 +187,13 @@ void AiProtocolManagerFilter::onEndStreamAndDispatch() {
     config_->stats().rq_agent_.inc();
     break;
   default:
-    // The decoder finished successfully but produced a protocol we don't handle.
-    // Treat as non-AI and fall through so the stream is not silently hung.
-    config_->stats().rq_classify_unknown_.inc();
-    ENVOY_STREAM_LOG(debug, "ai_protocol_manager: unhandled protocol after decode, passing through",
-                     *decoder_callbacks_);
-    dispatch();
-    return;
+    PANIC("tyxia non ai protocol should already be handled");
+    // config_->stats().rq_classify_unknown_.inc();
+    // ENVOY_STREAM_LOG(debug, "ai_protocol_manager: unhandled protocol after decode, passing
+    // through",
+    //                  *decoder_callbacks_);
+    // non_ai_traffic_ = true;
+    // return DispatchResult::NonAiTraffic;
   }
 
   // Build the sub-chain — analogous to FilterManager::createDownstreamFilterChain().
@@ -185,6 +201,7 @@ void AiProtocolManagerFilter::onEndStreamAndDispatch() {
 
   // Run all request-side chain phases, then dispatch.
   runChainRequest();
+  return DispatchResult::AiTraffic;
 }
 
 // ── selectAndBuildChain ───────────────────────────────────────────────────────
@@ -199,12 +216,12 @@ void AiProtocolManagerFilter::selectAndBuildChain() {
   switch (request_.protocol) {
   case Codec::ProtocolKind::Inference:
     inference_chain_ = config_->createInferenceChain();
-    active_chain_    = inference_chain_.get();
+    active_chain_ = inference_chain_.get();
     break;
   case Codec::ProtocolKind::AgenticMcp:
   case Codec::ProtocolKind::AgenticA2a:
     agentic_chain_ = config_->createAgenticChain();
-    active_chain_  = agentic_chain_.get();
+    active_chain_ = agentic_chain_.get();
     break;
   default:
     PANIC("selectAndBuildChain called with unknown protocol");
@@ -230,8 +247,7 @@ void AiProtocolManagerFilter::runChainRequest() {
   // on_local_reply fires instead when any filter called sendLocalReply() —
   // the outer filter sends the HTTP response and skips dispatch entirely.
   active_chain_->runRequestMetadata(
-      request_, decoder_callbacks_->dispatcher(),
-      decoder_callbacks_->streamInfo(), *config_,
+      request_, decoder_callbacks_->dispatcher(), decoder_callbacks_->streamInfo(), *config_,
       [this](Codec::AiRequest& /*req*/) {
         // Q1 complete. Move to Q2 if any filter declared item interest.
         if (!active_chain_->combinedItemInterest().any()) {
@@ -246,9 +262,8 @@ void AiProtocolManagerFilter::runChainRequest() {
         // Send it as an HTTP response and skip the upstream dispatch path.
         ENVOY_STREAM_LOG(debug, "ai_protocol_manager: chain local reply http_status={}",
                          *decoder_callbacks_, resp.http_status);
-        decoder_callbacks_->sendLocalReply(
-            static_cast<Http::Code>(resp.http_status),
-            resp.body, nullptr, absl::nullopt, "");
+        decoder_callbacks_->sendLocalReply(static_cast<Http::Code>(resp.http_status), resp.body,
+                                           nullptr, absl::nullopt, "");
       });
 }
 
@@ -318,8 +333,8 @@ AiProtocolManagerFilter::encodeHeaders(Http::ResponseHeaderMap& /*headers*/, boo
   return Http::FilterHeadersStatus::Continue;
 }
 
-Http::FilterDataStatus
-AiProtocolManagerFilter::encodeData(Buffer::Instance& /*data*/, bool /*end_stream*/) {
+Http::FilterDataStatus AiProtocolManagerFilter::encodeData(Buffer::Instance& /*data*/,
+                                                           bool /*end_stream*/) {
   // TODO: feed into ResponseDecoder::onData → emit AiResponseChunks → run R2 per chunk.
   return Http::FilterDataStatus::Continue;
 }
@@ -330,11 +345,13 @@ AiProtocolManagerFilter::encodeTrailers(Http::ResponseTrailerMap& /*trailers*/) 
   return Http::FilterTrailersStatus::Continue;
 }
 
-Http::Filter1xxHeadersStatus AiProtocolManagerFilter::encode1xxHeaders(Http::ResponseHeaderMap& /*headers*/) {
+Http::Filter1xxHeadersStatus
+AiProtocolManagerFilter::encode1xxHeaders(Http::ResponseHeaderMap& /*headers*/) {
   return Http::Filter1xxHeadersStatus::Continue;
 }
 
-Http::FilterMetadataStatus AiProtocolManagerFilter::encodeMetadata(Http::MetadataMap& /*metadata_map*/) {
+Http::FilterMetadataStatus
+AiProtocolManagerFilter::encodeMetadata(Http::MetadataMap& /*metadata_map*/) {
   return Http::FilterMetadataStatus::Continue;
 }
 

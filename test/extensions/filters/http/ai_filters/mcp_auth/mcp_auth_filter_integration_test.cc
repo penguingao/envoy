@@ -344,7 +344,8 @@ TEST_P(McpAuthFilterIntegrationTest, NonJsonRpcBodyFallsThrough) {
 
   // The request must reach upstream — the filter fell through on body parse failure.
   waitForNextUpstreamRequest();
-  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("webhook"));
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_THAT(upstream_body, HasSubstr("webhook"));
 
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());
