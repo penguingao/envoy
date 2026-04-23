@@ -241,14 +241,14 @@ mechanics. The sub-chain is the same instance as on the request path,
 so per-request `scratch` state set by `onRequestMetadata` is still
 visible to `onResponseStart`.
 
-### Transcoding: JSON-RPC → JSON REST
+### Transcoding: JSON-RPC <-> JSON REST
 
 Transcoding between JSON-RPC and JSON REST onboards wildly-deployed REST
 API services to rapidly emerging Agents and MCP Clients. The transcoder
 naturally sits at the `RequestEncoder` where the high-level AI
 representation is lowered to the HTTP representation prior to dispatch.
 
-#### Decode phase
+#### Request Decode phase
 
 `RequestDecoder` parses the JSON-RPC body and extracts its structured
 fields (`method`, `params`, `id`) into the protocol-agnostic `AiRequest`
@@ -256,7 +256,7 @@ fields (`method`, `params`, `id`) into the protocol-agnostic `AiRequest`
 filter works entirely in terms of `AgentInvocation`, `tool_name`,
 `arguments`, etc.
 
-#### Encode phase
+#### Request Encode phase
 
 Transcoding happens when re-encoding the `AiRequest` back to HTTP.
 `RequestEncoder` serializes the structured fields as a plain JSON REST
@@ -279,7 +279,7 @@ identical in both cases — only the serialization path inside
 
 Because the decoded `AiRequest` carries the logical invocation
 (`AgentInvocation::ToolsCall`, `tool_name = "search"`) rather than raw
-RPC fields, the encoder constructs the appropriate REST path (e.g.
+RPC fields, the encoder could construct the appropriate REST path (e.g.
 `POST /tools/search`) instead of the original JSON-RPC endpoint (e.g.
 `POST /mcp`). Placing the transcoder in front of the router enables
 route/cluster re-selection in Envoy.
