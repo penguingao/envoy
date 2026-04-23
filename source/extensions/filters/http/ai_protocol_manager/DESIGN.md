@@ -888,7 +888,54 @@ model or be stashed in the variant's residual — dropping is not
 acceptable. This invariant is what makes the filter safe to insert
 transparently in front of AI backends.
 
-### 4.4 Protocol classification
+### 4.4 Transcoding: JSON-RPC → JSON REST
+
+Some AI backends — particularly inference endpoints or REST-native agent
+servers — do not speak JSON-RPC 2.0. When an incoming MCP or A2A request
+arrives as a JSON-RPC envelope and must be forwarded to such a backend,
+the `RequestEncoder` transcodes the message from JSON-RPC format into a
+plain JSON REST request before dispatch.
+
+Transcoding is the natural byproduct of the two-step decode/encode
+pipeline already described in §4.3:
+
+1. **Decode phase** (`RequestDecoder`): The JSON-RPC body is parsed and
+   its structured fields (`method`, `params`, `id`) are extracted into
+   the protocol-agnostic `AiRequest` / `AgentPayload`. The JSON-RPC
+   envelope is discarded at this point — the filter works entirely in
+   terms of `AgentInvocation`, `tool_name`, `arguments`, etc.
+
+2. **Encode phase** (`RequestEncoder`): When re-encoding the `AiRequest`
+   back to HTTP, the encoder can serialize the same structured fields as
+   a plain JSON REST body (e.g. `{ "name": "...", "arguments": {...} }`)
+   rather than wrapping them back in a JSON-RPC object. The HTTP method,
+   path, and `Content-Type: application/json` header are rewritten to
+   match the target REST API's conventions.
+
+**Wire format selection.** The dispatch filter selects the output wire
+format based on the backend's configured protocol. If the backend is
+REST-native the encoder emits REST JSON; if the backend expects JSON-RPC
+(e.g. another MCP server) the encoder re-wraps the fields into a
+JSON-RPC envelope, preserving the original `jsonrpc_id` and
+`rpc_method`. The `AiRequest` representation is identical in both cases
+— only the serialization path inside `RequestEncoder` changes.
+
+**Path and method rewriting.** Because the decoded `AiRequest` carries
+the logical invocation (`AgentInvocation::ToolsCall`, `tool_name =
+"search"`) rather than raw RPC fields, the encoder constructs the
+appropriate REST path (e.g. `POST /tools/search`) instead of the
+original JSON-RPC endpoint (e.g. `POST /mcp`).
+
+**Round-trip invariant under transcoding.** The §4.3 invariant governs
+same-protocol round-trips. Transcoding is an intentional exception: the
+encoded request is not byte-similar to the incoming request and may not
+share the same HTTP method, path, or body framing. The *semantic*
+content — invocation kind, arguments, and identity fields — must be
+preserved. It is the dispatch filter's responsibility to select a target
+backend whose REST API maps cleanly to the `AgentInvocation` being
+forwarded.
+
+### 4.5 Protocol classification
 
 `codec/protocol_classifier.h`:
 
@@ -921,7 +968,7 @@ routing before any body has arrived, which is what lets bodiless
 requests like `GET /v1/responses/{id}` classify correctly without ever
 calling into a body parser.
 
-### 4.5 `AiItem` — materialized view of a large payload
+### 4.6 `AiItem` — materialized view of a large payload
 
 `codec/ai_item.h`. `PayloadRef` is the storage-side handle; `AiItem`
 is the runtime-side materialized view that filter authors see during
@@ -974,12 +1021,12 @@ public:
 
 Filters never construct `AiItem` directly; the runtime does.
 
-### 4.6 `AiResponse` — envelope + variant summary
+### 4.7 `AiResponse` — envelope + variant summary
 
 `codec/ai_response.h`. Applies the same envelope+variant pattern as
 `AiRequest`. The variant holds **summary** scalars only (usage,
 finish_reason, task status) — the actual response content lives in the
-chunk stream (§4.7) because streaming is the common case and buffering
+chunk stream (§4.8) because streaming is the common case and buffering
 the whole response before running the chain would defeat the point.
 
 ```cpp
@@ -1030,7 +1077,7 @@ public:
 };
 ```
 
-### 4.7 `AiResponseChunk` — materialized streaming chunk
+### 4.8 `AiResponseChunk` — materialized streaming chunk
 
 `codec/ai_response_chunk.h`. Symmetric to `AiItem` on the request
 side: a runtime-owned, materialized view that lives only for the
