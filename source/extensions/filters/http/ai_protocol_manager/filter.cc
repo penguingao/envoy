@@ -20,6 +20,7 @@ AiProtocolManagerFilter::AiProtocolManagerFilter(AiProtocolManagerConfigSharedPt
 AiProtocolManagerFilter::~AiProtocolManagerFilter() = default;
 
 void AiProtocolManagerFilter::onDestroy() {
+  *alive_ = false;
   if (active_chain_) {
     // AiFilterChain destructor calls onDestroy() on each filter.
     active_chain_ = nullptr;
@@ -51,6 +52,16 @@ AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end
     return Http::FilterHeadersStatus::StopIteration;
   }
 
+  std::cout << "tyxia_Decoder protocol: " << std::endl;
+
+  if (decoder_.protocol() == Codec::ProtocolKind::Unknown) {
+    std::cout << "tyxia_Decoder Unknown: " << std::endl;
+    non_ai_traffic_ = true;
+    return Http::FilterHeadersStatus::Continue;
+  }
+
+  std::cout << "tyxia_Decoder_after_protocol: " << std::endl;
+
   if (end_stream) {
     onEndStreamAndDispatch();
     // In chain-forward mode dispatch() calls continueDecoding() internally;
@@ -72,6 +83,9 @@ AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end
 
 Http::FilterDataStatus
 AiProtocolManagerFilter::decodeData(Buffer::Instance& data, bool end_stream) {
+  if (non_ai_traffic_) {
+    return Http::FilterDataStatus::Continue;
+  }
   auto status = decoder_.onData(data.toString());
   if (!status.ok()) {
     ENVOY_STREAM_LOG(warn, "ai_protocol_manager: body decode error: {}", *decoder_callbacks_,
@@ -94,6 +108,9 @@ AiProtocolManagerFilter::decodeData(Buffer::Instance& data, bool end_stream) {
 
 Http::FilterTrailersStatus
 AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap& trailers) {
+  if (non_ai_traffic_) {
+    return Http::FilterTrailersStatus::Continue;
+  }
   auto status = decoder_.onTrailers(trailers);
   if (!status.ok()) {
     ENVOY_STREAM_LOG(warn, "ai_protocol_manager: trailer decode error: {}", *decoder_callbacks_,
@@ -146,10 +163,10 @@ void AiProtocolManagerFilter::onEndStreamAndDispatch() {
     config_->stats().rq_agent_.inc();
     break;
   default:
-    config_->stats().rq_classify_unknown_.inc();
-    ENVOY_STREAM_LOG(warn, "ai_protocol_manager: unknown protocol, passing through",
-                     *decoder_callbacks_);
-    decoder_callbacks_->continueDecoding();
+    // config_->stats().rq_classify_unknown_.inc();
+    // ENVOY_STREAM_LOG(warn, "ai_protocol_manager: unknown protocol, passing through",
+    //                  *decoder_callbacks_);
+    // decoder_callbacks_->continueDecoding();
     return;
   }
 
@@ -240,6 +257,19 @@ void AiProtocolManagerFilter::dispatch() {
   }
   dispatched_ = true;
 
+  // continueDecoding() must not be called synchronously from within a decode
+  // callback (FilterManager asserts !(filter_call_state_ & DecodeData)).
+  // Post to the next event loop tick to satisfy that invariant.
+  auto alive = alive_;
+  decoder_callbacks_->dispatcher().post([this, alive = std::move(alive)]() {
+    if (!*alive) {
+      return;
+    }
+    doDispatch();
+  });
+}
+
+void AiProtocolManagerFilter::doDispatch() {
   // TODO: honour config_->dispatchMode() and branch to fallout path.
 
   switch (request_.protocol) {

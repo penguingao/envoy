@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <atomic>
 
 #include "envoy/http/filter.h"
 
@@ -92,9 +93,12 @@ private:
   void runChainRequest();
 
   // Dispatch — the tail of the request-side flow.
-  // Chain-forward: mutate decoder_callbacks_ headers/body, then continueDecoding().
-  // Fallout: open Http::AsyncClient stream to upstream.
+  // Posts doDispatch() to the next event loop tick to avoid calling
+  // continueDecoding() from within a decode callback.
   void dispatch();
+
+  // Actual dispatch logic, called from dispatch() via dispatcher().post().
+  void doDispatch();
 
   // ── Chain-forward response path ──────────────────────────────────────────
 
@@ -130,6 +134,12 @@ private:
 
   // True in chain-forward mode once decode side has called continueDecoding().
   bool dispatched_{false};
+
+  // Shared flag set to false in onDestroy() so any posted dispatcher lambdas
+  // can bail out safely if the stream is reset before they run.
+  std::shared_ptr<bool> alive_{std::make_shared<bool>(true)};
+
+  bool non_ai_traffic_{false};
 };
 
 } // namespace AiProtocolManager

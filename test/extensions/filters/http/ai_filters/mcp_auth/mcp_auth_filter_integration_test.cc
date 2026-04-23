@@ -94,9 +94,9 @@ TEST_P(McpAuthFilterIntegrationTest, InitializeBypassesAuth) {
       body);
 
   waitForNextUpstreamRequest();
-  // Re-encoded body must contain the method name and JSON-RPC version.
-  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("initialize"));
-  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("2.0"));
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_THAT(upstream_body, HasSubstr("initialize"));
+  EXPECT_THAT(upstream_body, HasSubstr("2.0"));
 
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());

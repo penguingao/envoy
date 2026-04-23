@@ -76,6 +76,9 @@ public:
   // i.e. the caller must supply body chunks before calling onEndStream.
   bool needsBody() const;
 
+  // Returns the classified protocol kind.
+  ProtocolKind protocol() const { return request_.protocol; }
+
   // Moves the completed AiRequest out of the decoder. Valid only after a
   // successful onEndStream(); returns FailedPrecondition otherwise. Resets
   // the decoder to AwaitingHeaders so it can be reused for the next request
