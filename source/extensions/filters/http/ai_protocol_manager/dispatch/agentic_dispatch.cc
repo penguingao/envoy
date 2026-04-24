@@ -18,11 +18,15 @@ void AgenticDispatch::dispatch(Codec::AiRequest& request,
   ASSERT(request.protocol == Codec::ProtocolKind::AgenticMcp ||
          request.protocol == Codec::ProtocolKind::AgenticA2a);
 
+  // ── Step 1: Encode body either to JSON-RPC or to REST ────────────
+  //
   std::string body_str;
   std::string out_method = request.http_method;
   std::string out_path   = request.path;
-  bool        is_rest    = false;
+  bool is_rest = false;
 
+  // TODO(tyxia) Improve the transcoding config logic here is get from per route config
+  // to enable transocding on specific routes.
   if (transcoder != nullptr) {
     auto rest = Codec::RequestEncoder::encodeAgentBodyAsRest(request, *transcoder);
     if (rest.has_value()) {
