@@ -114,7 +114,16 @@ public:
   AgentBodyParser(const Http::RequestHeaderMap& headers, absl::string_view http_method,
                   absl::string_view path)
       : headers_(headers), http_method_(http_method), path_(path),
-        mcp_parser_(Mcp::McpParserConfig::createDefault()) {}
+        mcp_parser_([]() {
+          auto config = Mcp::McpParserConfig::createDefault();
+          config.addMethodConfig(::Envoy::Extensions::Filters::Common::Mcp::McpConstants::Methods::TOOLS_CALL,
+                                 {Mcp::McpParserConfig::AttributeExtractionRule(std::string(::Envoy::Extensions::Filters::Common::Mcp::McpConstants::Paths::PARAMS_NAME)),
+                                  Mcp::McpParserConfig::AttributeExtractionRule("params.arguments")});
+          config.addMethodConfig(::Envoy::Extensions::Filters::Common::Mcp::McpConstants::Methods::PROMPTS_GET,
+                                 {Mcp::McpParserConfig::AttributeExtractionRule(std::string(::Envoy::Extensions::Filters::Common::Mcp::McpConstants::Paths::PARAMS_NAME)),
+                                  Mcp::McpParserConfig::AttributeExtractionRule("params.arguments")});
+          return config;
+        }()) {}
 
   absl::Status feed(absl::string_view chunk) {
     auto status = mcp_parser_.parse(chunk);

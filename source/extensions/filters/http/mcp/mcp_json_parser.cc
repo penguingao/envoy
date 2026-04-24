@@ -26,8 +26,7 @@ void McpParserConfig::initializeDefaults() {
   always_extract_.insert("id");
 
   // Tools
-  addMethodConfig(Methods::TOOLS_CALL, {AttributeExtractionRule(std::string(Paths::PARAMS_NAME)),
-                                        AttributeExtractionRule("params.arguments")});
+  addMethodConfig(Methods::TOOLS_CALL, {AttributeExtractionRule(std::string(Paths::PARAMS_NAME))});
 
   // Resources.
   addMethodConfig(Methods::RESOURCES_LIST, {});
@@ -40,8 +39,7 @@ void McpParserConfig::initializeDefaults() {
 
   // Prompts.
   addMethodConfig(Methods::PROMPTS_LIST, {});
-  addMethodConfig(Methods::PROMPTS_GET, {AttributeExtractionRule(std::string(Paths::PARAMS_NAME)),
-                                        AttributeExtractionRule("params.arguments")});
+  addMethodConfig(Methods::PROMPTS_GET, {AttributeExtractionRule(std::string(Paths::PARAMS_NAME))});
 
   // Completion.
   addMethodConfig(Methods::COMPLETION_COMPLETE,
