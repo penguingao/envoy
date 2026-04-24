@@ -1653,7 +1653,65 @@ Plus per-sub-chain histograms for decode/encode/dispatch latency.
   along with the owning filter.
 - No cross-worker state in v0.
 
-## 10. Testing strategy (structural)
+## 10. Case Study
+
+Implements MCP transcoding with AI Filter Chain: 
+- No double parsing: Parsing only happens once at RequestDecoder, transcoding is performed on native AI message after it traverses the AI filter chain.
+
+- Seamless "Lowering": Transcoding is now a natural lifecycle step where high-level AI intents are lowered to HTTP protocols—be it JSON-RPC for MCP-native backends or JSON REST for REST services.
+
+
+The whole transcoding flow :
+
+```
+   MCP client                AiProtocolManagerFilter                   REST backend
+      │                              │                                       │
+      │  POST /mcp                   │                                       │
+      │  {"jsonrpc":"2.0",           │                                       │
+      │   "method":"tools/call",     │                                       │
+      │   "params":{"name":"search", │                                       │
+      │    "arguments":{"query":"hello"}}}                                   │
+      │─────────────────────────────▶│                                       │
+      │                              │ RequestDecoder                        │
+      │                              │   strips JSON-RPC envelope            │
+      │                              │   ┌─────────────────────────────┐     │
+      │                              │   │ AgentPayload                │     │
+      │                              │   │  invocation = ToolsCall     │     │
+      │                              │   │  tool_name  = "search"      │     │
+      │                              │   │  arguments  = {query:hello} │     │
+      │                              │   └─────────────────────────────┘     │
+      │                              │                                       │
+      │                              │ AgenticChain                          │
+      │                              │   ┌─────────────────────────────┐     │
+      │                              │   │ McpAuthFilter               │     │
+      │                              │   │  auth/authz on AgentPayload │     │
+      │                              │   │  not on raw HTTP            │     │
+      │                              │   └─────────────────────────────┘     │
+      │                              │                                       │
+      │                              │ AgenticDispatch                       │
+      │                              │   ┌─────────────────────────────────┐ │
+      │                              │   │ RequestEncoder                  │ │
+      │                              │   │                                 │ │
+      │                              │   │ transcoder config present?      │ │
+      │                              │   │                                 │ │
+      │                              │   │ YES → encodeAgentBodyAsRest()   │ │
+      │                              │   │   method = GET                  │ │
+      │                              │   │   path   = /api/search          │ │
+      │                              │   │            ?query=hello         │ │
+      │                              │   │   body   = (empty)              │ │
+      │                              │   │                                 │ │
+      │                              │   │ NO  → encodeAgentBody()         │ │
+      │                              │   │   re-wraps as JSON-RPC          │ │
+      │                              │   └─────────────────────────────────┘ │
+      │                              │   mutate headers + addDecodedData()   │
+      │                              │   continueDecoding() → router filter  │
+      │                              │──────────────────────────────────────▶│
+      │                              │                    GET /api/search    │
+      │                              │                        ?query=hello   │
+
+```
+
+## 11. Testing strategy (structural)
 
 ```
 test/extensions/filters/http/ai_protocol_manager/
@@ -1684,7 +1742,7 @@ A `fake_ai_filter.h` that records `onRequest` invocations is the
 canonical way to write sub-chain tests; keeps the AI layer verifiable
 without any HTTP spinup.
 
-## 11. Open questions (to iterate on)
+## 12. Open questions (to iterate on)
 
 1. **Chain composition**: do we allow a single request to traverse
    both chains (e.g. agent invoking inference), or is that modeled
