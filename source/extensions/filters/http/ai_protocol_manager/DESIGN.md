@@ -60,51 +60,6 @@ against a neutral request type.
 
 ### Request path
 
-#### Fallout mode (terminal dispatch)
-
-The dispatch filter owns `Http::AsyncClient` and drives the full
-request→response cycle without re-entering the Envoy HTTP filter chain.
-
-```
-                            downstream HTTP request
-                                     │
-                                     ▼
- ┌──────────────────────────────────────────────────────────────────────┐
- │                  AiProtocolManagerFilter (terminal)                  │
- │                                                                      │
- │   decodeHeaders / decodeData / decodeTrailers                        │
- │            │                                                         │
- │            ▼                                                         │
- │   ┌──────────────────┐        ┌──────────────────────────────┐       │
- │   │ RequestDecoder   │───────▶│ AiRequest (internal repr.)   │       │
- │   │ (HTTP + body,    │        │  verb/path/headers + body    │       │
- │   │  body streamed)  │        │  + PayloadRefs → PayloadStore│       │
- │   └──────────────────┘        └──────────────┬───────────────┘       │
- │                                              │                       │
- │                              classify(protocol) picks ONE chain      │
- │                               ┌──────────────┴──────────────┐        │
- │                               ▼                             ▼        │
- │                      ┌──────────────────┐       ┌──────────────────┐ │
- │                      │ InferenceChain   │       │   AgenticChain   │ │
- │                      │ (ordered         │       │  (ordered        │ │
- │                      │  AiFilters over  │       │   AiFilters over │ │
- │                      │  AiRequest)      │       │   AiRequest)     │ │
- │                      └────────┬─────────┘       └────────┬─────────┘ │
- │                               │ AiRequest                │ AiRequest │
- │                               ▼                          ▼           │
- │                      ┌──────────────────┐       ┌──────────────────┐ │
- │                      │ InferenceDispatch│       │  AgenticDispatch │ │
- │                      │   (terminal,     │       │    (terminal,    │ │
- │                      │ RequestEncoder)  │       │ RequestEncoder)  │ │
- │                      └────────┬─────────┘       └────────┬─────────┘ │
- │                               └──────────────┬───────────┘           │
- │                                              ▼                       │
- │                                        Http::AsyncClient             │
- └──────────────────────────────────────────────┼───────────────────────┘
-                                                ▼
-                                           upstream(s)
-```
-
 #### Chain-forward mode (non-terminal dispatch)
 
 The dispatch filter re-encodes the `AiRequest` back into Envoy's native
@@ -117,7 +72,7 @@ The response flows back through `AiProtocolManagerFilter`'s encoder side.
                                      │
                                      ▼
  ┌──────────────────────────────────────────────────────────────────────┐
- │                  AiProtocolManagerFilter                             │
+ │                  AiProtocolManagerFilter (Non-terminal Dispatch)     │
  │                                                                      │
  │   decodeHeaders / decodeData / decodeTrailers                        │
  │            │                                                         │
@@ -151,6 +106,51 @@ The response flows back through `AiProtocolManagerFilter`'s encoder side.
                                              │
                                              ▼
                                [Envoy router filter → upstream]
+```
+
+#### Fallout mode (terminal dispatch)
+
+The dispatch filter owns `Http::AsyncClient` and drives the full
+request→response cycle without re-entering the Envoy HTTP filter chain.
+
+```
+                            downstream HTTP request
+                                     │
+                                     ▼
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │                  AiProtocolManagerFilter (Terminal Dispatch)         │
+ │                                                                      │
+ │   decodeHeaders / decodeData / decodeTrailers                        │
+ │            │                                                         │
+ │            ▼                                                         │
+ │   ┌──────────────────┐        ┌──────────────────────────────┐       │
+ │   │ RequestDecoder   │───────▶│ AiRequest (internal repr.)   │       │
+ │   │ (HTTP + body,    │        │  verb/path/headers + body    │       │
+ │   │  body streamed)  │        │  + PayloadRefs → PayloadStore│       │
+ │   └──────────────────┘        └──────────────┬───────────────┘       │
+ │                                              │                       │
+ │                              classify(protocol) picks ONE chain      │
+ │                               ┌──────────────┴──────────────┐        │
+ │                               ▼                             ▼        │
+ │                      ┌──────────────────┐       ┌──────────────────┐ │
+ │                      │ InferenceChain   │       │   AgenticChain   │ │
+ │                      │ (ordered         │       │  (ordered        │ │
+ │                      │  AiFilters over  │       │   AiFilters over │ │
+ │                      │  AiRequest)      │       │   AiRequest)     │ │
+ │                      └────────┬─────────┘       └────────┬─────────┘ │
+ │                               │ AiRequest                │ AiRequest │
+ │                               ▼                          ▼           │
+ │                      ┌──────────────────┐       ┌──────────────────┐ │
+ │                      │ InferenceDispatch│       │  AgenticDispatch │ │
+ │                      │   (terminal,     │       │    (terminal,    │ │
+ │                      │ RequestEncoder)  │       │ RequestEncoder)  │ │
+ │                      └────────┬─────────┘       └────────┬─────────┘ │
+ │                               └──────────────┬───────────┘           │
+ │                                              ▼                       │
+ │                                        Http::AsyncClient             │
+ └──────────────────────────────────────────────┼───────────────────────┘
+                                                ▼
+                                           upstream(s)
 ```
 
 **Key differences from fallout mode:**
