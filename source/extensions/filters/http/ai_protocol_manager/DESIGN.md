@@ -285,11 +285,13 @@ RPC fields, the encoder could construct the appropriate REST path (e.g.
 route/cluster re-selection in Envoy.
 
 #### The benefit of AI Native Design
-- No double parsing: Parsing only happens once at RequestDecoder, transcoding is performed on native AI message after it traverses the AI filter chain.
+- Native AI Intent Governance:  MCP attributes authentication is directly applied on native AI message
+
+- No Double Parsing: Parsing only happens once at RequestDecoder, transcoding is performed on native AI message after it traverses the AI filter chain.
 
 - Seamless "Lowering": Transcoding is now a natural lifecycle step where high-level AI intents are lowered to HTTP protocols—be it JSON-RPC for MCP-native backends or JSON REST for REST services.
 
-##### MCP → REST transcoding flow
+##### MCP Authentication and REST transcoding flow
 
 ```
    MCP client                AiProtocolManagerFilter                   REST backend
