@@ -12,6 +12,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/codec/request_decoder.h"
 #include "source/extensions/filters/http/ai_protocol_manager/dispatch/agentic_dispatch.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_config.h"
+#include "source/extensions/filters/http/ai_protocol_manager/rest_transcoder_config.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -141,6 +142,8 @@ private:
   std::shared_ptr<bool> alive_{std::make_shared<bool>(true)};
 
   bool non_ai_traffic_{false};
+
+  const McpRestTranscoderRouteConfig* transcoder_config_{nullptr};
 };
 
 } // namespace AiProtocolManager

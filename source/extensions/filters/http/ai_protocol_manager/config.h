@@ -36,6 +36,12 @@ private:
       const ProtoConfig& proto_config, const std::string& stats_prefix,
       Server::Configuration::FactoryContext& context) override;
 
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
+      const ProtoConfig& proto_config,
+      Server::Configuration::ServerFactoryContext& context,
+      ProtobufMessage::ValidationVisitor& validator) override;
+
   // Build AiProtocolManagerConfig from the decoded proto fields.
   AiProtocolManagerConfigSharedPtr
   buildConfig(const ProtoConfig& proto, const std::string& stats_prefix,

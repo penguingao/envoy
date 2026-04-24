@@ -74,6 +74,14 @@ envoy_cc_library(
     deps = [
         ":ai_request_lib",
         "//source/common/common:assert_lib",
+        "//source/common/common:regex_lib",
+        "//source/common/http:utility_lib",
         "//source/common/json:json_streamer_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:rest_transcoder_config_lib",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/types:optional",
+        "@abseil-cpp//absl/types:span",
+        "@nlohmann_json//:json",
     ],
 )

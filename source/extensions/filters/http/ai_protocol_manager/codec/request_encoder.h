@@ -3,6 +3,9 @@
 #include <string>
 
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
+#include "source/extensions/filters/http/ai_protocol_manager/rest_transcoder_config.h"
+
+#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -10,8 +13,14 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 namespace Codec {
 
+struct RestHttpRequest {
+  std::string method;
+  std::string path;
+  std::string body;
+};
+
 // RequestEncoder translates a (possibly mutated) AiRequest back into an
-// outbound HTTP body. It is the inverse of RequestDecoder.
+// outbound HTTP request. It is the inverse of RequestDecoder.
 //
 // Chain-forward dispatch sequence (DESIGN.md §6.3):
 //   RequestEncoder → body string → AgenticDispatch mutates headers + body →
@@ -39,6 +48,18 @@ public:
   // `request` must have protocol == AgenticMcp or AgenticA2a and a populated
   // AgentPayload; returns an empty string on contract violation.
   static std::string encodeAgentBody(const AiRequest& request);
+
+  // Lowers the AgentPayload to a plain REST HTTP request using the per-route
+  // transcoder config.  The AgentPayload structured fields (tool_name,
+  // resource_uri, arguments) are used directly — no re-parsing of the original
+  // body is required.
+  //
+  // Returns nullopt when:
+  //   - No matching HttpRule is found in `transcoder` for this invocation.
+  //   - The arguments JSON is malformed.
+  //   - The HttpRule has no HTTP method set.
+  static absl::optional<RestHttpRequest> encodeAgentBodyAsRest(
+      const AiRequest& request, const McpRestTranscoderRouteConfig& transcoder);
 };
 
 } // namespace Codec
