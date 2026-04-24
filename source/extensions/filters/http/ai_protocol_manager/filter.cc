@@ -3,6 +3,7 @@
 #include "source/common/common/assert.h"
 #include "source/common/http/codes.h"
 #include "source/common/http/header_map_impl.h"
+#include "source/common/http/utility.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_response.h"
 
 #include "absl/strings/str_cat.h"
@@ -249,6 +250,10 @@ void AiProtocolManagerFilter::runChainRequest() {
   active_chain_->runRequestMetadata(
       request_, decoder_callbacks_->dispatcher(), decoder_callbacks_->streamInfo(), *config_,
       [this](Codec::AiRequest& /*req*/) {
+        transcoder_config_ =
+            Http::Utility::resolveMostSpecificPerFilterConfig<McpRestTranscoderRouteConfig>(
+                decoder_callbacks_);
+
         // Q1 complete. Move to Q2 if any filter declared item interest.
         if (!active_chain_->combinedItemInterest().any()) {
           dispatch();
@@ -303,7 +308,7 @@ void AiProtocolManagerFilter::doDispatch() {
     // Chain-forward: re-encode AgentPayload → JSON-RPC body, mutate headers,
     // inject body into the FM buffer, then resume the decode chain.
     // AgenticDispatch::dispatch() calls continueDecoding() internally.
-    Dispatch::AgenticDispatch::dispatch(request_, *decoder_callbacks_);
+    Dispatch::AgenticDispatch::dispatch(request_, *decoder_callbacks_, transcoder_config_);
     return;
 
   default:

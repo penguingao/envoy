@@ -29,5 +29,6 @@ envoy_cc_test(
         "//test/integration:http_integration_lib",
         "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/http/ai_filters/mcp_auth/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
     ],
 )

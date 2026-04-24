@@ -4,6 +4,7 @@
 
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
+#include "source/extensions/filters/http/ai_protocol_manager/rest_transcoder_config.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -44,7 +45,8 @@ public:
   // `callbacks` is the StreamDecoderFilterCallbacks from the outer filter.
   // This method calls callbacks.continueDecoding() internally.
   static void dispatch(Codec::AiRequest& request,
-                       Http::StreamDecoderFilterCallbacks& callbacks);
+                       Http::StreamDecoderFilterCallbacks& callbacks,
+                       const McpRestTranscoderRouteConfig* transcoder = nullptr);
 };
 
 } // namespace Dispatch

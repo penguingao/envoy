@@ -5,6 +5,7 @@
 #include "source/common/protobuf/protobuf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain/ai_filter_factory.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/rest_transcoder_config.h"
 
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 
@@ -71,6 +72,24 @@ AiProtocolManagerFilterConfigFactory::createFilterFactoryFromProtoTyped(
     // Add as both decoder and encoder so chain-forward response path works.
     callbacks.addStreamFilter(filter);
   };
+}
+
+// ── createRouteSpecificFilterConfigTyped ──────────────────────────────────────
+//
+// Called by FactoryBase when a route's typed_per_filter_config for this filter
+// is resolved.  Only the rest_transcoder field is meaningful here; ai_filters
+// is ignored for per-route configs.
+
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+AiProtocolManagerFilterConfigFactory::createRouteSpecificFilterConfigTyped(
+    const ProtoConfig& proto,
+    Server::Configuration::ServerFactoryContext& /*context*/,
+    ProtobufMessage::ValidationVisitor& /*validator*/) {
+  if (!proto.has_rest_transcoder()) {
+    return absl::InvalidArgumentError(
+        "AiProtocolManager per-route config must set rest_transcoder");
+  }
+  return std::make_shared<McpRestTranscoderRouteConfig>(proto.rest_transcoder());
 }
 
 // ── Static registration ───────────────────────────────────────────────────────
