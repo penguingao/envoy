@@ -60,51 +60,6 @@ against a neutral request type.
 
 ### Request path
 
-#### Fallout mode (terminal dispatch)
-
-The dispatch filter owns `Http::AsyncClient` and drives the full
-request→response cycle without re-entering the Envoy HTTP filter chain.
-
-```
-                            downstream HTTP request
-                                     │
-                                     ▼
- ┌──────────────────────────────────────────────────────────────────────┐
- │                  AiProtocolManagerFilter (terminal)                  │
- │                                                                      │
- │   decodeHeaders / decodeData / decodeTrailers                        │
- │            │                                                         │
- │            ▼                                                         │
- │   ┌──────────────────┐        ┌──────────────────────────────┐       │
- │   │ RequestDecoder   │───────▶│ AiRequest (internal repr.)   │       │
- │   │ (HTTP + body,    │        │  verb/path/headers + body    │       │
- │   │  body streamed)  │        │  + PayloadRefs → PayloadStore│       │
- │   └──────────────────┘        └──────────────┬───────────────┘       │
- │                                              │                       │
- │                              classify(protocol) picks ONE chain      │
- │                               ┌──────────────┴──────────────┐        │
- │                               ▼                             ▼        │
- │                      ┌──────────────────┐       ┌──────────────────┐ │
- │                      │ InferenceChain   │       │   AgenticChain   │ │
- │                      │ (ordered         │       │  (ordered        │ │
- │                      │  AiFilters over  │       │   AiFilters over │ │
- │                      │  AiRequest)      │       │   AiRequest)     │ │
- │                      └────────┬─────────┘       └────────┬─────────┘ │
- │                               │ AiRequest                │ AiRequest │
- │                               ▼                          ▼           │
- │                      ┌──────────────────┐       ┌──────────────────┐ │
- │                      │ InferenceDispatch│       │  AgenticDispatch │ │
- │                      │   (terminal,     │       │    (terminal,    │ │
- │                      │ RequestEncoder)  │       │ RequestEncoder)  │ │
- │                      └────────┬─────────┘       └────────┬─────────┘ │
- │                               └──────────────┬───────────┘           │
- │                                              ▼                       │
- │                                        Http::AsyncClient             │
- └──────────────────────────────────────────────┼───────────────────────┘
-                                                ▼
-                                           upstream(s)
-```
-
 #### Chain-forward mode (non-terminal dispatch)
 
 The dispatch filter re-encodes the `AiRequest` back into Envoy's native
@@ -117,7 +72,7 @@ The response flows back through `AiProtocolManagerFilter`'s encoder side.
                                      │
                                      ▼
  ┌──────────────────────────────────────────────────────────────────────┐
- │                  AiProtocolManagerFilter                             │
+ │                  AiProtocolManagerFilter (Non-terminal Dispatch)     │
  │                                                                      │
  │   decodeHeaders / decodeData / decodeTrailers                        │
  │            │                                                         │
@@ -151,6 +106,51 @@ The response flows back through `AiProtocolManagerFilter`'s encoder side.
                                              │
                                              ▼
                                [Envoy router filter → upstream]
+```
+
+#### Fallout mode (terminal dispatch)
+
+The dispatch filter owns `Http::AsyncClient` and drives the full
+request→response cycle without re-entering the Envoy HTTP filter chain.
+
+```
+                            downstream HTTP request
+                                     │
+                                     ▼
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │                  AiProtocolManagerFilter (Terminal Dispatch)         │
+ │                                                                      │
+ │   decodeHeaders / decodeData / decodeTrailers                        │
+ │            │                                                         │
+ │            ▼                                                         │
+ │   ┌──────────────────┐        ┌──────────────────────────────┐       │
+ │   │ RequestDecoder   │───────▶│ AiRequest (internal repr.)   │       │
+ │   │ (HTTP + body,    │        │  verb/path/headers + body    │       │
+ │   │  body streamed)  │        │  + PayloadRefs → PayloadStore│       │
+ │   └──────────────────┘        └──────────────┬───────────────┘       │
+ │                                              │                       │
+ │                              classify(protocol) picks ONE chain      │
+ │                               ┌──────────────┴──────────────┐        │
+ │                               ▼                             ▼        │
+ │                      ┌──────────────────┐       ┌──────────────────┐ │
+ │                      │ InferenceChain   │       │   AgenticChain   │ │
+ │                      │ (ordered         │       │  (ordered        │ │
+ │                      │  AiFilters over  │       │   AiFilters over │ │
+ │                      │  AiRequest)      │       │   AiRequest)     │ │
+ │                      └────────┬─────────┘       └────────┬─────────┘ │
+ │                               │ AiRequest                │ AiRequest │
+ │                               ▼                          ▼           │
+ │                      ┌──────────────────┐       ┌──────────────────┐ │
+ │                      │ InferenceDispatch│       │  AgenticDispatch │ │
+ │                      │   (terminal,     │       │    (terminal,    │ │
+ │                      │ RequestEncoder)  │       │ RequestEncoder)  │ │
+ │                      └────────┬─────────┘       └────────┬─────────┘ │
+ │                               └──────────────┬───────────┘           │
+ │                                              ▼                       │
+ │                                        Http::AsyncClient             │
+ └──────────────────────────────────────────────┼───────────────────────┘
+                                                ▼
+                                           upstream(s)
 ```
 
 **Key differences from fallout mode:**
@@ -283,6 +283,63 @@ RPC fields, the encoder could construct the appropriate REST path (e.g.
 `POST /tools/search`) instead of the original JSON-RPC endpoint (e.g.
 `POST /mcp`). Placing the transcoder in front of the router enables
 route/cluster re-selection in Envoy.
+
+#### The benefit of AI Native Design
+- Native AI Intent Governance:  MCP attributes authentication is directly applied on native AI message
+
+- No Double Parsing: Parsing only happens once at RequestDecoder, transcoding is performed on native AI message after it traverses the AI filter chain.
+
+- Seamless "Lowering": Transcoding is now a natural lifecycle step where high-level AI intents are lowered to HTTP protocols—be it JSON-RPC for MCP-native backends or JSON REST for REST services.
+
+##### MCP Authentication and REST transcoding flow
+
+```
+   MCP client                AiProtocolManagerFilter                   REST backend
+      │                              │                                       │
+      │  POST /mcp                   │                                       │
+      │  {"jsonrpc":"2.0",           │                                       │
+      │   "method":"tools/call",     │                                       │
+      │   "params":{"name":"search", │                                       │
+      │    "arguments":{"query":"hello"}}}                                   │
+      │─────────────────────────────▶│                                       │
+      │                              │ RequestDecoder                        │
+      │                              │   strips JSON-RPC envelope            │
+      │                              │   ┌─────────────────────────────┐     │
+      │                              │   │ AgentPayload                │     │
+      │                              │   │  invocation = ToolsCall     │     │
+      │                              │   │  tool_name  = "search"      │     │
+      │                              │   │  arguments  = {query:hello} │     │
+      │                              │   └─────────────────────────────┘     │
+      │                              │                                       │
+      │                              │ AgenticChain                          │
+      │                              │   ┌─────────────────────────────┐     │
+      │                              │   │ McpAuthFilter               │     │
+      │                              │   │  auth/authz on AgentPayload │     │
+      │                              │   │  not on raw HTTP            │     │
+      │                              │   └─────────────────────────────┘     │
+      │                              │                                       │
+      │                              │ AgenticDispatch                       │
+      │                              │   ┌─────────────────────────────────┐ │
+      │                              │   │ RequestEncoder                  │ │
+      │                              │   │                                 │ │
+      │                              │   │ transcoder config present?      │ │
+      │                              │   │                                 │ │
+      │                              │   │ YES → encodeAgentBodyAsRest()   │ │
+      │                              │   │   method = GET                  │ │
+      │                              │   │   path   = /api/search          │ │
+      │                              │   │            ?query=hello         │ │
+      │                              │   │   body   = (empty)              │ │
+      │                              │   │                                 │ │
+      │                              │   │ NO  → encodeAgentBody()         │ │
+      │                              │   │   re-wraps as JSON-RPC          │ │
+      │                              │   └─────────────────────────────────┘ │
+      │                              │   mutate headers + addDecodedData()   │
+      │                              │   continueDecoding() → router filter  │
+      │                              │──────────────────────────────────────▶│
+      │                              │                    GET /api/search    │
+      │                              │                        ?query=hello   │
+
+```
 
 ## 3. Directory & file layout
 
