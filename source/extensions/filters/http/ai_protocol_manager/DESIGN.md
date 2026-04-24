@@ -284,15 +284,12 @@ RPC fields, the encoder could construct the appropriate REST path (e.g.
 `POST /mcp`). Placing the transcoder in front of the router enables
 route/cluster re-selection in Envoy.
 
-### Case Study: Transcoding
-
-Implements MCP transcoding with AI Filter Chain: 
+#### The benefit of AI Native Design
 - No double parsing: Parsing only happens once at RequestDecoder, transcoding is performed on native AI message after it traverses the AI filter chain.
 
 - Seamless "Lowering": Transcoding is now a natural lifecycle step where high-level AI intents are lowered to HTTP protocols—be it JSON-RPC for MCP-native backends or JSON REST for REST services.
 
-
-The whole transcoding flow :
+##### MCP → REST transcoding flow
 
 ```
    MCP client                AiProtocolManagerFilter                   REST backend
