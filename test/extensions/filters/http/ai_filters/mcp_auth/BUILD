@@ -32,3 +32,17 @@ envoy_cc_test(
         "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
     ],
 )
+
+envoy_cc_test(
+    name = "mcp_auth_rest_integration_test",
+    srcs = ["mcp_auth_rest_integration_test.cc"],
+    deps = [
+        # Pull in the config registrations so the factories are available at runtime.
+        "//source/extensions/filters/http/ai_protocol_manager:config",
+        "//source/extensions/filters/http/ai_filters/mcp_auth:mcp_auth_filter_lib",
+        "//test/integration:http_integration_lib",
+        "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/http/ai_filters/mcp_auth/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
+    ],
+)
