@@ -95,9 +95,30 @@ McpAuthFilter::onRequestMetadata(AiProtocolManager::Codec::AiRequest& request,
     return AiFilterStatus::StopIteration;
   }
 
-  // ── Step 3: admin-prefix check ───────────────────────────────────────────
-  if (!config_->admin_method_prefix.empty() &&
-      absl::StartsWith(method, config_->admin_method_prefix) && principal != "admin") {
+  // ── Step 3: access policy check ──────────────────────────────────────────
+  //
+  // When method_policies is non-empty, evaluate them in order; first match
+  // wins. When empty, fall back to the deprecated admin_method_prefix rule.
+  if (!config_->method_policies.empty()) {
+    const auto* agent = request.as_agent();
+    for (const auto& policy : config_->method_policies) {
+      if (policy.matches(method, agent)) {
+        if (!policy.allows(principal)) {
+          ENVOY_LOG(debug, "mcp_auth: policy denied principal '{}' for method '{}'",
+                    principal, method);
+          callbacks.sendLocalReply(
+              makeLocalReply(403, kJsonRpcForbidden,
+                             absl::StrCat("Forbidden: '", method,
+                                          "' is not allowed for principal '", principal, "'"),
+                             request.jsonrpc_id));
+          return AiFilterStatus::StopIteration;
+        }
+        break; // first match wins — stop evaluating further policies
+      }
+    }
+  } else if (!config_->admin_method_prefix.empty() &&
+             absl::StartsWith(method, config_->admin_method_prefix) &&
+             principal != "admin") {
     ENVOY_LOG(debug, "mcp_auth: principal '{}' is not authorised for admin method '{}'",
               principal, method);
     callbacks.sendLocalReply(

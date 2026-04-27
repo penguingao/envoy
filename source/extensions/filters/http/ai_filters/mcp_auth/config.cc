@@ -28,11 +28,12 @@ ProtobufTypes::MessagePtr McpAuthFilterFactory::createEmptyConfigProto() {
 // Unpacks the Any-packed McpAuthConfig proto and maps its fields into the
 // immutable McpAuthFilterConfig that is shared across all streams.
 //
-// Field defaults (applied when the proto field is unset or empty):
+// Field defaults:
 //   identity_header      → "x-mcp-identity"
-//   admin_method_prefix  → "admin/"
-//   "initialize" is always inserted into allowed_unauthenticated_methods
-//   regardless of configuration.
+//   admin_method_prefix  → "admin/" (only used when method_policies is empty)
+//   "initialize" is always inserted into allowed_unauthenticated_methods.
+//
+// When method_policies is non-empty it supersedes admin_method_prefix.
 
 McpAuthFilterConfigSharedPtr
 McpAuthFilterFactory::parseConfig(const Protobuf::Any& typed_config,
@@ -48,14 +49,50 @@ McpAuthFilterFactory::parseConfig(const Protobuf::Any& typed_config,
     cfg->identity_header = proto.identity_header();
   }
 
-  // admin_method_prefix — default "admin/" set by McpAuthFilterConfig ctor.
-  if (!proto.admin_method_prefix().empty()) {
-    cfg->admin_method_prefix = proto.admin_method_prefix();
-  }
-
   // allowed_unauthenticated_methods — "initialize" always present (added by ctor).
   for (const auto& method : proto.allowed_unauthenticated_methods()) {
     cfg->allowed_unauthenticated_methods.insert(method);
+  }
+
+  // method_policies — when present, supersedes admin_method_prefix.
+  using ProtoField = envoy::extensions::filters::http::ai_filters::mcp_auth::v3::ParamCondition;
+  for (const auto& p : proto.method_policies()) {
+    MethodPolicy policy;
+    policy.method_pattern = p.method_pattern();
+    for (const auto& principal : p.allowed_principals()) {
+      policy.allowed_principals.insert(principal);
+    }
+
+    for (const auto& pc : p.param_conditions()) {
+      ParamCondition cond;
+
+      switch (pc.field()) {
+      case ProtoField::TOOL_NAME:    cond.field = ParamField::ToolName;    break;
+      case ProtoField::RESOURCE_URI: cond.field = ParamField::ResourceUri; break;
+      case ProtoField::PROMPT_NAME:  cond.field = ParamField::PromptName;  break;
+      default:                       cond.field = ParamField::ToolName;    break;
+      }
+
+      switch (pc.matcher().match_pattern_case()) {
+      case envoy::extensions::filters::http::ai_filters::mcp_auth::v3::StringMatcher::kExact:
+        cond.matcher = {StringMatcher::Kind::Exact,  pc.matcher().exact()};  break;
+      case envoy::extensions::filters::http::ai_filters::mcp_auth::v3::StringMatcher::kPrefix:
+        cond.matcher = {StringMatcher::Kind::Prefix, pc.matcher().prefix()}; break;
+      case envoy::extensions::filters::http::ai_filters::mcp_auth::v3::StringMatcher::kSuffix:
+        cond.matcher = {StringMatcher::Kind::Suffix, pc.matcher().suffix()}; break;
+      default:
+        cond.matcher = {StringMatcher::Kind::Exact, ""};                     break;
+      }
+
+      policy.param_conditions.push_back(std::move(cond));
+    }
+
+    cfg->method_policies.push_back(std::move(policy));
+  }
+
+  // admin_method_prefix (deprecated) — only applied when method_policies is empty.
+  if (cfg->method_policies.empty() && !proto.admin_method_prefix().empty()) {
+    cfg->admin_method_prefix = proto.admin_method_prefix();
   }
 
   return cfg;

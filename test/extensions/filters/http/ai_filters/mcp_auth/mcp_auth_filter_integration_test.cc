@@ -353,83 +353,26 @@ TEST_P(McpAuthFilterIntegrationTest, NonJsonRpcBodyFallsThrough) {
   EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
-// ── REST Transcoder Integration Tests ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// method_policies integration tests
 //
-// End-to-end flow under test:
+// Uses a separate fixture that configures McpAuthConfig with method_policies
+// instead of the deprecated admin_method_prefix.
 //
-//   HTTP client
-//     → AiProtocolManagerFilter (decodes JSON-RPC body, classifies as AgenticMcp)
-//       → AgenticChain
-//           → McpAuthFilter (Q1 auth gate — still runs when transcoder is active)
-//       → AgenticDispatch
-//           reads McpRestTranscoderRouteConfig from typed_per_filter_config
-//           calls RequestEncoder::encodeAgentBodyAsRest()
-//           mutates method/path/body to plain REST before continueDecoding()
-//     → Envoy router filter
-//     → upstream test server
-//
-// The per-route config is injected via config_helper_.addConfigModifier() onto
-// the default virtual host before initialize() runs.
-//
-// Test matrix:
-//
-//   Test                                  Request                          Expected upstream
-//   ──────────────────────────────────────────────────────────────────────────────────────────
-//   ToolsCallTranscodedToGetQueryParam    tools/call search {"query":"hi"} GET /api/search?query=hi
-//   ToolsCallTranscodedToPostWithBody     tools/call create_item {...}     POST /api/items, JSON body
-//   ToolsListTranscodedToGet              tools/list                       GET /api/tools, empty body
-//   ResourcesListTranscodedToGet          resources/list                   GET /api/resources, empty body
-//   ResourcesReadTranscodedWithUri        resources/read uri=my-doc        GET /resources/my-doc
-//   UnknownToolFallsBackToJsonRpc         tools/call unknown_tool          POST /mcp, JSON-RPC body
-//   AuthFailsBeforeTranscoding            tools/call search (no identity)  401 — transcoder never runs
+// Policy configured for this fixture:
+//   - "admin/*"  → allowed_principals: ["admin", "ops"]
+//   - "tools/*"  → allowed_principals: ["*"]    (any authenticated)
+//   - "debug/*"  → allowed_principals: []        (deny all)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-class McpRestTranscoderIntegrationTest
+class McpAuthPolicyIntegrationTest
     : public testing::TestWithParam<Network::Address::IpVersion>,
       public HttpIntegrationTest {
 public:
-  McpRestTranscoderIntegrationTest()
+  McpAuthPolicyIntegrationTest()
       : HttpIntegrationTest(Http::CodecType::HTTP2, GetParam()) {}
 
   void initialize() override {
-    using HCM =
-        envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager;
-    using AiPMProto =
-        envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager;
-
-    // Attach the REST transcoder config to the default virtual host so that
-    // all routes on this listener pick it up via resolveMostSpecificPerFilterConfig.
-    config_helper_.addConfigModifier([](HCM& cfg) {
-      AiPMProto per_route;
-      auto& tc = *per_route.mutable_rest_transcoder();
-
-      // tools/call: "search" → GET /api/search (args become query params)
-      {
-        auto* t = tc.add_tools();
-        t->set_tool_name("search");
-        t->mutable_http_rule()->set_get("/api/search");
-      }
-      // tools/call: "create_item" → POST /api/items, full args as body
-      {
-        auto* t = tc.add_tools();
-        t->set_tool_name("create_item");
-        t->mutable_http_rule()->set_post("/api/items");
-        t->mutable_http_rule()->set_body("*");
-      }
-      // tools/list  → GET /api/tools
-      tc.mutable_tools_list_rule()->set_get("/api/tools");
-      // resources/list → GET /api/resources
-      tc.mutable_resources_list_rule()->set_get("/api/resources");
-      // resources/read → GET /resources/{uri}
-      tc.mutable_resources_read_rule()->set_get("/resources/{uri}");
-
-      (*cfg.mutable_route_config()
-           ->mutable_virtual_hosts()
-           ->Mutable(0)
-           ->mutable_typed_per_filter_config())["envoy.filters.http.ai_protocol_manager"]
-          .PackFrom(per_route);
-    });
-
-    // Prepend AiProtocolManager with McpAuth inside the agentic chain.
     config_helper_.prependFilter(R"EOF(
       name: envoy.filters.http.ai_protocol_manager
       typed_config:
@@ -438,22 +381,31 @@ public:
         - name: envoy.ai_filters.mcp_auth
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ai_filters.mcp_auth.v3.McpAuthConfig
+            method_policies:
+            - method_pattern: "admin/*"
+              allowed_principals: ["admin", "ops"]
+            - method_pattern: "tools/*"
+              allowed_principals: ["*"]
+            - method_pattern: "debug/*"
+              allowed_principals: []
     )EOF");
     HttpIntegrationTest::initialize();
   }
 };
 
-INSTANTIATE_TEST_SUITE_P(IpVersions, McpRestTranscoderIntegrationTest,
+INSTANTIATE_TEST_SUITE_P(IpVersions, McpAuthPolicyIntegrationTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
 
-// ── 1. tools/call "search" → GET /api/search with args as query params ────────
+// ── P1. Permitted principal for admin/* passes ───────────────────────────────
+//
+// "ops" is listed in the admin/* policy → request reaches upstream.
 
-TEST_P(McpRestTranscoderIntegrationTest, ToolsCallTranscodedToGetQueryParam) {
+TEST_P(McpAuthPolicyIntegrationTest, PolicyAdminMethodPermittedPrincipalPasses) {
   initialize();
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
   const std::string body =
-      R"({"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"search","arguments":{"query":"hello"}}})";
+      R"({"jsonrpc":"2.0","id":"p1","method":"admin/restart","params":{}})";
 
   auto response = codec_client_->makeRequestWithBody(
       Http::TestRequestHeaderMapImpl{{":method", "POST"},
@@ -461,27 +413,27 @@ TEST_P(McpRestTranscoderIntegrationTest, ToolsCallTranscodedToGetQueryParam) {
                                      {":scheme", "http"},
                                      {":authority", "host"},
                                      {"content-type", "application/json"},
-                                     {"x-mcp-identity", "alice"}},
+                                     {"x-mcp-identity", "ops"}},
       body);
 
   waitForNextUpstreamRequest();
-  EXPECT_THAT(upstream_request_->headers().getMethodValue(), testing::StrEq("GET"));
-  EXPECT_THAT(upstream_request_->headers().getPathValue(), testing::StrEq("/api/search?query=hello"));
-  EXPECT_THAT(upstream_request_->body().toString(), testing::IsEmpty());
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("admin/restart"));
 
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
-// ── 2. tools/call "create_item" → POST /api/items with full args as JSON body ─
+// ── P2. Non-permitted principal for admin/* → 403 ────────────────────────────
+//
+// "bob" is not in the admin/* allowed_principals list → 403 JSON-RPC error.
 
-TEST_P(McpRestTranscoderIntegrationTest, ToolsCallTranscodedToPostWithBody) {
+TEST_P(McpAuthPolicyIntegrationTest, PolicyAdminMethodNonPermittedPrincipalRejects403) {
   initialize();
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
   const std::string body =
-      R"({"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"create_item","arguments":{"name":"widget","color":"blue"}}})";
+      R"({"jsonrpc":"2.0","id":"p2","method":"admin/restart","params":{}})";
 
   auto response = codec_client_->makeRequestWithBody(
       Http::TestRequestHeaderMapImpl{{":method", "POST"},
@@ -489,83 +441,83 @@ TEST_P(McpRestTranscoderIntegrationTest, ToolsCallTranscodedToPostWithBody) {
                                      {":scheme", "http"},
                                      {":authority", "host"},
                                      {"content-type", "application/json"},
-                                     {"x-mcp-identity", "alice"}},
+                                     {"x-mcp-identity", "bob"}},
       body);
 
-  waitForNextUpstreamRequest();
-  EXPECT_THAT(upstream_request_->headers().getMethodValue(), testing::StrEq("POST"));
-  EXPECT_THAT(upstream_request_->headers().getPathValue(), testing::StrEq("/api/items"));
-  const std::string upstream_body = upstream_request_->body().toString();
-  EXPECT_THAT(upstream_body, HasSubstr("\"name\":\"widget\""));
-  EXPECT_THAT(upstream_body, HasSubstr("\"color\":\"blue\""));
-
-  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());
-  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32003"));
+  EXPECT_THAT(response->body(), HasSubstr("Forbidden"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"p2\""));
 }
 
-// ── 3. tools/list → GET /api/tools ───────────────────────────────────────────
+// ── P3. Wildcard principal for tools/* passes any authenticated identity ──────
+//
+// tools/* has allowed_principals: ["*"] — any identity header value passes.
 
-TEST_P(McpRestTranscoderIntegrationTest, ToolsListTranscodedToGet) {
-  initialize();
-
-  codec_client_ = makeHttpConnection(lookupPort("http"));
-  const std::string body = R"({"jsonrpc":"2.0","id":"3","method":"tools/list","params":{}})";
-
-  auto response = codec_client_->makeRequestWithBody(
-      Http::TestRequestHeaderMapImpl{{":method", "POST"},
-                                     {":path", "/mcp"},
-                                     {":scheme", "http"},
-                                     {":authority", "host"},
-                                     {"content-type", "application/json"},
-                                     {"x-mcp-identity", "alice"}},
-      body);
-
-  waitForNextUpstreamRequest();
-  EXPECT_THAT(upstream_request_->headers().getMethodValue(), testing::StrEq("GET"));
-  EXPECT_THAT(upstream_request_->headers().getPathValue(), testing::StrEq("/api/tools"));
-  EXPECT_THAT(upstream_request_->body().toString(), testing::IsEmpty());
-
-  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
-  ASSERT_TRUE(response->waitForEndStream());
-  EXPECT_EQ("200", response->headers().getStatusValue());
-}
-
-// ── 4. resources/list → GET /api/resources ───────────────────────────────────
-
-TEST_P(McpRestTranscoderIntegrationTest, ResourcesListTranscodedToGet) {
-  initialize();
-
-  codec_client_ = makeHttpConnection(lookupPort("http"));
-  const std::string body = R"({"jsonrpc":"2.0","id":"4","method":"resources/list","params":{}})";
-
-  auto response = codec_client_->makeRequestWithBody(
-      Http::TestRequestHeaderMapImpl{{":method", "POST"},
-                                     {":path", "/mcp"},
-                                     {":scheme", "http"},
-                                     {":authority", "host"},
-                                     {"content-type", "application/json"},
-                                     {"x-mcp-identity", "alice"}},
-      body);
-
-  waitForNextUpstreamRequest();
-  EXPECT_THAT(upstream_request_->headers().getMethodValue(), testing::StrEq("GET"));
-  EXPECT_THAT(upstream_request_->headers().getPathValue(), testing::StrEq("/api/resources"));
-  EXPECT_THAT(upstream_request_->body().toString(), testing::IsEmpty());
-
-  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
-  ASSERT_TRUE(response->waitForEndStream());
-  EXPECT_EQ("200", response->headers().getStatusValue());
-}
-
-// ── 5. resources/read → GET /resources/{uri} substitution ────────────────────
-
-TEST_P(McpRestTranscoderIntegrationTest, ResourcesReadTranscodedWithUriSubstitution) {
+TEST_P(McpAuthPolicyIntegrationTest, PolicyWildcardPrincipalAllowsAnyIdentity) {
   initialize();
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
   const std::string body =
-      R"({"jsonrpc":"2.0","id":"5","method":"resources/read","params":{"uri":"my-doc"}})";
+      R"({"jsonrpc":"2.0","id":"p3","method":"tools/call","params":{"name":"myTool","arguments":{}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "anyone-at-all"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("tools/call"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── P4. Empty allowed_principals for debug/* denies all authenticated ─────────
+//
+// debug/* has allowed_principals: [] — even a valid identity header is denied.
+
+TEST_P(McpAuthPolicyIntegrationTest, PolicyEmptyPrincipalsDenyAllAuthenticated) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"p4","method":"debug/heap","params":{}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "admin"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32003"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"p4\""));
+}
+
+// ── P5. No matching policy → default allow for authenticated principal ────────
+//
+// "resources/list" is not covered by any rule → any authenticated principal
+// passes through.
+
+TEST_P(McpAuthPolicyIntegrationTest, PolicyNoMatchDefaultAllow) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"p5","method":"resources/list","params":{}})";
 
   auto response = codec_client_->makeRequestWithBody(
       Http::TestRequestHeaderMapImpl{{":method", "POST"},
@@ -577,53 +529,24 @@ TEST_P(McpRestTranscoderIntegrationTest, ResourcesReadTranscodedWithUriSubstitut
       body);
 
   waitForNextUpstreamRequest();
-  EXPECT_THAT(upstream_request_->headers().getMethodValue(), testing::StrEq("GET"));
-  EXPECT_THAT(upstream_request_->headers().getPathValue(), testing::StrEq("/resources/my-doc"));
-  EXPECT_THAT(upstream_request_->body().toString(), testing::IsEmpty());
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("resources/list"));
 
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
-// ── 6. Unknown tool → falls back to JSON-RPC passthrough ─────────────────────
+// ── P6. method_policies: missing identity header still rejected 401 ───────────
+//
+// The identity check (step 2) runs before any policy evaluation. Even with
+// method_policies configured, a missing header is still a 401.
 
-TEST_P(McpRestTranscoderIntegrationTest, UnknownToolFallsBackToJsonRpc) {
+TEST_P(McpAuthPolicyIntegrationTest, PolicyMissingIdentityHeaderStillRejects401) {
   initialize();
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
   const std::string body =
-      R"({"jsonrpc":"2.0","id":"6","method":"tools/call","params":{"name":"unknown_tool","arguments":{}}})";
-
-  auto response = codec_client_->makeRequestWithBody(
-      Http::TestRequestHeaderMapImpl{{":method", "POST"},
-                                     {":path", "/mcp"},
-                                     {":scheme", "http"},
-                                     {":authority", "host"},
-                                     {"content-type", "application/json"},
-                                     {"x-mcp-identity", "alice"}},
-      body);
-
-  waitForNextUpstreamRequest();
-  EXPECT_THAT(upstream_request_->headers().getMethodValue(), testing::StrEq("POST"));
-  const std::string upstream_body = upstream_request_->body().toString();
-  EXPECT_THAT(upstream_body, HasSubstr("tools/call"));
-  EXPECT_THAT(upstream_body, HasSubstr("unknown_tool"));
-  EXPECT_THAT(upstream_body, HasSubstr("jsonrpc"));
-
-  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
-  ASSERT_TRUE(response->waitForEndStream());
-  EXPECT_EQ("200", response->headers().getStatusValue());
-}
-
-// ── 7. Auth fails before transcoding ever runs ───────────────────────────────
-
-TEST_P(McpRestTranscoderIntegrationTest, AuthFailsBeforeTranscoding) {
-  initialize();
-
-  codec_client_ = makeHttpConnection(lookupPort("http"));
-  const std::string body =
-      R"({"jsonrpc":"2.0","id":"7","method":"tools/call","params":{"name":"search","arguments":{"query":"hello"}}})";
+      R"({"jsonrpc":"2.0","id":"p6","method":"tools/call","params":{"name":"myTool","arguments":{}}})";
 
   auto response = codec_client_->makeRequestWithBody(
       Http::TestRequestHeaderMapImpl{{":method", "POST"},
@@ -637,7 +560,284 @@ TEST_P(McpRestTranscoderIntegrationTest, AuthFailsBeforeTranscoding) {
   EXPECT_FALSE(upstream_request_ != nullptr);
   EXPECT_EQ("401", response->headers().getStatusValue());
   EXPECT_THAT(response->body(), HasSubstr("-32001"));
-  EXPECT_THAT(response->body(), HasSubstr("Unauthorized"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"p6\""));
+}
+
+// ── P7. method_policies: initialize still bypasses auth via allow-list ────────
+//
+// The allow-list check (step 1) runs before policy evaluation, so "initialize"
+// reaches upstream even with no identity header and restrictive policies set.
+
+TEST_P(McpAuthPolicyIntegrationTest, PolicyInitializeStillBypassesAuth) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"p7","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("initialize"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// param_conditions integration tests
+//
+// A separate fixture that configures method_policies with param_conditions:
+//
+//   - tools/call  + tool_name exact "search"     → allowed_principals: ["*"]
+//   - tools/call  + tool_name exact "delete"     → allowed_principals: ["admin"]
+//   - tools/call  (no param condition, catch-all) → allowed_principals: ["*"]
+//   - resources/read + resource_uri prefix "public/" → allowed_principals: ["*"]
+//   - resources/read (catch-all)                 → allowed_principals: ["alice"]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class McpAuthParamConditionIntegrationTest
+    : public testing::TestWithParam<Network::Address::IpVersion>,
+      public HttpIntegrationTest {
+public:
+  McpAuthParamConditionIntegrationTest()
+      : HttpIntegrationTest(Http::CodecType::HTTP2, GetParam()) {}
+
+  void initialize() override {
+    config_helper_.prependFilter(R"EOF(
+      name: envoy.filters.http.ai_protocol_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+        ai_filters:
+        - name: envoy.ai_filters.mcp_auth
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ai_filters.mcp_auth.v3.McpAuthConfig
+            method_policies:
+            - method_pattern: "tools/call"
+              allowed_principals: ["*"]
+              param_conditions:
+              - field: TOOL_NAME
+                matcher:
+                  exact: "search"
+            - method_pattern: "tools/call"
+              allowed_principals: ["admin"]
+              param_conditions:
+              - field: TOOL_NAME
+                matcher:
+                  exact: "delete"
+            - method_pattern: "tools/call"
+              allowed_principals: ["*"]
+            - method_pattern: "resources/read"
+              allowed_principals: ["*"]
+              param_conditions:
+              - field: RESOURCE_URI
+                matcher:
+                  prefix: "public/"
+            - method_pattern: "resources/read"
+              allowed_principals: ["alice"]
+    )EOF");
+    HttpIntegrationTest::initialize();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, McpAuthParamConditionIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
+
+// ── PC1. tools/call search — any authenticated principal passes ───────────────
+//
+// tool_name "search" matches the first rule (allowed_principals: ["*"]).
+
+TEST_P(McpAuthParamConditionIntegrationTest, ToolCallSearchAnyPrincipalPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pc1","method":"tools/call","params":{"name":"search","arguments":{"query":"hi"}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "bob"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("search"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── PC2. tools/call delete — non-admin principal → 403 ───────────────────────
+//
+// tool_name "delete" matches the second rule (allowed_principals: ["admin"]).
+// "bob" is not admin → 403.
+
+TEST_P(McpAuthParamConditionIntegrationTest, ToolCallDeleteNonAdminRejects403) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pc2","method":"tools/call","params":{"name":"delete","arguments":{"id":"123"}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "bob"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32003"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"pc2\""));
+}
+
+// ── PC3. tools/call delete — admin principal passes ──────────────────────────
+
+TEST_P(McpAuthParamConditionIntegrationTest, ToolCallDeleteAdminPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pc3","method":"tools/call","params":{"name":"delete","arguments":{"id":"123"}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "admin"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("delete"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── PC4. tools/call unknown tool — falls to catch-all rule → any principal ───
+//
+// tool_name "rename" matches neither the "search" nor "delete" param rules,
+// so evaluation falls to the third rule (tools/call, no param condition) which
+// allows everyone.
+
+TEST_P(McpAuthParamConditionIntegrationTest, ToolCallUnknownToolCatchAllPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pc4","method":"tools/call","params":{"name":"rename","arguments":{}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "anyone"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("rename"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── PC5. resources/read public/ URI — any principal passes ───────────────────
+
+TEST_P(McpAuthParamConditionIntegrationTest, ResourceReadPublicUriAnyPrincipalPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pc5","method":"resources/read","params":{"uri":"public/readme"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "bob"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("public/readme"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── PC6. resources/read private/ URI — falls to catch-all → only alice ───────
+//
+// URI "private/secrets" doesn't match the "public/" prefix condition, so the
+// first resources/read rule is skipped. The second rule (no param condition)
+// allows only "alice". "bob" → 403, "alice" → passes.
+
+TEST_P(McpAuthParamConditionIntegrationTest, ResourceReadPrivateUriNonAliceRejects403) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pc6","method":"resources/read","params":{"uri":"private/secrets"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "bob"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32003"));
+}
+
+TEST_P(McpAuthParamConditionIntegrationTest, ResourceReadPrivateUriAlicePasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pc7","method":"resources/read","params":{"uri":"private/secrets"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "alice"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("private/secrets"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 } // namespace
