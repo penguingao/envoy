@@ -60,6 +60,22 @@ public:
   //   - The HttpRule has no HTTP method set.
   static absl::optional<RestHttpRequest> encodeAgentBodyAsRest(
       const AiRequest& request, const McpRestTranscoderRouteConfig& transcoder);
+
+  // Encodes the InferencePayload of the AiRequest back into an OpenAI-style
+  // JSON body string.
+  //
+  // Strategy: start from residual_params (the full original body) as the base,
+  // then overlay any extracted fields with their current (possibly mutated by
+  // chain filters) values. messages[] and tools[] are rebuilt from their
+  // PayloadRefs so per-item mutations from Q2 onRequestItem are reflected.
+  //
+  // Returns an empty string for bodiless invocations (ResponsesRetrieve,
+  // ResponsesCancel, ResponsesDelete, ResponsesListInputItems) — InferenceDispatch
+  // skips addDecodedData / content-length mutation in that case.
+  //
+  // `request` must have protocol == Inference and a populated InferencePayload;
+  // returns an empty string on contract violation.
+  static std::string encodeInferenceBody(const AiRequest& request);
 };
 
 } // namespace Codec

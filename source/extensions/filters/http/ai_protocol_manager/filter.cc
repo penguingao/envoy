@@ -311,10 +311,14 @@ void AiProtocolManagerFilter::doDispatch() {
     Dispatch::AgenticDispatch::dispatch(request_, *decoder_callbacks_, transcoder_config_);
     return;
 
+  case Codec::ProtocolKind::Inference:
+    // Chain-forward: re-encode InferencePayload → OpenAI JSON body, mutate
+    // headers, inject body into the FM buffer, then resume the decode chain.
+    // InferenceDispatch::dispatch() calls continueDecoding() internally.
+    Dispatch::InferenceDispatch::dispatch(request_, *decoder_callbacks_);
+    return;
+
   default:
-    // Inference and unknown: pass through without re-encoding the body.
-    // TODO: invoke RequestEncoder for InferencePayload when body mutations
-    //       need to be reflected in the outgoing request.
     ENVOY_STREAM_LOG(debug, "ai_protocol_manager: dispatching via continueDecoding",
                      *decoder_callbacks_);
     decoder_callbacks_->continueDecoding();

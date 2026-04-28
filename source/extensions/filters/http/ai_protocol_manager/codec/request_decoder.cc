@@ -397,6 +397,13 @@ absl::Status RequestDecoder::onHeaders(const Http::RequestHeaderMap& headers) {
     if (auto* inv = std::get_if<InferenceInvocation>(&result.invocation)) {
       payload.invocation = *inv;
     }
+    // Allow the caller to pin a provider via the x-ai-provider request header
+    // (e.g. "anthropic", "openai", "vertex"). InferenceDispatch reads this at
+    // chain-forward time to select the appropriate body encoder.
+    auto ph = headers.get(Http::LowerCaseString("x-ai-provider"));
+    if (!ph.empty()) {
+      payload.target.provider_hint = std::string(ph[0]->value().getStringView());
+    }
     request_.payload  = std::move(payload);
     inference_parser_ = std::make_unique<InferenceBodyParser>();
     state_            = DecodeState::ParsingInferenceBody;
