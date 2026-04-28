@@ -11,6 +11,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_payload.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/request_decoder.h"
 #include "source/extensions/filters/http/ai_protocol_manager/dispatch/agentic_dispatch.h"
+#include "source/extensions/filters/http/ai_protocol_manager/dispatch/inference_dispatch.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_config.h"
 #include "source/extensions/filters/http/ai_protocol_manager/rest_transcoder_config.h"
 

@@ -338,6 +338,114 @@ RequestEncoder::encodeAgentBodyAsRest(const AiRequest& request,
   return *std::move(result);
 }
 
+// ── encodeInferenceBody ───────────────────────────────────────────────────────
+//
+// Re-encodes the InferencePayload back into an OpenAI-compatible JSON body.
+//
+// Round-trip strategy:
+//   1. Parse residual_params (the full original request body) as the base JSON.
+//      This preserves every field the decoder did not extract into structured
+//      form (response_format, tool_choice, stream_options, user, …).
+//   2. Overwrite extracted scalar fields with their current values so that
+//      chain-filter mutations (e.g. model swap, temperature adjustment) appear
+//      in the outgoing request.
+//   3. Rebuild messages[] and tools[] from PayloadRefs.  The chain runner
+//      updates PayloadRefs in-place when a Q2 onRequestItem handler calls
+//      markDirty(), so this step naturally reflects per-item mutations.
+//
+// Bodiless invocations (Retrieve / Cancel / Delete / ListInputItems) return ""
+// because those operations carry no JSON body on the wire.
+
+std::string RequestEncoder::encodeInferenceBody(const AiRequest& request) {
+  const InferencePayload* payload = request.as_inference();
+  ASSERT(payload != nullptr);
+  if (payload == nullptr) {
+    return "";
+  }
+
+  // Bodiless resource operations have no body to encode.
+  switch (payload->invocation) {
+  case InferenceInvocation::ResponsesRetrieve:
+  case InferenceInvocation::ResponsesCancel:
+  case InferenceInvocation::ResponsesDelete:
+  case InferenceInvocation::ResponsesListInputItems:
+    return "";
+  default:
+    break;
+  }
+
+  // ── Step 1: seed from residual (full original body) ──────────────────────
+  json body;
+  if (!payload->residual_params.empty()) {
+    body = json::parse(payload->residual_params.toString(), nullptr, /*allow_exceptions=*/false);
+    if (body.is_discarded()) {
+      body = json::object();
+    }
+  } else {
+    body = json::object();
+  }
+
+  // ── Step 2: overlay extracted scalars (may have been mutated by chain) ───
+  if (!payload->target.name.empty()) {
+    body["model"] = payload->target.name;
+  }
+  body["stream"] = request.streaming;
+
+  if (payload->sampling.temperature.has_value()) {
+    body["temperature"] = *payload->sampling.temperature;
+  }
+  if (payload->sampling.top_p.has_value()) {
+    body["top_p"] = *payload->sampling.top_p;
+  }
+  if (payload->sampling.max_tokens.has_value()) {
+    body["max_tokens"] = *payload->sampling.max_tokens;
+  }
+  if (payload->sampling.n.has_value()) {
+    body["n"] = *payload->sampling.n;
+  }
+  if (payload->sampling.seed.has_value()) {
+    body["seed"] = *payload->sampling.seed;
+  }
+  if (!payload->sampling.stop.empty()) {
+    body["stop"] = payload->sampling.stop;
+  }
+
+  // ── Step 3: rebuild messages[] from PayloadRefs ───────────────────────────
+  // Only overwrite the "messages" key when the payload actually carries
+  // messages so that we don't clobber an absent key for invocations like
+  // Embeddings that don't have a messages array.
+  if (!payload->messages.empty()) {
+    json msgs = json::array();
+    for (const auto& ref : payload->messages) {
+      if (ref.empty()) {
+        continue;
+      }
+      auto elem = json::parse(ref.toString(), nullptr, /*allow_exceptions=*/false);
+      if (!elem.is_discarded()) {
+        msgs.push_back(std::move(elem));
+      }
+    }
+    body["messages"] = std::move(msgs);
+  }
+
+  // ── Step 4: rebuild tools[] from PayloadRefs ─────────────────────────────
+  if (!payload->tools.empty()) {
+    json tools_arr = json::array();
+    for (const auto& ref : payload->tools) {
+      if (ref.empty()) {
+        continue;
+      }
+      auto elem = json::parse(ref.toString(), nullptr, /*allow_exceptions=*/false);
+      if (!elem.is_discarded()) {
+        tools_arr.push_back(std::move(elem));
+      }
+    }
+    body["tools"] = std::move(tools_arr);
+  }
+
+  return body.dump();
+}
+
 } // namespace Codec
 } // namespace AiProtocolManager
 } // namespace HttpFilters

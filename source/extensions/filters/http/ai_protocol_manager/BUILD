@@ -58,6 +58,7 @@ envoy_cc_library(
         "//source/extensions/filters/http/ai_protocol_manager/codec:ai_response_lib",
         "//source/extensions/filters/http/ai_protocol_manager/codec:request_decoder_lib",
         "//source/extensions/filters/http/ai_protocol_manager/dispatch:agentic_dispatch_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/dispatch:inference_dispatch_lib",
         "@abseil-cpp//absl/strings",
     ],
 )
