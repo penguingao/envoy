@@ -2,12 +2,10 @@
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
-#include "source/common/json/json_loader.h"
-#include "source/common/json/json_utility.h"
-#include "source/extensions/filters/http/mcp/mcp_json_parser.h"
 
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
+#include "nlohmann/json.hpp"
 
 namespace Envoy {
 namespace Extensions {
@@ -15,153 +13,644 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 namespace Codec {
 
+namespace {
+
+using nlohmann::json;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BufferByteIterator
+//
+// Input iterator that walks bytes across a Buffer::RawSliceVector without
+// copying slice data. Passed to nlohmann::json::sax_parse() so the parser
+// reads directly from the OwnedImpl slab chain.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class BufferByteIterator {
+public:
+  using iterator_category = std::input_iterator_tag;
+  using value_type        = char;
+  using difference_type   = std::ptrdiff_t;
+  using pointer           = const char*;
+  using reference         = char;
+
+  BufferByteIterator(const Buffer::RawSliceVector& slices, size_t si, size_t bi)
+      : slices_(&slices), slice_idx_(si), byte_idx_(bi) {}
+
+  char operator*() const {
+    return static_cast<const char*>((*slices_)[slice_idx_].mem_)[byte_idx_];
+  }
+
+  BufferByteIterator& operator++() {
+    if (slice_idx_ >= slices_->size()) {
+      return *this;
+    }
+    if (++byte_idx_ >= (*slices_)[slice_idx_].len_) {
+      ++slice_idx_;
+      byte_idx_ = 0;
+    }
+    return *this;
+  }
+
+  bool operator==(const BufferByteIterator& o) const {
+    return slice_idx_ == o.slice_idx_ && byte_idx_ == o.byte_idx_;
+  }
+  bool operator!=(const BufferByteIterator& o) const { return !(*this == o); }
+
+private:
+  const Buffer::RawSliceVector* slices_;
+  size_t                        slice_idx_;
+  size_t                        byte_idx_;
+};
+
+// Index of the first non-empty slice (begin iterator seed).
+size_t firstNonEmpty(const Buffer::RawSliceVector& slices) {
+  for (size_t i = 0; i < slices.size(); ++i) {
+    if (slices[i].len_ > 0) {
+      return i;
+    }
+  }
+  return slices.size();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SubtreeBuilder
+//
+// Reconstructs a nlohmann::json value from SAX events. Used to capture
+// sub-documents (messages[] elements, tools[] elements, params object) while
+// the main SAX handler continues streaming the outer document.
+// Only one sub-tree at a time is live in memory.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class SubtreeBuilder {
+public:
+  void onNull()                { push(nullptr); }
+  void onBool(bool v)          { push(v); }
+  void onInt(int64_t v)        { push(v); }
+  void onUint(uint64_t v)      { push(v); }
+  void onFloat(double v)       { push(v); }
+  void onString(std::string v) { push(std::move(v)); }
+
+  void onKey(std::string k) {
+    ASSERT(!stack_.empty() && stack_.back().value.is_object());
+    stack_.back().pending_key = std::move(k);
+  }
+
+  void onStartObject() { stack_.push_back({json::object(), ""}); }
+  void onEndObject()   { finishContainer(); }
+  void onStartArray()  { stack_.push_back({json::array(), ""}); }
+  void onEndArray()    { finishContainer(); }
+
+  bool complete() const { return result_complete_; }
+
+  json takeResult() {
+    result_complete_ = false;
+    return std::move(result_);
+  }
+
+private:
+  struct Frame {
+    json        value;
+    std::string pending_key;
+  };
+
+  std::vector<Frame> stack_;
+  json               result_;
+  bool               result_complete_{false};
+
+  void push(json v) {
+    if (stack_.empty()) {
+      result_          = std::move(v);
+      result_complete_ = true;
+      return;
+    }
+    auto& f = stack_.back();
+    if (f.value.is_array()) {
+      f.value.push_back(std::move(v));
+    } else {
+      f.value[f.pending_key] = std::move(v);
+    }
+  }
+
+  void finishContainer() {
+    json v = std::move(stack_.back().value);
+    stack_.pop_back();
+    push(std::move(v));
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// InferenceSAXHandler
+//
+// SAX handler for OpenAI-style REST bodies. Extracts scalar fields (model,
+// stream, sampling params) inline as SAX events fire; captures each
+// messages[] and tools[] element through a SubtreeBuilder that is alive only
+// for the duration of that one element — never the full document DOM.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct InferenceSAXHandler : public nlohmann::json_sax<json> {
+  using string_t          = json::string_t;
+  using number_integer_t  = json::number_integer_t;
+  using number_unsigned_t = json::number_unsigned_t;
+  using number_float_t    = json::number_float_t;
+  using binary_t          = json::binary_t;
+
+  InferencePayload& payload_;
+  AiRequest&        request_;
+  PayloadStore&     store_;
+
+  // Current nesting depth in the root document (not counting sub-builder depth).
+  // 0 = before/after root object, 1 = inside root, 2 = inside top-level array/value, …
+  int         depth_{0};
+  std::string current_key_;  // current key at depth 1; preserved across deeper values
+
+  bool in_messages_{false};  // inside top-level "messages" array
+  bool in_tools_{false};     // inside top-level "tools" array
+
+  // Active element capture (alive only within one messages/tools element).
+  std::unique_ptr<SubtreeBuilder> elem_builder_;
+  int                             elem_depth_{0};  // extra nesting depth within element
+
+  bool        has_error_{false};
+  std::string error_;
+
+  InferenceSAXHandler(InferencePayload& p, AiRequest& r, PayloadStore& s)
+      : payload_(p), request_(r), store_(s) {}
+
+  bool null() override {
+    if (elem_builder_) {
+      elem_builder_->onNull();
+    }
+    return true;
+  }
+
+  bool boolean(bool v) override {
+    if (elem_builder_) {
+      elem_builder_->onBool(v);
+      return true;
+    }
+    if (depth_ == 1 && current_key_ == "stream") {
+      request_.streaming = v;
+    }
+    return true;
+  }
+
+  bool number_integer(number_integer_t v) override {
+    if (elem_builder_) {
+      elem_builder_->onInt(v);
+      return true;
+    }
+    if (depth_ == 1) {
+      if      (current_key_ == "max_tokens") payload_.sampling.max_tokens = static_cast<int32_t>(v);
+      else if (current_key_ == "n")          payload_.sampling.n          = static_cast<int32_t>(v);
+      else if (current_key_ == "seed")       payload_.sampling.seed       = v;
+    }
+    return true;
+  }
+
+  bool number_unsigned(number_unsigned_t v) override {
+    if (elem_builder_) {
+      elem_builder_->onUint(v);
+      return true;
+    }
+    if (depth_ == 1) {
+      if      (current_key_ == "max_tokens") payload_.sampling.max_tokens = static_cast<int32_t>(v);
+      else if (current_key_ == "n")          payload_.sampling.n          = static_cast<int32_t>(v);
+      else if (current_key_ == "seed")       payload_.sampling.seed       = static_cast<int64_t>(v);
+    }
+    return true;
+  }
+
+  bool number_float(number_float_t v, const string_t&) override {
+    if (elem_builder_) {
+      elem_builder_->onFloat(v);
+      return true;
+    }
+    if (depth_ == 1) {
+      if      (current_key_ == "temperature") payload_.sampling.temperature = v;
+      else if (current_key_ == "top_p")       payload_.sampling.top_p       = v;
+    }
+    return true;
+  }
+
+  bool string(string_t& v) override {
+    if (elem_builder_) {
+      elem_builder_->onString(v);
+      return true;
+    }
+    if (depth_ == 1 && current_key_ == "model") {
+      payload_.target.name = v;
+    } else if (current_key_ == "stop" && (depth_ == 1 || depth_ == 2)) {
+      // "stop" can be a bare string (depth 1) or an array element (depth 2).
+      payload_.sampling.stop.push_back(v);
+    }
+    return true;
+  }
+
+  bool binary(binary_t& /*v*/) override { return true; }
+
+  bool start_object(std::size_t) override {
+    if (elem_builder_) {
+      elem_builder_->onStartObject();
+      ++elem_depth_;
+      return true;
+    }
+    ++depth_;
+    // depth_ == 3 means we just opened an object that is an element of the
+    // messages[] or tools[] array (which lives at depth 2).
+    if (depth_ == 3 && (in_messages_ || in_tools_)) {
+      elem_builder_ = std::make_unique<SubtreeBuilder>();
+      elem_depth_   = 0;
+      elem_builder_->onStartObject();
+    }
+    return true;
+  }
+
+  bool key(string_t& k) override {
+    if (elem_builder_) {
+      elem_builder_->onKey(k);
+      return true;
+    }
+    if (depth_ == 1) {
+      current_key_ = k;
+    }
+    return true;
+  }
+
+  bool end_object() override {
+    if (elem_builder_) {
+      if (elem_depth_ > 0) {
+        elem_builder_->onEndObject();
+        --elem_depth_;
+        return true;
+      }
+      // Element root is closing: finish capture and return to array depth.
+      elem_builder_->onEndObject();
+      storeElement();
+      --depth_;  // depth_ was 3 (element level) → 2 (array level)
+      return true;
+    }
+    --depth_;
+    return true;
+  }
+
+  bool start_array(std::size_t) override {
+    if (elem_builder_) {
+      elem_builder_->onStartArray();
+      ++elem_depth_;
+      return true;
+    }
+    ++depth_;
+    if (depth_ == 2) {
+      if      (current_key_ == "messages") { in_messages_ = true;  in_tools_ = false; }
+      else if (current_key_ == "tools")    { in_tools_    = true; in_messages_ = false; }
+    } else if (depth_ == 3 && (in_messages_ || in_tools_)) {
+      // Defensive: array-typed element inside messages/tools (unusual but valid JSON).
+      elem_builder_ = std::make_unique<SubtreeBuilder>();
+      elem_depth_   = 0;
+      elem_builder_->onStartArray();
+    }
+    return true;
+  }
+
+  bool end_array() override {
+    if (elem_builder_) {
+      if (elem_depth_ > 0) {
+        elem_builder_->onEndArray();
+        --elem_depth_;
+        return true;
+      }
+      elem_builder_->onEndArray();
+      storeElement();
+      --depth_;  // depth_ was 3 (element level) → 2 (array level)
+      return true;
+    }
+    --depth_;
+    if (depth_ == 1) {
+      in_messages_ = false;
+      in_tools_    = false;
+    }
+    return true;
+  }
+
+  bool parse_error(std::size_t pos, const std::string& /*token*/,
+                   const nlohmann::detail::exception& ex) override {
+    has_error_ = true;
+    error_     = absl::StrCat("JSON parse error at byte ", pos, ": ", ex.what());
+    return false;
+  }
+
+private:
+  void storeElement() {
+    json      elem = elem_builder_->takeResult();
+    elem_builder_.reset();
+    elem_depth_ = 0;
+    PayloadRef ref = store_.store(elem.dump(), PayloadKind::JsonObject);
+    if (in_messages_) {
+      payload_.messages.push_back(std::move(ref));
+    } else {
+      payload_.tools.push_back(std::move(ref));
+    }
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AgentSAXHandler
+//
+// SAX handler for JSON-RPC 2.0 agent bodies. Extracts the envelope (id,
+// method) inline; captures the params value in a SubtreeBuilder so it can
+// be stored as a PayloadRef without holding the full body DOM.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct AgentSAXHandler : public nlohmann::json_sax<json> {
+  using string_t          = json::string_t;
+  using number_integer_t  = json::number_integer_t;
+  using number_unsigned_t = json::number_unsigned_t;
+  using number_float_t    = json::number_float_t;
+  using binary_t          = json::binary_t;
+
+  AiRequest& request_;
+
+  int         depth_{0};
+  std::string current_key_;
+
+  std::unique_ptr<SubtreeBuilder> params_builder_;
+  int                             params_depth_{0};
+  json                            params_value_;
+  bool                            params_captured_{false};
+
+  bool        has_error_{false};
+  std::string error_;
+
+  explicit AgentSAXHandler(AiRequest& r) : request_(r) {}
+
+  bool null() override {
+    if (params_builder_) {
+      params_builder_->onNull();
+      checkParamsDone();
+    }
+    return true;
+  }
+
+  bool boolean(bool v) override {
+    if (params_builder_) {
+      params_builder_->onBool(v);
+      checkParamsDone();
+      return true;
+    }
+    return true;
+  }
+
+  bool number_integer(number_integer_t v) override {
+    if (params_builder_) {
+      params_builder_->onInt(v);
+      checkParamsDone();
+      return true;
+    }
+    if (depth_ == 1 && current_key_ == "id") {
+      request_.jsonrpc_id = std::to_string(v);
+    }
+    return true;
+  }
+
+  bool number_unsigned(number_unsigned_t v) override {
+    if (params_builder_) {
+      params_builder_->onUint(v);
+      checkParamsDone();
+      return true;
+    }
+    if (depth_ == 1 && current_key_ == "id") {
+      request_.jsonrpc_id = std::to_string(v);
+    }
+    return true;
+  }
+
+  bool number_float(number_float_t v, const string_t&) override {
+    if (params_builder_) {
+      params_builder_->onFloat(v);
+      checkParamsDone();
+      return true;
+    }
+    if (depth_ == 1 && current_key_ == "id") {
+      request_.jsonrpc_id = std::to_string(static_cast<int64_t>(v));
+    }
+    return true;
+  }
+
+  bool string(string_t& v) override {
+    if (params_builder_) {
+      params_builder_->onString(v);
+      checkParamsDone();
+      return true;
+    }
+    if (depth_ == 1) {
+      if      (current_key_ == "id")     request_.jsonrpc_id = v;
+      else if (current_key_ == "method") request_.rpc_method = v;
+    }
+    return true;
+  }
+
+  bool binary(binary_t& /*v*/) override { return true; }
+
+  bool start_object(std::size_t) override {
+    if (params_builder_) {
+      params_builder_->onStartObject();
+      ++params_depth_;
+      return true;
+    }
+    ++depth_;
+    if (depth_ == 2 && current_key_ == "params") {
+      params_builder_ = std::make_unique<SubtreeBuilder>();
+      params_depth_   = 0;
+      params_builder_->onStartObject();
+    }
+    return true;
+  }
+
+  bool key(string_t& k) override {
+    if (params_builder_) {
+      params_builder_->onKey(k);
+      return true;
+    }
+    if (depth_ == 1) {
+      current_key_ = k;
+    }
+    return true;
+  }
+
+  bool end_object() override {
+    if (params_builder_) {
+      if (params_depth_ > 0) {
+        params_builder_->onEndObject();
+        --params_depth_;
+        return true;
+      }
+      params_builder_->onEndObject();
+      captureParams();
+      return true;
+    }
+    --depth_;
+    return true;
+  }
+
+  bool start_array(std::size_t) override {
+    if (params_builder_) {
+      params_builder_->onStartArray();
+      ++params_depth_;
+      return true;
+    }
+    ++depth_;
+    // params may be an array per JSON-RPC spec (positional arguments).
+    if (depth_ == 2 && current_key_ == "params") {
+      params_builder_ = std::make_unique<SubtreeBuilder>();
+      params_depth_   = 0;
+      params_builder_->onStartArray();
+    }
+    return true;
+  }
+
+  bool end_array() override {
+    if (params_builder_) {
+      if (params_depth_ > 0) {
+        params_builder_->onEndArray();
+        --params_depth_;
+        return true;
+      }
+      params_builder_->onEndArray();
+      captureParams();
+      return true;
+    }
+    --depth_;
+    return true;
+  }
+
+  bool parse_error(std::size_t pos, const std::string& /*token*/,
+                   const nlohmann::detail::exception& ex) override {
+    has_error_ = true;
+    error_     = absl::StrCat("JSON-RPC parse error at byte ", pos, ": ", ex.what());
+    return false;
+  }
+
+  bool hasParams() const { return params_captured_; }
+  const json& params() const { return params_value_; }
+
+private:
+  void checkParamsDone() {
+    if (params_builder_ && params_builder_->complete()) {
+      captureParams();
+    }
+  }
+
+  void captureParams() {
+    params_value_    = params_builder_->takeResult();
+    params_captured_ = true;
+    params_builder_.reset();
+  }
+};
+
+} // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // InferenceBodyParser
 //
-// Buffers the complete OpenAI-style REST JSON body and parses it at
-// onEndStream using Json::Factory::loadFromString. For large payloads the
-// buffer may be flushed to PayloadStore; scalar fields (model, stream, sampling
-// knobs) always stay inline. Each messages/tools element is serialised back to
-// JSON via asJsonString() and then stored as a PayloadRef.
+// Accumulates the full OpenAI-style REST JSON body in a Buffer::OwnedImpl
+// (Envoy's iovec slab allocator) rather than a std::string.
+//
+// At onEndStream, runs a SAX parse pass directly over the buffer's
+// RawSliceVector via BufferByteIterator — no contiguous copy. Scalar fields
+// are extracted inline; each messages[] and tools[] element is captured via
+// SubtreeBuilder and stored as an individual PayloadRef (one at a time in
+// memory, never the full array).
+//
+// residual_params receives the entire body buffer via store(Buffer::Instance&),
+// which does a zero-copy slab transfer (Buffer::move) for payloads above the
+// inline threshold.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class RequestDecoder::InferenceBodyParser {
 public:
-  void feed(absl::string_view chunk) { body_.append(chunk.data(), chunk.size()); }
+  void feed(absl::string_view chunk) {
+    body_buffer_.add(chunk.data(), chunk.size());
+  }
 
   absl::Status finish(InferencePayload& payload, AiRequest& request, PayloadStore& store,
                       const DecoderConfig& config) {
-    if (body_.empty()) {
+    if (body_buffer_.length() == 0) {
       return absl::OkStatus();
     }
 
-    auto parse_result = Json::Factory::loadFromString(body_);
-    if (!parse_result.ok()) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("inference body JSON parse error: ", parse_result.status().message()));
-    }
-    const Json::Object& obj = *parse_result.value();
+    // Obtain slice descriptors — these are pointers into the slab memory, no copy.
+    Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
+    const size_t           first  = firstNonEmpty(slices);
+    BufferByteIterator     begin(slices, first, 0);
+    BufferByteIterator     end(slices, slices.size(), 0);
 
-    // "model"
-    if (auto v = obj.getString("model", ""); v.ok() && !v.value().empty()) {
-      payload.target.name = std::move(v.value());
-    }
+    InferenceSAXHandler handler(payload, request, store);
+    const bool ok = nlohmann::json::sax_parse(
+        begin, end, &handler, nlohmann::detail::input_format_t::json, /*strict=*/false);
 
-    // "stream"
-    if (auto v = obj.getBoolean("stream", false); v.ok()) {
-      request.streaming = v.value();
-    }
-
-    // Sampling scalars.
-    if (auto v = obj.getDouble("temperature"); v.ok()) {
-      payload.sampling.temperature = v.value();
-    }
-    if (auto v = obj.getDouble("top_p"); v.ok()) {
-      payload.sampling.top_p = v.value();
-    }
-    if (auto v = obj.getInteger("max_tokens"); v.ok()) {
-      payload.sampling.max_tokens = static_cast<int32_t>(v.value());
-    }
-    if (auto v = obj.getInteger("n"); v.ok()) {
-      payload.sampling.n = static_cast<int32_t>(v.value());
-    }
-    if (auto v = obj.getInteger("seed"); v.ok()) {
-      payload.sampling.seed = v.value();
-    }
-    if (auto v = obj.getStringArray("stop", /*allow_empty=*/true); v.ok()) {
-      payload.sampling.stop = std::move(v.value());
+    if (!ok || handler.has_error_) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "inference body JSON parse error: ",
+          handler.has_error_ ? handler.error_ : "invalid JSON"));
     }
 
-    // "messages" — serialize each element back to JSON, then store as PayloadRef.
-    if (auto msgs = obj.getObjectArray("messages", /*allow_empty=*/true); msgs.ok()) {
-      payload.messages.reserve(msgs.value().size());
-      for (const auto& msg : msgs.value()) {
-        payload.messages.push_back(store.store(msg->asJsonString(), PayloadKind::JsonObject));
-      }
-    }
-
-    // "tools" — same pattern.
-    if (auto tools = obj.getObjectArray("tools", /*allow_empty=*/true); tools.ok()) {
-      payload.tools.reserve(tools.value().size());
-      for (const auto& tool : tools.value()) {
-        payload.tools.push_back(store.store(tool->asJsonString(), PayloadKind::JsonObject));
-      }
-    }
-
-    // Store the raw body as the residual so the encoder can reconstruct all
-    // fields that the mapper did not explicitly claim.
-    payload.residual_params = store.store(std::move(body_), PayloadKind::JsonObject);
+    // Move the body buffer into residual_params. For payloads above the inline
+    // threshold this is a zero-copy slab transfer (Buffer::OwnedImpl::move).
+    payload.residual_params = store.store(body_buffer_, PayloadKind::JsonObject);
 
     (void)config;
     return absl::OkStatus();
   }
 
 private:
-  std::string body_;
+  Buffer::OwnedImpl body_buffer_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AgentBodyParser
 //
-// Wraps McpJsonParser for streaming JSON-RPC parsing. After the full body has
-// been parsed, extracts the envelope fields (jsonrpc / id / method), re-runs
-// the classifier with rpc_method to determine AgentInvocation, then populates
-// AgentPayload from the extracted Protobuf::Struct metadata.
+// Same external-buffer + SAX strategy for JSON-RPC 2.0 agent bodies.
+// The AgentSAXHandler extracts id and method inline; the params value is
+// captured in a SubtreeBuilder. Invocation-specific fields (tool_name,
+// resource_uri, …) are extracted from the captured params JSON after the
+// rpc_method is known and the second classify() call runs.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class RequestDecoder::AgentBodyParser {
 public:
   AgentBodyParser(const Http::RequestHeaderMap& headers, absl::string_view http_method,
                   absl::string_view path)
-      : headers_(headers), http_method_(http_method), path_(path),
-        mcp_parser_([]() {
-          auto config = Mcp::McpParserConfig::createDefault();
-          config.addMethodConfig(::Envoy::Extensions::Filters::Common::Mcp::McpConstants::Methods::TOOLS_CALL,
-                                 {Mcp::McpParserConfig::AttributeExtractionRule(std::string(::Envoy::Extensions::Filters::Common::Mcp::McpConstants::Paths::PARAMS_NAME)),
-                                  Mcp::McpParserConfig::AttributeExtractionRule("params.arguments")});
-          config.addMethodConfig(::Envoy::Extensions::Filters::Common::Mcp::McpConstants::Methods::PROMPTS_GET,
-                                 {Mcp::McpParserConfig::AttributeExtractionRule(std::string(::Envoy::Extensions::Filters::Common::Mcp::McpConstants::Paths::PARAMS_NAME)),
-                                  Mcp::McpParserConfig::AttributeExtractionRule("params.arguments")});
-          return config;
-        }()) {}
+      : headers_(headers), http_method_(http_method), path_(path) {}
 
   absl::Status feed(absl::string_view chunk) {
-    auto status = mcp_parser_.parse(chunk);
-    if (!status.ok()) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("agent body JSON-RPC parse error: ", status.message()));
-    }
+    body_buffer_.add(chunk.data(), chunk.size());
     return absl::OkStatus();
   }
 
   absl::Status finish(AgentPayload& payload, AiRequest& request, PayloadStore& store) {
-    // FinishParse flushes the stream parser and calls finalizeExtraction.
-    auto status = mcp_parser_.finishParse();
-    if (!status.ok()) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("agent body finalize error: ", status.message()));
+    if (body_buffer_.length() == 0) {
+      return absl::OkStatus();
     }
 
-    const Protobuf::Struct& meta = mcp_parser_.metadata();
+    Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
+    const size_t           first  = firstNonEmpty(slices);
+    BufferByteIterator     begin(slices, first, 0);
+    BufferByteIterator     end(slices, slices.size(), 0);
 
-    // ── Envelope fields ──────────────────────────────────────────────────────
+    AgentSAXHandler handler(request);
+    const bool ok = nlohmann::json::sax_parse(
+        begin, end, &handler, nlohmann::detail::input_format_t::json, /*strict=*/false);
 
-    // "id" — may be a string or a number per JSON-RPC spec.
-    if (auto it = meta.fields().find("id"); it != meta.fields().end()) {
-      if (it->second.has_string_value()) {
-        request.jsonrpc_id = it->second.string_value();
-      } else if (it->second.has_number_value()) {
-        request.jsonrpc_id =
-            std::to_string(static_cast<int64_t>(it->second.number_value()));
-      }
-      // Empty jsonrpc_id means notification (no response expected).
+    if (!ok || handler.has_error_) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "agent body JSON-RPC parse error: ",
+          handler.has_error_ ? handler.error_ : "invalid JSON"));
     }
 
-    // "method" → rpc_method → re-classify to obtain AgentInvocation.
-    request.rpc_method = mcp_parser_.getMethod();
+    // Re-classify with the now-known rpc_method to determine AgentInvocation.
     if (!request.rpc_method.empty()) {
-      ClassifyResult r2 = classify({http_method_, path_, headers_, request.rpc_method});
-      request.protocol  = r2.protocol;
+      ClassifyResult r2  = classify({http_method_, path_, headers_, request.rpc_method});
+      request.protocol   = r2.protocol;
       if (auto* inv = std::get_if<AgentInvocation>(&r2.invocation)) {
         payload.invocation = *inv;
       }
@@ -169,121 +658,58 @@ public:
                                                                    : AgentDialect::A2a;
     }
 
-    // ── Params fields — invocation-specific extraction ────────────────────────
-    populateFromMeta(meta, payload, store);
+    // Extract invocation-specific params fields from the captured sub-tree.
+    if (handler.hasParams()) {
+      const json& params = handler.params();
+      populateParams(params, payload, store);
+      payload.params_raw = store.store(params.dump(), PayloadKind::JsonObject);
+    }
+
+    // Full body as residual — zero-copy slab transfer for large payloads.
+    payload.residual_params = store.store(body_buffer_, PayloadKind::JsonObject);
 
     return absl::OkStatus();
   }
 
 private:
-  // Extracts a string value at a dot-separated path within a Protobuf::Struct.
-  static std::string getStr(const Protobuf::Struct& root, absl::string_view dotted) {
-    std::vector<absl::string_view> segs = absl::StrSplit(dotted, '.');
-    const Protobuf::Struct* cur = &root;
-    const Protobuf::Value* val = nullptr;
-    for (size_t i = 0; i < segs.size(); ++i) {
-      auto it = cur->fields().find(std::string(segs[i]));
-      if (it == cur->fields().end()) {
-        return {};
-      }
-      if (i == segs.size() - 1) {
-        val = &it->second;
-      } else {
-        if (!it->second.has_struct_value()) {
-          return {};
-        }
-        cur = &it->second.struct_value();
-      }
-    }
-    return (val && val->has_string_value()) ? val->string_value() : std::string{};
-  }
+  static void populateParams(const json& params, AgentPayload& payload, PayloadStore& store) {
+    auto str = [&](const char* k) -> std::string {
+      return (params.contains(k) && params[k].is_string()) ? params[k].get<std::string>() : "";
+    };
+    auto field = [&](const char* k) -> PayloadRef {
+      return params.contains(k) ? store.store(params[k].dump(), PayloadKind::JsonObject)
+                                : PayloadRef{};
+    };
 
-  // Serialises the Protobuf::Value at `dotted_path` to a JSON string and
-  // stores it in a PayloadRef.
-  static PayloadRef storeField(const Protobuf::Struct& root, absl::string_view dotted,
-                               PayloadStore& store) {
-    // Locate the value.
-    std::vector<absl::string_view> segs = absl::StrSplit(dotted, '.');
-    const Protobuf::Struct* cur = &root;
-    const Protobuf::Value* val = nullptr;
-    for (size_t i = 0; i < segs.size(); ++i) {
-      auto it = cur->fields().find(std::string(segs[i]));
-      if (it == cur->fields().end()) {
-        return PayloadRef{};
-      }
-      if (i == segs.size() - 1) {
-        val = &it->second;
-      } else {
-        if (!it->second.has_struct_value()) {
-          return PayloadRef{};
-        }
-        cur = &it->second.struct_value();
-      }
-    }
-    if (!val) {
-      return PayloadRef{};
-    }
-    std::string json;
-    Json::Utility::appendValueToString(*val, json);
-    return store.store(std::move(json), PayloadKind::JsonObject);
-  }
-
-  void populateFromMeta(const Protobuf::Struct& meta, AgentPayload& payload,
-                        PayloadStore& store) {
     switch (payload.invocation) {
     case AgentInvocation::ToolsCall:
-      payload.tool_name = getStr(meta, "params.name");
-      payload.arguments = storeField(meta, "params.arguments", store);
+      payload.tool_name = str("name");
+      payload.arguments = field("arguments");
       break;
-
     case AgentInvocation::ResourcesRead:
     case AgentInvocation::ResourcesSubscribe:
     case AgentInvocation::ResourcesUnsubscribe:
-      payload.resource_uri = getStr(meta, "params.uri");
+      payload.resource_uri = str("uri");
       break;
-
     case AgentInvocation::PromptsGet:
-      payload.prompt_name = getStr(meta, "params.name");
-      payload.arguments   = storeField(meta, "params.arguments", store);
+      payload.prompt_name = str("name");
+      payload.arguments   = field("arguments");
       break;
-
     case AgentInvocation::CompletionComplete:
-      payload.completion_ref = getStr(meta, "params.ref");
+      payload.completion_ref = str("ref");
       break;
-
     case AgentInvocation::Initialize:
-      payload.capabilities = storeField(meta, "params.capabilities", store);
+      payload.capabilities = field("capabilities");
       break;
-
-    case AgentInvocation::MessageSend:
-    case AgentInvocation::TaskSubmit:
-      // A2A parts live at params.message.parts[] — stored as residual for now;
-      // per-part offload requires iterating the ListValue which is added in v1.
-      break;
-
     default:
       break;
     }
-
-    // Store the "params" value separately so the encoder can use it as the
-    // base params object for invocations whose params were not fully extracted.
-    if (auto it = meta.fields().find("params"); it != meta.fields().end()) {
-      std::string params_json;
-      Json::Utility::appendValueToString(it->second, params_json);
-      payload.params_raw = store.store(std::move(params_json), PayloadKind::JsonObject);
-    }
-
-    // Store the whole parsed metadata as residual to satisfy the round-trip
-    // invariant: every field the mapper didn't claim is still available.
-    std::string residual;
-    Json::Utility::appendStructToString(meta, residual);
-    payload.residual_params = store.store(std::move(residual), PayloadKind::JsonObject);
   }
 
   const Http::RequestHeaderMap& headers_;
   const std::string             http_method_;
   const std::string             path_;
-  Mcp::McpJsonParser            mcp_parser_;
+  Buffer::OwnedImpl             body_buffer_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -369,9 +795,6 @@ absl::Status RequestDecoder::onHeaders(const Http::RequestHeaderMap& headers) {
     request_.path_params[k] = std::move(v);
   }
 
-  // Determine whether a body is expected. We treat any POST/PUT/PATCH as
-  // potentially body-bearing; GET/DELETE/HEAD with a non-zero Content-Length
-  // are unusual for AI APIs but handled conservatively.
   const absl::string_view cl  = headers.getContentLengthValue();
   const absl::string_view te  = headers.getTransferEncodingValue();
   const bool body_hinted_by_headers =
@@ -391,15 +814,11 @@ absl::Status RequestDecoder::onHeaders(const Http::RequestHeaderMap& headers) {
     return absl::OkStatus();
   }
 
-  // Select body parser based on classified protocol.
   if (result.protocol == ProtocolKind::Inference) {
     InferencePayload payload;
     if (auto* inv = std::get_if<InferenceInvocation>(&result.invocation)) {
       payload.invocation = *inv;
     }
-    // Allow the caller to pin a provider via the x-ai-provider request header
-    // (e.g. "anthropic", "openai", "vertex"). InferenceDispatch reads this at
-    // chain-forward time to select the appropriate body encoder.
     auto ph = headers.get(Http::LowerCaseString("x-ai-provider"));
     if (!ph.empty()) {
       payload.target.provider_hint = std::string(ph[0]->value().getStringView());
@@ -408,7 +827,6 @@ absl::Status RequestDecoder::onHeaders(const Http::RequestHeaderMap& headers) {
     inference_parser_ = std::make_unique<InferenceBodyParser>();
     state_            = DecodeState::ParsingInferenceBody;
   } else {
-    // Agentic (MCP or A2A) — protocol refined after rpc_method arrives in body.
     AgentPayload payload;
     if (result.protocol == ProtocolKind::AgenticA2a) {
       payload.dialect = AgentDialect::A2a;
@@ -436,20 +854,17 @@ absl::Status RequestDecoder::onData(absl::string_view chunk) {
     return agent_parser_->feed(chunk);
 
   default:
-    // BodilessComplete or AwaitingHeaders — no body expected; ignore.
     return absl::OkStatus();
   }
 }
 
 absl::Status RequestDecoder::onTrailers(const Http::RequestTrailerMap& /*trailers*/) {
-  // AI protocols do not use request trailers; treat trailing as end-of-stream.
   return onEndStream();
 }
 
 absl::Status RequestDecoder::onEndStream() {
   switch (state_) {
   case DecodeState::BodilessComplete:
-    // Already fully populated in onHeaders.
     state_ = DecodeState::BodyComplete;
     break;
 
@@ -498,8 +913,6 @@ absl::StatusOr<AiRequest> RequestDecoder::take() {
         "RequestDecoder::take() called before successful onEndStream()");
   }
   AiRequest result = std::move(request_);
-  // Reset decoder so it can be reused (one decoder per filter instance is
-  // typical, but resetting is cheap and avoids dangling state).
   request_ = AiRequest{};
   state_   = DecodeState::AwaitingHeaders;
   inference_parser_.reset();

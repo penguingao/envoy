@@ -15,7 +15,8 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 
 AiProtocolManagerFilter::AiProtocolManagerFilter(AiProtocolManagerConfigSharedPtr config)
-    : config_(std::move(config)), payload_store_(config_->decoderConfig().max_inline_bytes),
+    : config_(std::move(config)),
+      payload_store_("/tmp", config_->decoderConfig().max_inline_bytes),
       decoder_(config_->decoderConfig(), payload_store_) {}
 
 AiProtocolManagerFilter::~AiProtocolManagerFilter() = default;

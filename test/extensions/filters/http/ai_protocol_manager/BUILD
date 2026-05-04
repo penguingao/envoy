@@ -21,3 +21,12 @@ envoy_cc_test(
         "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
     ],
 )
+
+envoy_cc_test(
+    name = "payload_store_test",
+    srcs = ["payload_store_test.cc"],
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager/codec:mmap_payload_store_lib",
+        "//source/common/buffer:buffer_lib",
+    ],
+)

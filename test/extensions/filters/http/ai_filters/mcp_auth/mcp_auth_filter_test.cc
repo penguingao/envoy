@@ -39,7 +39,13 @@
 #include "source/extensions/filters/http/ai_filters/mcp_auth/filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain/ai_filter_chain.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
+#include "source/extensions/filters/http/ai_protocol_manager/filter_config.h"
 
+#include "source/common/stats/isolated_store_impl.h"
+
+#include "test/mocks/event/mocks.h"
+#include "test/mocks/server/factory_context.h"
+#include "test/mocks/stream_info/mocks.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"

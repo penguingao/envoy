@@ -92,7 +92,7 @@ private:
     AwaitingHeaders,
     BodilessComplete,     // no body expected; AiRequest fully populated by onHeaders
     ParsingInferenceBody, // accumulating REST-JSON body bytes
-    ParsingAgentBody,     // streaming JSON-RPC body through McpJsonParser
+    ParsingAgentBody,     // buffering JSON-RPC body for end-of-stream parse
     BodyComplete,         // onEndStream done; take() is valid
     Error,
   };
@@ -104,9 +104,9 @@ private:
   // params, and stores each messages/tools element as a PayloadRef.
   class InferenceBodyParser;
 
-  // Wraps McpJsonParser for streaming JSON-RPC parsing. Reads the envelope
-  // (jsonrpc / id / method) incrementally; on "method" arrival calls classify()
-  // again to determine AgentInvocation and selects the matching params parser.
+  // Buffers the full JSON-RPC body and parses it at onEndStream using
+  // nlohmann::json. Extracts the envelope (id, method), re-classifies with
+  // rpc_method to determine AgentInvocation, and populates AgentPayload params.
   class AgentBodyParser;
 
   // ── Helpers ────────────────────────────────────────────────────────────────

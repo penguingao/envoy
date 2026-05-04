@@ -27,6 +27,8 @@ envoy_cc_library(
     deps = [
         ":ai_payload_lib",
         "//envoy/http:header_map_interface",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/common:assert_lib",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/types:optional",
     ],
@@ -35,6 +37,18 @@ envoy_cc_library(
 envoy_cc_library(
     name = "ai_response_lib",
     hdrs = ["ai_response.h"],
+)
+
+envoy_cc_library(
+    name = "mmap_payload_store_lib",
+    hdrs = ["mmap_payload_store.h"],
+    srcs = ["mmap_payload_store.cc"],
+    deps = [
+        ":ai_payload_lib",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/common:assert_lib",
+        "@abseil-cpp//absl/strings",
+    ],
 )
 
 envoy_cc_library(
@@ -59,11 +73,9 @@ envoy_cc_library(
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
-        "//source/common/json:json_loader_lib",
-        "//source/common/json:json_utility_lib",
-        "//source/extensions/filters/http/mcp:mcp_json_parser_lib",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
     ],
 )
 

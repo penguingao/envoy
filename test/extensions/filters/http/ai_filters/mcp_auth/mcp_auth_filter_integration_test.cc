@@ -840,6 +840,189 @@ TEST_P(McpAuthParamConditionIntegrationTest, ResourceReadPrivateUriAlicePasses) 
   EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Large-payload tests — external buffer storage path
+//
+// These tests send JSON-RPC bodies whose total size exceeds the default inline
+// threshold (4096 bytes), forcing the MmapPayloadStore to write the params and
+// residual_params to its backing mmap region (Storage::External) rather than
+// keeping them on the heap.
+//
+// Three properties are verified end-to-end:
+//   1. The full body is correctly parsed (tool_name / method extracted)
+//   2. Auth is still enforced regardless of body size
+//   3. The upstream receives the complete, untruncated payload
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Helper: builds a JSON-RPC tools/call body whose arguments.data field is
+// padded to ensure the total serialised size exceeds the 4096-byte mmap
+// threshold.  The body is valid JSON and round-trips through AgentBodyParser.
+std::string makeLargeToolsCallBody(const std::string& id, const std::string& tool_name,
+                                   size_t pad_bytes = 4500) {
+  return R"({"jsonrpc":"2.0","id":")" + id +
+         R"(","method":"tools/call","params":{"name":")" + tool_name +
+         R"(","arguments":{"data":")" + std::string(pad_bytes, 'A') + R"("}}})";
+}
+
+// ── L1. Large tools/call body + valid identity → reaches upstream intact ──────
+//
+// With MmapPayloadStore the arguments (>4096 bytes) are stored as
+// Storage::External and fetched back by AgentDispatch before re-encoding.
+// The upstream must receive a body containing the method and tool name.
+
+TEST_P(McpAuthFilterIntegrationTest, LargeToolsCallBodyWithValidAuthPassesThrough) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body = makeLargeToolsCallBody("L1", "myTool");
+  ASSERT_GT(body.size(), 4096u) << "test precondition: body must exceed inline threshold";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "alice"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_GT(upstream_body.size(), 4096u) << "upstream body should not be truncated";
+  EXPECT_THAT(upstream_body, HasSubstr("tools/call"));
+  EXPECT_THAT(upstream_body, HasSubstr("myTool"));
+  // Spot-check: a run of 'A' chars from the large payload is present.
+  EXPECT_THAT(upstream_body, HasSubstr(std::string(100, 'A')));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── L2. Large tools/call body + missing identity → 401 ────────────────────────
+//
+// Auth is evaluated after body parsing: even for a >4096-byte body that goes
+// through External storage, a missing identity header must still yield 401.
+
+TEST_P(McpAuthFilterIntegrationTest, LargeToolsCallBodyWithoutAuthRejects401) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body = makeLargeToolsCallBody("L2", "myTool");
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("401", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32001"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"L2\""));
+}
+
+// ── L3. Large initialize body (allow-listed) passes without identity header ───
+//
+// "initialize" is in the allow-list regardless of body size.  The large params
+// (>4096 bytes) are stored as External refs; the request still reaches upstream.
+
+TEST_P(McpAuthFilterIntegrationTest, LargeInitializeBodyBypassesAuth) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  // Build a large initialize body by padding the capabilities object.
+  const std::string large_cap(4500, 'C');
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"L3","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{"extra":")" +
+      large_cap + R"("}}})" ;
+  ASSERT_GT(body.size(), 4096u);
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_GT(upstream_body.size(), 4096u);
+  EXPECT_THAT(upstream_body, HasSubstr("initialize"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── LP1. Policy: large tools/call body + wildcard policy passes ───────────────
+//
+// Exercises the External storage path through McpAuthPolicyIntegrationTest
+// to confirm policy evaluation is unaffected by the storage backend.
+
+TEST_P(McpAuthPolicyIntegrationTest, PolicyLargeToolsCallWildcardPrincipalPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body = makeLargeToolsCallBody("LP1", "rename");
+  ASSERT_GT(body.size(), 4096u);
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "anyone"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_GT(upstream_body.size(), 4096u);
+  EXPECT_THAT(upstream_body, HasSubstr("tools/call"));
+  EXPECT_THAT(upstream_body, HasSubstr("rename"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── PC-L1. Param condition: large body, tool_name still extracted correctly ───
+//
+// Confirms that AgentBodyParser correctly extracts tool_name from a large body
+// (stored in External MmapPayloadStore) so the param_condition can match it.
+
+TEST_P(McpAuthParamConditionIntegrationTest, LargeBodyToolNameExtractedForParamCondition) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  // "search" with large extra field — should match the wildcard tools/* rule.
+  const std::string body = makeLargeToolsCallBody("PCL1", "search");
+  ASSERT_GT(body.size(), 4096u);
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "bob"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_GT(upstream_body.size(), 4096u);
+  EXPECT_THAT(upstream_body, HasSubstr("search"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
 } // namespace
 } // namespace McpAuth
 } // namespace AiFilters
