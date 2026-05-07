@@ -13,6 +13,14 @@
 
 #include "absl/strings/string_view.h"
 
+// Forward declaration — avoids pulling dispatcher.h into every translation unit
+// that includes ai_payload.h. Callers of fetchAsync must include the full header.
+namespace Envoy {
+namespace Event {
+class Dispatcher;
+} // namespace Event
+} // namespace Envoy
+
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
@@ -114,6 +122,15 @@ public:
   // Materializes a ref back into a Buffer::Instance via callback (may be
   // synchronous for Inline/Buffered; async for External backends).
   virtual void fetch(const PayloadRef& ref, FetchCallback cb) = 0;
+
+  // Asynchronous variant. For External refs, implementations may schedule the
+  // read on a background thread and invoke `cb` on the event loop thread via
+  // `dispatcher.post()`; for Inline/Buffered the default calls fetch() inline.
+  // The callback is always invoked exactly once, on the dispatcher thread.
+  virtual void fetchAsync(const PayloadRef& ref, Event::Dispatcher& /*dispatcher*/,
+                          FetchCallback cb) {
+    fetch(ref, std::move(cb));
+  }
 };
 
 // Default in-memory implementation. Fields whose serialized size is at or

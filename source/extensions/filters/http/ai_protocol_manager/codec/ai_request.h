@@ -1,6 +1,7 @@
 #pragma once
 
 #include <any>
+#include <functional>
 #include <optional>
 #include <string>
 #include <variant>
@@ -186,6 +187,13 @@ public:
 // request.payload_store. Both encoder implementations use this to avoid
 // PANICing on External refs produced by MmapPayloadStore.
 std::string materializeRef(const PayloadRef& ref, const AiRequest& request);
+
+// Upgrades all External PayloadRefs in `request` to Buffered by reading them
+// from the mmap store asynchronously. `on_done` is called on the dispatcher
+// thread once every fetch has completed. Safe to call even if there are no
+// External refs — on_done fires immediately in that case.
+void prefetchExternalRefs(AiRequest& request, Event::Dispatcher& dispatcher,
+                          std::function<void()> on_done);
 
 } // namespace Codec
 } // namespace AiProtocolManager

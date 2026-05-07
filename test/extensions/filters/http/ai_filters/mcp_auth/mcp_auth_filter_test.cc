@@ -1,3 +1,4 @@
+// NOT IMPORTANT Unit Tests
 // Functional tests for McpAuthFilter.
 //
 // McpAuthFilter is an AiFilter that runs inside AgenticChain (phase Q1).
@@ -70,6 +71,15 @@ struct ChainOutcome {
 
 class McpAuthFilterTest : public testing::Test {
 protected:
+  McpAuthFilterTest()
+      : ai_config_(std::make_unique<AiProtocolManager::AiProtocolManagerConfig>(
+            AiProtocolManager::ChainConfig{},
+            AiProtocolManager::ChainConfig{},
+            AiProtocolManager::Codec::DecoderConfig{},
+            AiProtocolManager::AiProtocolManagerStats{AI_PROTOCOL_MANAGER_STATS(
+                POOL_COUNTER_PREFIX(*stats_store_.rootScope(), ""))},
+            mock_factory_context_)) {}
+
   // Build an AiFilterChain with a single McpAuthFilter using the given config.
   // Defaults to the zero-arg McpAuthFilterConfig (identity_header="x-mcp-identity",
   // allowed_unauthenticated_methods={"initialize"}, admin_method_prefix="admin/").
@@ -116,7 +126,7 @@ protected:
                    AiProtocolManager::Codec::AiRequest& req) {
     ChainOutcome out;
     chain.runRequestMetadata(
-        req,
+        req, mock_dispatcher_, mock_stream_info_, *ai_config_,
         [&out](AiProtocolManager::Codec::AiRequest&) { out.ready = true; },
         [&out](AiProtocolManager::Codec::AiResponse&& resp) {
           out.local_reply = true;
@@ -125,6 +135,12 @@ protected:
         });
     return out;
   }
+
+  Stats::IsolatedStoreImpl stats_store_;
+  testing::NiceMock<Event::MockDispatcher> mock_dispatcher_;
+  testing::NiceMock<StreamInfo::MockStreamInfo> mock_stream_info_;
+  testing::NiceMock<Server::Configuration::MockFactoryContext> mock_factory_context_;
+  std::unique_ptr<AiProtocolManager::AiProtocolManagerConfig> ai_config_;
 };
 
 // ── 1. Allow-listed method bypasses auth ─────────────────────────────────────
@@ -707,11 +723,11 @@ TEST_F(McpAuthFilterTest, ParamConditionAllMustMatch) {
   p.param_conditions.push_back(c1);
   cfg->method_policies.push_back(std::move(p));
 
-  auto chain = makeChain(cfg);
   Http::TestRequestHeaderMapImpl headers{{"x-mcp-identity", "eve"}};
 
   // Both conditions met (tool matches, principal wrong) → 403.
   {
+    auto chain = makeChain(cfg);
     AiProtocolManager::Codec::AgentPayload agent;
     agent.tool_name = "search";
     auto req = makeAgentRequest("tools/call", &headers, std::move(agent), "30a");
@@ -721,6 +737,7 @@ TEST_F(McpAuthFilterTest, ParamConditionAllMustMatch) {
 
   // Tool name doesn't match → policy skipped → default allow.
   {
+    auto chain = makeChain(cfg);
     AiProtocolManager::Codec::AgentPayload agent;
     agent.tool_name = "other";
     auto req = makeAgentRequest("tools/call", &headers, std::move(agent), "30b");

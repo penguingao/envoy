@@ -26,6 +26,7 @@ envoy_cc_library(
     srcs = ["ai_request.cc"],
     deps = [
         ":ai_payload_lib",
+        "//envoy/event:dispatcher_interface",
         "//envoy/http:header_map_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
@@ -45,6 +46,7 @@ envoy_cc_library(
     srcs = ["mmap_payload_store.cc"],
     deps = [
         ":ai_payload_lib",
+        "//envoy/event:dispatcher_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "@abseil-cpp//absl/strings",

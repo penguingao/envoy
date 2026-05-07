@@ -54,6 +54,13 @@ public:
   // Synchronous. External refs are read directly from the mmap region.
   void fetch(const PayloadRef& ref, FetchCallback cb) override;
 
+  // Asynchronous. For External refs: spawns a short-lived detached thread that
+  // calls pread() (which may page-fault without blocking the event loop), then
+  // posts the result back to the caller's dispatcher thread. Inline/Buffered
+  // refs fall through to the synchronous fetch() path.
+  void fetchAsync(const PayloadRef& ref, Event::Dispatcher& dispatcher,
+                  FetchCallback cb) override;
+
   // Total bytes written to the backing file. Exposed for testing.
   size_t bytesWritten() const { return write_offset_; }
 

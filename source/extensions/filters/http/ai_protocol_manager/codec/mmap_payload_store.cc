@@ -3,7 +3,11 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
+
+#include "envoy/event/dispatcher.h"
 
 #include "source/common/common/assert.h"
 
@@ -140,6 +144,36 @@ void MmapPayloadStore::fetch(const PayloadRef& ref, FetchCallback cb) {
   }
   // Inline or Buffered — materialize via toString().
   cb(std::make_unique<Buffer::OwnedImpl>(ref.toString()));
+}
+
+void MmapPayloadStore::fetchAsync(const PayloadRef& ref, Event::Dispatcher& dispatcher,
+                                  FetchCallback cb) {
+  if (ref.storage() != PayloadRef::Storage::External || fd_ == -1) {
+    // Non-External refs have no I/O risk; call synchronously.
+    fetch(ref, std::move(cb));
+    return;
+  }
+
+  // Capture by value so the thread is independent of this store's lifetime.
+  // pread() uses the fd (int) directly; even if the store is destroyed and the
+  // fd is closed, pread() will return -1 rather than crashing.
+  const int      fd  = fd_;
+  const uint64_t off = ref.externalOffset();
+  const size_t   len = ref.externalLength();
+
+  // Detached thread: performs pread (which may page-fault) off the event loop,
+  // then posts the result buffer back to the dispatcher thread.
+  std::thread([fd, off, len, &dispatcher, cb = std::move(cb)]() mutable {
+    std::vector<char> tmp(len);
+    auto buf = std::make_unique<Buffer::OwnedImpl>();
+    if (len > 0 &&
+        ::pread(fd, tmp.data(), len, static_cast<off_t>(off)) == static_cast<ssize_t>(len)) {
+      buf->add(tmp.data(), len);
+    }
+    dispatcher.post([buf = std::move(buf), cb = std::move(cb)]() mutable {
+      cb(std::move(buf));
+    });
+  }).detach();
 }
 
 } // namespace Codec

@@ -292,11 +292,18 @@ void AiProtocolManagerFilter::dispatch() {
   // callback (FilterManager asserts !(filter_call_state_ & DecodeData)).
   // Post to the next event loop tick to satisfy that invariant.
   auto alive = alive_;
-  decoder_callbacks_->dispatcher().post([this, alive = std::move(alive)]() {
+  decoder_callbacks_->dispatcher().post([this, alive]() {
     if (!*alive) {
       return;
     }
-    doDispatch();
+    Codec::prefetchExternalRefs(
+        request_, decoder_callbacks_->dispatcher(),
+        [this, alive]() {
+          if (!*alive) {
+            return;
+          }
+          doDispatch();
+        });
   });
 }
 

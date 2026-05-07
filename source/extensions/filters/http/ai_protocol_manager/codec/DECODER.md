@@ -221,6 +221,144 @@ which store the filter is using.
 
 ---
 
+## Async External Payload Fetch
+
+### Problem
+
+`MmapPayloadStore` stores large payloads in an mmap-backed temp file. When an
+encoder reads them back via `fetch()`, it calls `memcpy` directly from the mmap
+region on the Envoy event loop thread. On the first access after a page eviction,
+that `memcpy` blocks on a page fault — the kernel must re-read the page from the
+temp file on disk. This is real I/O that can take milliseconds and stalls the
+entire worker thread.
+
+### Solution: three-layer async pipeline
+
+**Layer 1 — `MmapPayloadStore::fetchAsync`**
+
+Spawns a short-lived detached thread that calls `pread()` (rather than direct
+mmap access) so any page fault blocks only that thread, not the event loop. The
+fd is captured as a plain `int` by value, so the read is safe even if the store
+is destroyed before the thread completes. When done, `dispatcher.post()` marshals
+the result buffer back to the event loop thread.
+
+```
+event loop thread              detached thread
+      │                              │
+      │── fetchAsync() ─────────────▶│  pread()  [may page-fault here]
+      │   (returns immediately)      │
+      │                              │── dispatcher.post(callback)
+      │◀─────────────────────────────│
+      │  callback fires with Buffer
+```
+
+**Layer 2 — `prefetchExternalRefs` (`ai_request.cc`)**
+
+Walks all `PayloadRef` fields in `AiRequest` (messages, tools, attachments,
+parts, arguments, capabilities, params_raw, residual_params) and collects every
+`External` ref. Fans out a `fetchAsync` call for each, using a
+`shared_ptr<atomic<size_t>>` countdown. When the counter reaches zero, `on_done`
+is called exactly once, on the event loop thread. Each completed fetch upgrades
+the ref in-place from `External` to `Buffered`, so all downstream encoders can
+call `ref.toString()` without knowing the store type.
+
+**Layer 3 — wired into `dispatch()` (`filter.cc`)**
+
+`dispatch()` already posted `doDispatch()` to the next event loop tick to satisfy
+Envoy's re-entrancy rules. The post now calls `prefetchExternalRefs` first;
+`doDispatch()` runs only after all External refs have been materialized:
+
+```
+dispatch()
+  └─ dispatcher.post()              ← re-entrancy guard (pre-existing)
+       └─ prefetchExternalRefs()
+            ├─ no External refs  →  doDispatch() immediately
+            └─ N External refs   →  fan out fetchAsync × N
+                                     └─ on_done: doDispatch()
+```
+
+### Key design properties
+
+- **Non-blocking**: page faults happen on a detached thread, never on the worker.
+- **Exactly-once `on_done`**: the atomic countdown guarantees `doDispatch()` fires
+  once regardless of how many External refs exist.
+- **Encoder-transparent**: after prefetch all refs are `Buffered`; no encoder
+  call site needed to change.
+- **Safe across lifetimes**: the fd is captured by value; if the store is
+  destroyed mid-flight `pread()` returns -1 and the callback still fires with an
+  empty buffer rather than crashing.
+- **`InMemoryPayloadStore` unaffected**: its refs are never `External`, so
+  `prefetchExternalRefs` returns via the `external.empty()` fast path immediately.
+
+### Why writes are synchronous
+
+`store()` runs on the event loop thread and writes via `memcpy` into the mmap
+region. Writes to newly-allocated pages (immediately after `ftruncate`) cause
+write page faults, but these are fundamentally cheaper than read page faults:
+
+- **Read fault on an evicted page**: the kernel must re-read from disk — actual
+  I/O, potentially milliseconds.
+- **Write fault on a new page**: the kernel zero-initializes a fresh physical
+  page and maps it in — no disk I/O, just memory allocation.
+
+Writes happen during `onEndStream()` body parsing, immediately after bytes
+arrive. The just-`ftruncate`'d pages are brand-new; the OS has had no time to
+evict them. The eviction-under-memory-pressure risk that motivates async reads
+does not apply.
+
+Making writes async would also require pre-reserving arena offsets, holding the
+extracted data in a second temporary buffer which defeating the whole point of 
+the mmap offloadm while the async copy races ahead, and stalling or buffering
+SAX output — adding significant complexity for no practical benefit.
+
+### External Cache Consideration
+
+If the backing store were an external cache (Redis, memcached, any remote store)
+rather than a local mmap file, both the write and read paths would need async
+treatment — and the write path would additionally require a secondary buffer.
+
+**Why writes need a secondary buffer**
+
+With mmap, `store()` is synchronous: `memcpy` into the mapped region completes
+before the function returns, so a valid `PayloadRef::External{offset, length}`
+can be handed back to the SAX parser immediately. The arena offset is stable the
+moment the write finishes.
+
+With an external cache the write is a network round-trip. The event loop cannot
+block waiting for it, so `store()` cannot return a valid cache key synchronously.
+The data must live somewhere while the async write is in flight — that is the
+secondary buffer:
+
+```
+store() called by SAX parser
+  │
+  ├─ copy data into heap Buffer::OwnedImpl   ← secondary (temporary) buffer
+  ├─ return PayloadRef::Buffered immediately ← SAX parser continues
+  └─ fire async write to external cache
+        │
+        └─ on write confirm: upgrade ref Buffered → External{cache_key}
+```
+
+The ref starts as `Buffered` (heap copy) and is upgraded to `External` once the
+write confirms. If the write fails it stays `Buffered` — already a valid fallback
+the rest of the pipeline handles.
+
+**Comparison: mmap vs external cache**
+
+| | mmap | external cache |
+|---|---|---|
+| Write | synchronous `memcpy`, no extra allocation | async network write + heap copy as staging buffer |
+| Read | async only when page evicted (uncommon) | async on every read (every access is a network round-trip) |
+| Memory | pages evictable by OS; physical RAM reclaimed under pressure | heap copy lives until write confirms; cache holds a second copy |
+
+mmap threads the needle: writes are fast enough to be synchronous (no secondary
+buffer needed), the OS handles eviction transparently, and reads are only async
+when memory pressure actually forces a page out. An external cache provides
+durability and cross-process sharing, but pays the secondary buffer cost on every
+write and the async cost on every read regardless of memory pressure.
+
+---
+
 ## End-to-end data flow
 
 ```
@@ -247,11 +385,20 @@ decodeTrailers() / end_stream
             │                                      (offset+len into mmap file)
             └─ residual_params = store_.store(body_buffer_)   ← zero-copy move
 
-dispatch / encode
+dispatch
+  └─ filter.cc::dispatch()
+       └─ dispatcher.post()            ← re-entrancy guard
+            └─ prefetchExternalRefs()
+                 ├─ Inline/Buffered refs → on_done() immediately
+                 └─ External refs → fetchAsync() × N (detached threads + pread)
+                                     └─ dispatcher.post(on_done) when all complete
+                                          └─ doDispatch()
+
+encode
   └─ RequestEncoder / AnthropicRequestEncoder
        └─ materializeRef(ref, request)
-            ├─ Inline/Buffered → ref.toString()
-            └─ External        → store.fetch() → read from mmap region
+            ├─ Inline/Buffered → ref.toString()   ← all External already upgraded
+            └─ External        → store.fetch()    ← only if prefetch was skipped
 ```
 
 ---
