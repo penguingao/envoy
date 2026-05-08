@@ -11,6 +11,9 @@
 
 #include "source/common/common/logger.h"
 #include "source/common/protobuf/protobuf.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_payload.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/request_decoder.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 #include "source/extensions/filters/http/mcp/mcp_json_parser.h"
 
@@ -129,7 +132,8 @@ using McpFilterConfigSharedPtr = std::shared_ptr<McpFilterConfig>;
  */
 class McpFilter : public Http::PassThroughFilter, public Logger::Loggable<Logger::Id::mcp> {
 public:
-  explicit McpFilter(McpFilterConfigSharedPtr config) : config_(config) {}
+  explicit McpFilter(McpFilterConfigSharedPtr config)
+      : config_(config), decoder_(decoder_config_, payload_store_) {}
 
   // Http::StreamDecoderFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers,
@@ -148,15 +152,32 @@ private:
   uint32_t getMaxRequestBodySize() const;
 
   void handleParseError(absl::string_view error_msg);
-  Http::FilterDataStatus completeParsing();
+  Http::FilterDataStatus completeParsing(AiProtocolManager::Codec::AiRequest& req);
+
+  // Builds Protobuf::Struct metadata from a decoded AiRequest, extracting the
+  // well-known routing fields (method, id, params.name, params.uri) that
+  // mcp_filter writes to dynamic metadata and filter state.
+  void buildMetadata(const AiProtocolManager::Codec::AiRequest& req, Protobuf::Struct& metadata);
+
+  // Injects params._meta.{traceparent,tracestate,baggage} as upstream request
+  // headers when the relevant config is set. Validates format before injecting.
+  void injectTraceMeta(const AiProtocolManager::Codec::AgentPayload& agent);
 
   McpFilterConfigSharedPtr config_;
   Http::StreamDecoderFilterCallbacks* decoder_callbacks_{};
-  uint32_t bytes_parsed_{0};
-  bool parsing_complete_{false};
-  std::unique_ptr<JsonPathParser> parser_;
-  bool is_mcp_request_{false};
-  bool is_json_post_request_{false};
+  Http::RequestHeaderMap* request_headers_{nullptr};
+
+  // payload_store_ and decoder_config_ must be declared before decoder_ so
+  // they are initialized first (C++ initializes members in declaration order).
+  AiProtocolManager::Codec::InMemoryPayloadStore payload_store_;
+  AiProtocolManager::Codec::DecoderConfig       decoder_config_;
+  AiProtocolManager::Codec::RequestDecoder       decoder_;
+
+  std::string raw_body_;
+  size_t body_bytes_received_{0};
+  bool   parsing_complete_{false};
+  bool   is_mcp_request_{false};
+  bool   is_json_post_request_{false};
 };
 
 } // namespace Mcp

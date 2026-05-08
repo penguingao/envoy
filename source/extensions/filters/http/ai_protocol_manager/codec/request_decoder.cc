@@ -443,8 +443,9 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
       return true;
     }
     if (depth_ == 1) {
-      if      (current_key_ == "id")     request_.jsonrpc_id = v;
-      else if (current_key_ == "method") request_.rpc_method = v;
+      if      (current_key_ == "id")      request_.jsonrpc_id      = v;
+      else if (current_key_ == "method")  request_.rpc_method      = v;
+      else if (current_key_ == "jsonrpc") request_.jsonrpc_version = v;
     }
     return true;
   }
@@ -703,6 +704,17 @@ private:
       break;
     default:
       break;
+    }
+
+    // Extract W3C trace context from params._meta (present on any invocation).
+    if (params.contains("_meta") && params["_meta"].is_object()) {
+      const auto& meta = params["_meta"];
+      auto metaStr = [&](const char* k) -> std::string {
+        return (meta.contains(k) && meta[k].is_string()) ? meta[k].get<std::string>() : "";
+      };
+      payload.meta_traceparent = metaStr("traceparent");
+      payload.meta_tracestate  = metaStr("tracestate");
+      payload.meta_baggage     = metaStr("baggage");
     }
   }
 

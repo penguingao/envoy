@@ -1,6 +1,5 @@
 #include "source/extensions/filters/http/mcp/mcp_filter.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -19,15 +18,15 @@
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
 #include "source/common/protobuf/protobuf.h"
-#include "source/common/tracing/tracing_validation.h"
 #include "source/extensions/filters/common/mcp/constants.h"
 #include "source/extensions/filters/common/mcp/filter_state.h"
-#include "source/extensions/filters/http/mcp/mcp_json_parser.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
 
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/optional.h"
+#include "source/common/tracing/tracing_validation.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -46,56 +45,6 @@ McpFilterStats generateStats(const std::string& prefix, Stats::Scope& scope) {
   return McpFilterStats{MCP_FILTER_STATS(POOL_COUNTER_PREFIX(scope, final_prefix))};
 }
 
-const Http::LowerCaseString& traceparentHeader() {
-  CONSTRUCT_ON_FIRST_USE(Http::LowerCaseString, "traceparent");
-}
-
-const Http::LowerCaseString& tracestateHeader() {
-  CONSTRUCT_ON_FIRST_USE(Http::LowerCaseString, "tracestate");
-}
-
-const Http::LowerCaseString& baggageHeader() {
-  CONSTRUCT_ON_FIRST_USE(Http::LowerCaseString, "baggage");
-}
-
-void injectTraceContext(const Protobuf::Map<std::string, Protobuf::Value>& meta_fields,
-                        Http::RequestHeaderMap& headers) {
-  const auto& tp_it = meta_fields.find("traceparent");
-  if (tp_it == meta_fields.end() || tp_it->second.kind_case() != Protobuf::Value::kStringValue) {
-    return;
-  }
-
-  const std::string& tp = tp_it->second.string_value();
-  if (!Envoy::Tracing::isValidTraceParent(tp)) {
-    return;
-  }
-
-  headers.remove(traceparentHeader());
-  headers.remove(tracestateHeader());
-
-  headers.setCopy(traceparentHeader(), tp);
-
-  const auto& ts_it = meta_fields.find("tracestate");
-  if (ts_it != meta_fields.end() && ts_it->second.kind_case() == Protobuf::Value::kStringValue) {
-    const std::string& ts = ts_it->second.string_value();
-    if (Envoy::Tracing::isValidTraceState(ts)) {
-      headers.setCopy(tracestateHeader(), ts);
-    }
-  }
-}
-
-void injectBaggage(const Protobuf::Map<std::string, Protobuf::Value>& meta_fields,
-                   Http::RequestHeaderMap& headers) {
-  const auto& bg_it = meta_fields.find("baggage");
-  if (bg_it == meta_fields.end() || bg_it->second.kind_case() != Protobuf::Value::kStringValue) {
-    return;
-  }
-
-  const std::string& bg = bg_it->second.string_value();
-  if (Envoy::Tracing::isValidBaggage(bg)) {
-    headers.setCopy(baggageHeader(), bg);
-  }
-}
 } // namespace
 
 McpFilterConfig::McpFilterConfig(const envoy::extensions::filters::http::mcp::v3::Mcp& proto_config,
@@ -217,6 +166,8 @@ uint32_t McpFilter::getMaxRequestBodySize() const {
 
 Http::FilterHeadersStatus McpFilter::decodeHeaders(Http::RequestHeaderMap& headers,
                                                    bool end_stream) {
+  request_headers_ = &headers;
+
   if (isValidMcpDeleteRequest(headers)) {
     is_mcp_request_ = true;
     ENVOY_LOG(debug, "valid MCP DELETE session-termination request, passing through");
@@ -235,13 +186,23 @@ Http::FilterHeadersStatus McpFilter::decodeHeaders(Http::RequestHeaderMap& heade
     if (end_stream) {
       is_mcp_request_ = false;
     } else {
-      // Need to buffer the body to check for JSON-RPC 2.0
+      // Initialize RequestDecoder for body parsing. The classifier's catch-all
+      // (POST + application/json → AgenticMcp) covers all MCP paths.
+      auto status = decoder_.onHeaders(headers);
+      if (!status.ok()) {
+        ENVOY_LOG(debug, "mcp decoder onHeaders failed: {}", status.message());
+        is_mcp_request_ = false;
+        is_json_post_request_ = false;
+        if (shouldRejectRequest()) {
+          handleParseError("MCP protocol error");
+          return Http::FilterHeadersStatus::StopIteration;
+        }
+        return Http::FilterHeadersStatus::Continue;
+      }
       is_mcp_request_ = true;
 
-      // Set the buffer limit.
       const uint32_t max_size = getMaxRequestBodySize();
       if (max_size > 0) {
-        decoder_callbacks_->setBufferLimit(max_size);
         ENVOY_LOG(debug, "set decoder buffer limit to {} bytes", max_size);
       }
 
@@ -266,66 +227,64 @@ Http::FilterDataStatus McpFilter::decodeData(Buffer::Instance& data, bool end_st
   if (!is_json_post_request_ || !is_mcp_request_) {
     return Http::FilterDataStatus::Continue;
   }
-
-  if (!parser_) {
-    parser_ = std::make_unique<JsonPathParser>(config_->parserConfig());
-  }
-
   if (parsing_complete_) {
     return Http::FilterDataStatus::Continue;
   }
 
-  ENVOY_LOG(trace, "decodeData: buffer_size={}, already_parsed={}, end_stream={}", data.length(),
-            bytes_parsed_, end_stream);
+  ENVOY_LOG(trace, "decodeData: chunk_size={}, total_so_far={}, end_stream={}", data.length(),
+            body_bytes_received_, end_stream);
 
+  // Enforce body size limit manually since we accumulate in the decoder (not
+  // Envoy's buffer), so setBufferLimit watermarks don't apply here.
   const uint32_t max_size = getMaxRequestBodySize();
+  if (max_size > 0 && body_bytes_received_ + data.length() > max_size) {
+    config_->stats().body_too_large_.inc();
+    handleParseError("body exceeds configured size limit");
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }
+  body_bytes_received_ += data.length();
 
-  for (const Buffer::RawSlice& slice : data.getRawSlices()) {
-    const char* start = static_cast<const char*>(slice.mem_);
-    size_t len = slice.len_;
+  // Keep a raw copy for transparent passthrough: since we return
+  // StopIterationNoBuffer for every non-final chunk, Envoy discards those bytes.
+  // We re-inject the full body on the final chunk so the upstream sees it intact.
+  raw_body_.append(data.toString());
 
-    if (max_size > 0) {
-      len = std::min(len, static_cast<size_t>(max_size - bytes_parsed_));
-    }
-
-    if (len > 0) {
-      auto status = parser_->parse({start, len});
-      bytes_parsed_ += len;
-
-      if (parser_->isAllFieldsCollected()) {
-        ENVOY_LOG(debug, "mcp early parse termination: found all fields");
-        return completeParsing();
-      }
-
-      if (!status.ok()) {
-        config_->stats().invalid_json_.inc();
-        decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, "not a valid JSON", nullptr,
-                                           absl::nullopt, "mcp_filter_not_jsonrpc");
-        return Http::FilterDataStatus::StopIterationNoBuffer;
-      }
-    }
-
-    if (max_size > 0 && bytes_parsed_ == max_size)
-      break;
+  // Feed chunk into the decoder's internal buffer.
+  auto data_status = decoder_.onData(data.toString());
+  if (!data_status.ok()) {
+    config_->stats().invalid_json_.inc();
+    handleParseError(data_status.message());
+    return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
-  // If we are here, we haven't collected all fields yet.
-  bool size_limit_hit = (max_size > 0 && bytes_parsed_ == max_size);
-  if (end_stream || size_limit_hit) {
-    auto final_status = parser_->finishParse();
-    if (!final_status.ok()) {
-      if (size_limit_hit && parser_->hasOptionalFields() && parser_->hasAllRequiredFields()) {
-        ENVOY_LOG(debug, "size limit hit before optional fields; proceeding with partial parse");
-        return completeParsing();
-      }
-      config_->stats().body_too_large_.inc();
-      handleParseError("reached end_stream or configured body size, don't get enough data.");
-      return Http::FilterDataStatus::StopIterationNoBuffer;
-    }
-    return completeParsing();
+  if (!end_stream) {
+    // More data coming — tell the filter manager not to buffer (we already
+    // accumulated in the decoder).
+    return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
-  return Http::FilterDataStatus::StopIterationAndWatermark;
+  // End of stream: finalize SAX parse and extract AiRequest.
+  auto end_status = decoder_.onEndStream();
+  if (!end_status.ok()) {
+    config_->stats().invalid_json_.inc();
+    handleParseError(end_status.message());
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }
+
+  auto take_result = decoder_.take();
+  if (!take_result.ok()) {
+    handleParseError(take_result.status().message());
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }
+
+  auto status = completeParsing(take_result.value());
+  if (status == Http::FilterDataStatus::Continue) {
+    // Re-inject the full accumulated body so the upstream receives it intact.
+    // (Previous chunks were dropped by StopIterationNoBuffer.)
+    data.drain(data.length());
+    data.add(raw_body_);
+  }
+  return status;
 }
 
 void McpFilter::handleParseError(absl::string_view error_msg) {
@@ -337,11 +296,17 @@ void McpFilter::handleParseError(absl::string_view error_msg) {
                                      "mcp_filter_parse_error");
 }
 
-Http::FilterDataStatus McpFilter::completeParsing() {
+Http::FilterDataStatus McpFilter::completeParsing(AiProtocolManager::Codec::AiRequest& req) {
   parsing_complete_ = true;
-  is_mcp_request_ = parser_->isValidMcpRequest();
 
-  ENVOY_LOG(debug, "parsing complete: is_mcp={}, bytes_parsed={}", is_mcp_request_, bytes_parsed_);
+  // A valid MCP request must be JSON-RPC 2.0, classified as AgenticMcp (or
+  // AgenticA2a for A2A-over-MCP), and carry a non-empty rpc_method.
+  is_mcp_request_ = (req.jsonrpc_version == "2.0") &&
+                    (req.protocol == AiProtocolManager::Codec::ProtocolKind::AgenticMcp ||
+                     req.protocol == AiProtocolManager::Codec::ProtocolKind::AgenticA2a) &&
+                    !req.rpc_method.empty();
+
+  ENVOY_LOG(debug, "parsing complete: is_mcp={}, method={}", is_mcp_request_, req.rpc_method);
 
   if (!is_mcp_request_ && shouldRejectRequest()) {
     decoder_callbacks_->sendLocalReply(Http::Code::BadRequest,
@@ -350,35 +315,29 @@ Http::FilterDataStatus McpFilter::completeParsing() {
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
-  Protobuf::Struct metadata = parser_->metadata();
+  Protobuf::Struct metadata;
+  buildMetadata(req, metadata);
 
+  // Method group routing key.
   const std::string& group_metadata_key = config_->parserConfig().groupMetadataKey();
   if (!group_metadata_key.empty()) {
-    std::string method_group = config_->parserConfig().getMethodGroup(parser_->getMethod());
+    std::string method_group = config_->parserConfig().getMethodGroup(req.rpc_method);
     (*metadata.mutable_fields())[group_metadata_key].set_string_value(method_group);
     ENVOY_LOG(debug, "MCP filter set method group: {}={}", group_metadata_key, method_group);
   }
 
-  // Handle tracing field extraction and header injection.
-  if (config_->propagateTraceContext().has_value() || config_->propagateBaggage().has_value()) {
-    const Protobuf::Value* meta_value = parser_->getNestedValue(
-        std::string(Filters::Common::Mcp::McpConstants::Paths::PARAMS_META));
-    auto headers = decoder_callbacks_->requestHeaders();
-    if (meta_value != nullptr && meta_value->has_struct_value() && headers.has_value()) {
-      const auto& meta_fields = meta_value->struct_value().fields();
-      if (config_->propagateTraceContext().has_value()) {
-        injectTraceContext(meta_fields, *headers);
-      }
-      if (config_->propagateBaggage().has_value()) {
-        injectBaggage(meta_fields, *headers);
-      }
+  // Inject W3C trace context / baggage from params._meta when configured.
+  if (is_mcp_request_) {
+    const auto* agent = req.as_agent();
+    if (agent && (!agent->meta_traceparent.empty() || !agent->meta_baggage.empty())) {
+      injectTraceMeta(*agent);
     }
   }
 
   if (!metadata.fields().empty()) {
     if (config_->shouldStoreToFilterState()) {
       auto filter_state_obj =
-          std::make_shared<FilterStateObject>(parser_->getMethod(), metadata, is_mcp_request_);
+          std::make_shared<FilterStateObject>(req.rpc_method, metadata, is_mcp_request_);
       decoder_callbacks_->streamInfo().filterState()->setData(
           std::string(FilterStateObject::FilterStateKey), std::move(filter_state_obj),
           StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::Request,
@@ -400,6 +359,70 @@ Http::FilterDataStatus McpFilter::completeParsing() {
     }
   }
   return Http::FilterDataStatus::Continue;
+}
+
+void McpFilter::buildMetadata(const AiProtocolManager::Codec::AiRequest& req,
+                               Protobuf::Struct& metadata) {
+  auto& f = *metadata.mutable_fields();
+
+  // Envelope fields always extracted.
+  if (!req.jsonrpc_version.empty()) {
+    f["jsonrpc"].set_string_value(req.jsonrpc_version);
+  }
+  if (!req.rpc_method.empty()) {
+    f["method"].set_string_value(req.rpc_method);
+  }
+  if (!req.jsonrpc_id.empty()) {
+    f["id"].set_string_value(req.jsonrpc_id);
+  }
+
+  const auto* agent = req.as_agent();
+  if (!agent) {
+    return;
+  }
+
+  // Well-known routing fields extracted by AgentBodyParser. These cover the
+  // most common MCP routing cases without a second JSON parse.
+  if (!agent->tool_name.empty()) {
+    // tools/call → params.name
+    f["params.name"].set_string_value(agent->tool_name);
+  } else if (!agent->resource_uri.empty()) {
+    // resources/read, resources/subscribe, resources/unsubscribe → params.uri
+    f["params.uri"].set_string_value(agent->resource_uri);
+  } else if (!agent->prompt_name.empty()) {
+    // prompts/get → params.name
+    f["params.name"].set_string_value(agent->prompt_name);
+  }
+
+  // TODO: user-configured extraction rules from McpParserConfig (params.level,
+  // params.ref, params.protocolVersion, etc.) require materializing params_raw
+  // and applying the rules — to be implemented as a follow-up.
+}
+
+void McpFilter::injectTraceMeta(const AiProtocolManager::Codec::AgentPayload& agent) {
+  if (!request_headers_) {
+    return;
+  }
+
+  if (config_->propagateTraceContext().has_value()) {
+    if (!agent.meta_traceparent.empty() &&
+        Tracing::isValidTraceParent(agent.meta_traceparent)) {
+      request_headers_->addCopy(Http::LowerCaseString("traceparent"), agent.meta_traceparent);
+      ENVOY_LOG(debug, "MCP injected traceparent: {}", agent.meta_traceparent);
+    }
+    if (!agent.meta_tracestate.empty() &&
+        Tracing::isValidTraceState(agent.meta_tracestate)) {
+      request_headers_->addCopy(Http::LowerCaseString("tracestate"), agent.meta_tracestate);
+      ENVOY_LOG(debug, "MCP injected tracestate: {}", agent.meta_tracestate);
+    }
+  }
+
+  if (config_->propagateBaggage().has_value()) {
+    if (!agent.meta_baggage.empty() && Tracing::isValidBaggage(agent.meta_baggage)) {
+      request_headers_->addCopy(Http::LowerCaseString("baggage"), agent.meta_baggage);
+      ENVOY_LOG(debug, "MCP injected baggage: {}", agent.meta_baggage);
+    }
+  }
 }
 
 } // namespace Mcp

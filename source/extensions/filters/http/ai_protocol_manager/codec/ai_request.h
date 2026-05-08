@@ -137,6 +137,12 @@ struct AgentPayload {
   PayloadRef params_raw;
 
   PayloadRef residual_params;
+
+  // W3C trace context extracted from params._meta (MCP spec §5.x).
+  // Empty strings mean the field was absent or not extracted.
+  std::string meta_traceparent;
+  std::string meta_tracestate;
+  std::string meta_baggage;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,8 +164,9 @@ public:
   Http::RequestHeaderMap* headers{nullptr};
 
   // JSON-RPC identity (populated only for JSON-RPC bodies; empty otherwise).
-  std::string jsonrpc_id;   // empty ⇒ notification / non-JSON-RPC
-  std::string rpc_method;   // raw "method" token when present
+  std::string jsonrpc_version; // e.g. "2.0"; empty if not parsed
+  std::string jsonrpc_id;      // empty ⇒ notification / non-JSON-RPC
+  std::string rpc_method;      // raw "method" token when present
 
   ProtocolKind protocol{ProtocolKind::NonAi};
   std::variant<std::monostate, InferencePayload, AgentPayload> payload;
