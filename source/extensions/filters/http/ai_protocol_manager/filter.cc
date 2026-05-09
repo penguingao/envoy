@@ -15,7 +15,8 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 
 AiProtocolManagerFilter::AiProtocolManagerFilter(AiProtocolManagerConfigSharedPtr config)
-    : config_(std::move(config)), payload_store_(config_->decoderConfig().max_inline_bytes),
+    : config_(std::move(config)),
+      payload_store_("/tmp", config_->decoderConfig().max_inline_bytes),
       decoder_(config_->decoderConfig(), payload_store_) {}
 
 AiProtocolManagerFilter::~AiProtocolManagerFilter() = default;
@@ -291,11 +292,18 @@ void AiProtocolManagerFilter::dispatch() {
   // callback (FilterManager asserts !(filter_call_state_ & DecodeData)).
   // Post to the next event loop tick to satisfy that invariant.
   auto alive = alive_;
-  decoder_callbacks_->dispatcher().post([this, alive = std::move(alive)]() {
+  decoder_callbacks_->dispatcher().post([this, alive]() {
     if (!*alive) {
       return;
     }
-    doDispatch();
+    Codec::prefetchExternalRefs(
+        request_, decoder_callbacks_->dispatcher(),
+        [this, alive]() {
+          if (!*alive) {
+            return;
+          }
+          doDispatch();
+        });
   });
 }
 

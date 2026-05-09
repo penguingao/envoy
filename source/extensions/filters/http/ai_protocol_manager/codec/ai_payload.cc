@@ -7,11 +7,16 @@ namespace AiProtocolManager {
 namespace Codec {
 
 std::string PayloadRef::toString() const {
-  if (storage_ == Storage::Inline) {
+  switch (storage_) {
+  case Storage::Inline:
     return inline_data_;
-  }
-  if (buffered_data_ && buffered_data_->length() > 0) {
-    return buffered_data_->toString();
+  case Storage::Buffered:
+    if (buffered_data_ && buffered_data_->length() > 0) {
+      return buffered_data_->toString();
+    }
+    return {};
+  case Storage::External:
+    PANIC("External PayloadRef must be materialized through PayloadStore::fetch()");
   }
   return {};
 }

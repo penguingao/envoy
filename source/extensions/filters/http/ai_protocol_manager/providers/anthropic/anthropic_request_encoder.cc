@@ -1,5 +1,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/providers/anthropic/anthropic_request_encoder.h"
 
+#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
+
 #include "absl/strings/match.h"
 #include "nlohmann/json.hpp"
 
@@ -222,7 +224,7 @@ json convertAssistantWithToolCalls(const json& msg) {
 //   - role=assistant + tool_calls → tool_use content blocks.
 //   - role=user/assistant (plain) → content blocks converted.
 void buildMessages(const std::vector<Codec::PayloadRef>& refs, json& messages_out,
-                   json& system_out) {
+                   json& system_out, const Codec::AiRequest& request) {
   // Pre-parse every ref so we can do lookahead for tool-result grouping.
   std::vector<json> parsed;
   parsed.reserve(refs.size());
@@ -230,7 +232,7 @@ void buildMessages(const std::vector<Codec::PayloadRef>& refs, json& messages_ou
     if (ref.empty()) {
       continue;
     }
-    auto msg = json::parse(ref.toString(), nullptr, /*allow_exceptions=*/false);
+    auto msg = json::parse(Codec::materializeRef(ref, request), nullptr, /*allow_exceptions=*/false);
     if (!msg.is_discarded()) {
       parsed.push_back(std::move(msg));
     }
@@ -344,13 +346,13 @@ AnthropicRequestEncoder::encode(const Codec::AiRequest& request) {
   json system_val = json(nullptr);
 
   if (is_chat) {
-    buildMessages(payload->messages, messages, system_val);
+    buildMessages(payload->messages, messages, system_val, request);
   } else {
     // Legacy Completion: pull `prompt` from residual_params and wrap it.
     std::string prompt_text;
     if (!payload->residual_params.empty()) {
       auto residual =
-          json::parse(payload->residual_params.toString(), nullptr, /*allow_exceptions=*/false);
+          json::parse(Codec::materializeRef(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
       if (!residual.is_discarded() && residual.contains("prompt")) {
         const auto& p = residual["prompt"];
         if (p.is_string()) {
@@ -375,7 +377,7 @@ AnthropicRequestEncoder::encode(const Codec::AiRequest& request) {
       if (ref.empty()) {
         continue;
       }
-      auto tool = json::parse(ref.toString(), nullptr, /*allow_exceptions=*/false);
+      auto tool = json::parse(Codec::materializeRef(ref, request), nullptr, /*allow_exceptions=*/false);
       if (!tool.is_discarded()) {
         tools_arr.push_back(convertToolDef(tool));
       }
@@ -390,7 +392,7 @@ AnthropicRequestEncoder::encode(const Codec::AiRequest& request) {
   // so we read it back from the full original body stored in residual_params.
   if (!payload->residual_params.empty()) {
     auto residual =
-        json::parse(payload->residual_params.toString(), nullptr, /*allow_exceptions=*/false);
+        json::parse(Codec::materializeRef(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
     if (!residual.is_discarded() && residual.contains("tool_choice")) {
       body["tool_choice"] = convertToolChoice(residual["tool_choice"]);
     }

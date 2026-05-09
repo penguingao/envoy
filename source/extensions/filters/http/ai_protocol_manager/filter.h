@@ -8,7 +8,7 @@
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain/agentic_chain.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain/inference_chain.h"
-#include "source/extensions/filters/http/ai_protocol_manager/codec/ai_payload.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/mmap_payload_store.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/request_decoder.h"
 #include "source/extensions/filters/http/ai_protocol_manager/dispatch/agentic_dispatch.h"
 #include "source/extensions/filters/http/ai_protocol_manager/dispatch/inference_dispatch.h"
@@ -119,7 +119,7 @@ private:
   Http::StreamEncoderFilterCallbacks* encoder_callbacks_{nullptr};
 
   // Per-stream PayloadStore and RequestDecoder.
-  Codec::InMemoryPayloadStore payload_store_;
+  Codec::MmapPayloadStore payload_store_;
   Codec::RequestDecoder       decoder_;
 
   // Populated after onEndStream.

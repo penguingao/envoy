@@ -303,6 +303,130 @@ TEST_P(McpRestTranscoderIntegrationTest, AuthFailsBeforeTranscoding) {
   EXPECT_THAT(response->body(), HasSubstr("Unauthorized"));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Large-payload tests — external buffer storage path
+//
+// These tests send JSON-RPC bodies whose total size exceeds the 4096-byte
+// inline threshold so that MmapPayloadStore writes params / residual_params to
+// its mmap backing region (Storage::External).
+//
+// Verified properties:
+//   1. REST transcoding still produces the correct method/path/body
+//   2. Large bodies stored as External refs are fetched correctly by the encoder
+//   3. Auth enforced regardless of body size (External storage does not bypass)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── R-L1. Large create_item arguments → POST /api/items body intact ───────────
+//
+// The create_item rule maps body:"*", so the full arguments object becomes the
+// upstream POST body.  When arguments exceed 4096 bytes the AgentBodyParser
+// stores them as External in MmapPayloadStore; the transcoder must fetch() them
+// correctly to produce the upstream body.
+
+TEST_P(McpRestTranscoderIntegrationTest, LargeCreateItemArgumentsTranscodedToPostBody) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string large_desc(4500, 'D');
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"RL1","method":"tools/call","params":{"name":"create_item","arguments":{"name":"widget","description":")" +
+      large_desc + R"("}}})" ;
+  ASSERT_GT(body.size(), 4096u) << "test precondition: body must exceed inline threshold";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "alice"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->headers().getMethodValue(), testing::StrEq("POST"));
+  EXPECT_THAT(upstream_request_->headers().getPathValue(), testing::StrEq("/api/items"));
+
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_GT(upstream_body.size(), 4096u) << "upstream body should not be truncated";
+  EXPECT_THAT(upstream_body, HasSubstr("\"name\":\"widget\""));
+  // Spot-check: large description bytes arrived intact.
+  EXPECT_THAT(upstream_body, HasSubstr(std::string(100, 'D')));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── R-L2. Large body for unknown tool → JSON-RPC passthrough body intact ──────
+//
+// When the tool has no transcoding rule, AgentDispatch falls back to re-emitting
+// the original JSON-RPC body.  For a large body the residual_params ref is
+// External; the encoder must fetch() it to produce the upstream body.
+
+TEST_P(McpRestTranscoderIntegrationTest, LargeBodyUnknownToolFallsBackToJsonRpcIntact) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string large_arg(4500, 'B');
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"RL2","method":"tools/call","params":{"name":"unknown_tool","arguments":{"blob":")" +
+      large_arg + R"("}}})" ;
+  ASSERT_GT(body.size(), 4096u);
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "alice"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->headers().getMethodValue(), testing::StrEq("POST"));
+
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_GT(upstream_body.size(), 4096u);
+  EXPECT_THAT(upstream_body, HasSubstr("unknown_tool"));
+  EXPECT_THAT(upstream_body, HasSubstr("jsonrpc"));
+  EXPECT_THAT(upstream_body, HasSubstr(std::string(100, 'B')));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── R-L3. Large body + missing identity → auth rejects before transcoding ─────
+//
+// Auth runs (at Q1) before dispatch/transcoding regardless of body size or
+// storage backend.  A >4096-byte body without an identity header must still
+// produce a 401 and must never reach the upstream.
+
+TEST_P(McpRestTranscoderIntegrationTest, LargeBodyAuthFailsBeforeTranscoding) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string large_arg(4500, 'E');
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"RL3","method":"tools/call","params":{"name":"search","arguments":{"query":")" +
+      large_arg + R"("}}})" ;
+  ASSERT_GT(body.size(), 4096u);
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("401", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32001"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"RL3\""));
+}
+
 } // namespace
 } // namespace McpAuth
 } // namespace AiFilters

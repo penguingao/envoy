@@ -54,7 +54,7 @@ envoy_cc_library(
         "//source/common/http:utility_lib",
         "//source/extensions/filters/http/ai_protocol_manager/chain:agentic_chain_lib",
         "//source/extensions/filters/http/ai_protocol_manager/chain:inference_chain_lib",
-        "//source/extensions/filters/http/ai_protocol_manager/codec:ai_payload_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/codec:mmap_payload_store_lib",
         "//source/extensions/filters/http/ai_protocol_manager/codec:ai_response_lib",
         "//source/extensions/filters/http/ai_protocol_manager/codec:request_decoder_lib",
         "//source/extensions/filters/http/ai_protocol_manager/dispatch:agentic_dispatch_lib",

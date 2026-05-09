@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -10,6 +12,14 @@
 #include "source/common/common/assert.h"
 
 #include "absl/strings/string_view.h"
+
+// Forward declaration — avoids pulling dispatcher.h into every translation unit
+// that includes ai_payload.h. Callers of fetchAsync must include the full header.
+namespace Envoy {
+namespace Event {
+class Dispatcher;
+} // namespace Event
+} // namespace Envoy
 
 namespace Envoy {
 namespace Extensions {
@@ -25,7 +35,7 @@ enum class PayloadKind { JsonObject, JsonArray, Binary };
 // Buffer::Instance so they never live fully in filter memory simultaneously.
 class PayloadRef {
 public:
-  enum class Storage { Inline, Buffered };
+  enum class Storage { Inline, Buffered, External };
 
   PayloadRef() = default;
 
@@ -43,6 +53,16 @@ public:
     return ref;
   }
 
+  // Creates a ref to a byte range inside an external store's backing file.
+  // offset and length are byte positions within the store's mmap region.
+  static PayloadRef makeExternal(uint64_t offset, size_t length) {
+    PayloadRef ref;
+    ref.storage_          = Storage::External;
+    ref.external_offset_  = offset;
+    ref.external_length_  = length;
+    return ref;
+  }
+
   Storage storage() const { return storage_; }
 
   absl::string_view inlineView() const {
@@ -56,20 +76,37 @@ public:
     return *buffered_data_;
   }
 
+  uint64_t externalOffset() const {
+    ASSERT(storage_ == Storage::External);
+    return external_offset_;
+  }
+
+  size_t externalLength() const {
+    ASSERT(storage_ == Storage::External);
+    return external_length_;
+  }
+
   size_t size() const {
-    return storage_ == Storage::Inline ? inline_data_.size()
-                                       : (buffered_data_ ? buffered_data_->length() : 0);
+    switch (storage_) {
+    case Storage::Inline:   return inline_data_.size();
+    case Storage::Buffered: return buffered_data_ ? buffered_data_->length() : 0;
+    case Storage::External: return external_length_;
+    }
+    return 0;
   }
 
   bool empty() const { return size() == 0; }
 
-  // Materializes the value into a std::string regardless of storage type.
+  // Materializes the value into a std::string. Valid only for Inline and Buffered;
+  // External refs must be fetched through PayloadStore::fetch().
   std::string toString() const;
 
 private:
-  Storage              storage_{Storage::Inline};
-  std::string          inline_data_;
-  Buffer::InstancePtr  buffered_data_;
+  Storage             storage_{Storage::Inline};
+  std::string         inline_data_;
+  Buffer::InstancePtr buffered_data_;
+  uint64_t            external_offset_{0};
+  size_t              external_length_{0};
 };
 
 using FetchCallback = std::function<void(Buffer::InstancePtr)>;
@@ -85,6 +122,15 @@ public:
   // Materializes a ref back into a Buffer::Instance via callback (may be
   // synchronous for Inline/Buffered; async for External backends).
   virtual void fetch(const PayloadRef& ref, FetchCallback cb) = 0;
+
+  // Asynchronous variant. For External refs, implementations may schedule the
+  // read on a background thread and invoke `cb` on the event loop thread via
+  // `dispatcher.post()`; for Inline/Buffered the default calls fetch() inline.
+  // The callback is always invoked exactly once, on the dispatcher thread.
+  virtual void fetchAsync(const PayloadRef& ref, Event::Dispatcher& /*dispatcher*/,
+                          FetchCallback cb) {
+    fetch(ref, std::move(cb));
+  }
 };
 
 // Default in-memory implementation. Fields whose serialized size is at or
