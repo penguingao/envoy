@@ -23,6 +23,17 @@ using nlohmann::json;
 // Input iterator that walks bytes across a Buffer::RawSliceVector without
 // copying slice data. Passed to nlohmann::json::sax_parse() so the parser
 // reads directly from the OwnedImpl slab chain.
+//
+// Optionally tracks how many bytes have been consumed via a caller-supplied
+// size_t counter (pos). The SAX handlers read this counter to record the byte
+// positions of element boundaries and slice raw bytes directly from the buffer
+// — avoiding re-serialization and the normalization it introduces.
+//
+// Copy semantics: pos_ is shared across all copies (= default). nlohmann
+// copies the begin iterator into its internal input_adapter, so all copies
+// must share the same counter or the copy doing the actual advancing will not
+// increment it. This is safe because nlohmann is a sequential reader — only
+// one copy is ever advancing at a time.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class BufferByteIterator {
@@ -33,8 +44,22 @@ public:
   using pointer           = const char*;
   using reference         = char;
 
+  // Begin iterator — tracks consumed bytes via *pos.
+  BufferByteIterator(const Buffer::RawSliceVector& slices, size_t si, size_t bi, size_t* pos)
+      : slices_(&slices), slice_idx_(si), byte_idx_(bi), pos_(pos) {}
+
+  // End iterator — no position tracking needed.
   BufferByteIterator(const Buffer::RawSliceVector& slices, size_t si, size_t bi)
-      : slices_(&slices), slice_idx_(si), byte_idx_(bi) {}
+      : slices_(&slices), slice_idx_(si), byte_idx_(bi), pos_(nullptr) {}
+
+  // Default copy/move: pos_ is shared across copies. This is intentional —
+  // nlohmann copies the iterator into its internal adapter, so all copies must
+  // share the same counter. Safe because nlohmann advances only one copy at a
+  // time (sequential reader, no concurrent lookahead copies).
+  BufferByteIterator(const BufferByteIterator&)            = default;
+  BufferByteIterator(BufferByteIterator&&)                 = default;
+  BufferByteIterator& operator=(const BufferByteIterator&) = default;
+  BufferByteIterator& operator=(BufferByteIterator&&)      = default;
 
   char operator*() const {
     return static_cast<const char*>((*slices_)[slice_idx_].mem_)[byte_idx_];
@@ -48,6 +73,9 @@ public:
       ++slice_idx_;
       byte_idx_ = 0;
     }
+    if (pos_) {
+      ++(*pos_);
+    }
     return *this;
   }
 
@@ -60,6 +88,7 @@ private:
   const Buffer::RawSliceVector* slices_;
   size_t                        slice_idx_;
   size_t                        byte_idx_;
+  size_t*                       pos_;
 };
 
 // Index of the first non-empty slice (begin iterator seed).
@@ -72,79 +101,50 @@ size_t firstNonEmpty(const Buffer::RawSliceVector& slices) {
   return slices.size();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SubtreeBuilder
-//
-// Reconstructs a nlohmann::json value from SAX events. Used to capture
-// sub-documents (messages[] elements, tools[] elements, params object) while
-// the main SAX handler continues streaming the outer document.
-// Only one sub-tree at a time is live in memory.
-// ─────────────────────────────────────────────────────────────────────────────
-
-class SubtreeBuilder {
-public:
-  void onNull()                { push(nullptr); }
-  void onBool(bool v)          { push(v); }
-  void onInt(int64_t v)        { push(v); }
-  void onUint(uint64_t v)      { push(v); }
-  void onFloat(double v)       { push(v); }
-  void onString(std::string v) { push(std::move(v)); }
-
-  void onKey(std::string k) {
-    ASSERT(!stack_.empty() && stack_.back().value.is_object());
-    stack_.back().pending_key = std::move(k);
+// Copies bytes [start, end) from a non-contiguous RawSliceVector into a
+// std::string. Used to extract element sub-ranges from the body slab chain
+// without going through the SAX event re-serialization path.
+std::string sliceBuffer(const Buffer::RawSliceVector& slices, size_t start, size_t end) {
+  std::string result;
+  if (end <= start) {
+    return result;
   }
-
-  void onStartObject() { stack_.push_back({json::object(), ""}); }
-  void onEndObject()   { finishContainer(); }
-  void onStartArray()  { stack_.push_back({json::array(), ""}); }
-  void onEndArray()    { finishContainer(); }
-
-  bool complete() const { return result_complete_; }
-
-  json takeResult() {
-    result_complete_ = false;
-    return std::move(result_);
-  }
-
-private:
-  struct Frame {
-    json        value;
-    std::string pending_key;
-  };
-
-  std::vector<Frame> stack_;
-  json               result_;
-  bool               result_complete_{false};
-
-  void push(json v) {
-    if (stack_.empty()) {
-      result_          = std::move(v);
-      result_complete_ = true;
-      return;
+  result.reserve(end - start);
+  size_t offset = 0;
+  for (const auto& slice : slices) {
+    const size_t slice_end = offset + slice.len_;
+    if (slice_end <= start) {
+      offset = slice_end;
+      continue;
     }
-    auto& f = stack_.back();
-    if (f.value.is_array()) {
-      f.value.push_back(std::move(v));
-    } else {
-      f.value[f.pending_key] = std::move(v);
+    if (offset >= end) {
+      break;
     }
+    const size_t copy_from = std::max(start, offset) - offset;
+    const size_t copy_to   = std::min(end, slice_end) - offset;
+    result.append(static_cast<const char*>(slice.mem_) + copy_from, copy_to - copy_from);
+    offset = slice_end;
   }
-
-  void finishContainer() {
-    json v = std::move(stack_.back().value);
-    stack_.pop_back();
-    push(std::move(v));
-  }
-};
+  return result;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // InferenceSAXHandler
 //
 // SAX handler for OpenAI-style REST bodies. Extracts scalar fields (model,
-// stream, sampling params) inline as SAX events fire; captures each
-// messages[] and tools[] element through a SubtreeBuilder that is alive only
-// for the duration of that one element — never the full document DOM.
+// stream, sampling params) inline as SAX events fire.
+//
+// For messages[] and tools[] elements, uses byte-range capture: records the
+// buffer position when an element's opening { or [ is consumed, then slices
+// the raw bytes [start, end) from the slab chain when the matching close fires.
+// No DOM is constructed and no re-serialization is performed — the bytes stored
+// in the PayloadRef are identical to what appeared in the original request body.
+//
+// This is strictly better than the previous SubtreeSerializer approach:
+//   - No re-escaping of strings (unicode sequences preserved exactly)
+//   - No character-by-character scan of large content strings
+//   - Events inside a captured element are entirely ignored (no per-event work)
+//   - Element capture is a simple depth counter + two memcpy calls
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct InferenceSAXHandler : public nlohmann::json_sax<json> {
@@ -154,40 +154,37 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
   using number_float_t    = json::number_float_t;
   using binary_t          = json::binary_t;
 
-  InferencePayload& payload_;
-  AiRequest&        request_;
-  PayloadStore&     store_;
+  InferencePayload&             payload_;
+  AiRequest&                    request_;
+  PayloadStore&                 store_;
+  const size_t*                 parser_pos_;  // bytes consumed by nlohmann so far
+  const Buffer::RawSliceVector* slices_;      // body slab chain for byte slicing
 
-  // Current nesting depth in the root document (not counting sub-builder depth).
-  // 0 = before/after root object, 1 = inside root, 2 = inside top-level array/value, …
   int         depth_{0};
-  std::string current_key_;  // current key at depth 1; preserved across deeper values
+  std::string current_key_;
 
-  bool in_messages_{false};  // inside top-level "messages" array
-  bool in_tools_{false};     // inside top-level "tools" array
+  bool in_messages_{false};
+  bool in_tools_{false};
 
-  // Active element capture (alive only within one messages/tools element).
-  std::unique_ptr<SubtreeBuilder> elem_builder_;
-  int                             elem_depth_{0};  // extra nesting depth within element
+  // Byte-range capture state.
+  bool   capturing_element_{false};
+  size_t elem_start_{0};   // position of element's opening { or [
+  int    elem_depth_{0};   // nesting depth inside the captured element
 
   bool        has_error_{false};
   std::string error_;
 
-  InferenceSAXHandler(InferencePayload& p, AiRequest& r, PayloadStore& s)
-      : payload_(p), request_(r), store_(s) {}
+  InferenceSAXHandler(InferencePayload& p, AiRequest& r, PayloadStore& s,
+                      const size_t* pos, const Buffer::RawSliceVector* slices)
+      : payload_(p), request_(r), store_(s), parser_pos_(pos), slices_(slices) {}
 
-  bool null() override {
-    if (elem_builder_) {
-      elem_builder_->onNull();
-    }
-    return true;
-  }
+  // Scalars inside a captured element are ignored — byte-range capture
+  // records the raw bytes, so we don't need to process individual values.
+
+  bool null() override { return true; }
 
   bool boolean(bool v) override {
-    if (elem_builder_) {
-      elem_builder_->onBool(v);
-      return true;
-    }
+    if (capturing_element_) return true;
     if (depth_ == 1 && current_key_ == "stream") {
       request_.streaming = v;
     }
@@ -195,10 +192,7 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool number_integer(number_integer_t v) override {
-    if (elem_builder_) {
-      elem_builder_->onInt(v);
-      return true;
-    }
+    if (capturing_element_) return true;
     if (depth_ == 1) {
       if      (current_key_ == "max_tokens") payload_.sampling.max_tokens = static_cast<int32_t>(v);
       else if (current_key_ == "n")          payload_.sampling.n          = static_cast<int32_t>(v);
@@ -208,10 +202,7 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool number_unsigned(number_unsigned_t v) override {
-    if (elem_builder_) {
-      elem_builder_->onUint(v);
-      return true;
-    }
+    if (capturing_element_) return true;
     if (depth_ == 1) {
       if      (current_key_ == "max_tokens") payload_.sampling.max_tokens = static_cast<int32_t>(v);
       else if (current_key_ == "n")          payload_.sampling.n          = static_cast<int32_t>(v);
@@ -220,11 +211,8 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
     return true;
   }
 
-  bool number_float(number_float_t v, const string_t&) override {
-    if (elem_builder_) {
-      elem_builder_->onFloat(v);
-      return true;
-    }
+  bool number_float(number_float_t v, const string_t& /*raw*/) override {
+    if (capturing_element_) return true;
     if (depth_ == 1) {
       if      (current_key_ == "temperature") payload_.sampling.temperature = v;
       else if (current_key_ == "top_p")       payload_.sampling.top_p       = v;
@@ -233,14 +221,10 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool string(string_t& v) override {
-    if (elem_builder_) {
-      elem_builder_->onString(v);
-      return true;
-    }
+    if (capturing_element_) return true;
     if (depth_ == 1 && current_key_ == "model") {
       payload_.target.name = v;
     } else if (current_key_ == "stop" && (depth_ == 1 || depth_ == 2)) {
-      // "stop" can be a bare string (depth 1) or an array element (depth 2).
       payload_.sampling.stop.push_back(v);
     }
     return true;
@@ -249,27 +233,21 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
   bool binary(binary_t& /*v*/) override { return true; }
 
   bool start_object(std::size_t) override {
-    if (elem_builder_) {
-      elem_builder_->onStartObject();
+    if (capturing_element_) {
       ++elem_depth_;
       return true;
     }
     ++depth_;
-    // depth_ == 3 means we just opened an object that is an element of the
-    // messages[] or tools[] array (which lives at depth 2).
     if (depth_ == 3 && (in_messages_ || in_tools_)) {
-      elem_builder_ = std::make_unique<SubtreeBuilder>();
-      elem_depth_   = 0;
-      elem_builder_->onStartObject();
+      capturing_element_ = true;
+      elem_depth_        = 1;
+      elem_start_        = *parser_pos_ - 1;  // { was the last byte consumed
     }
     return true;
   }
 
   bool key(string_t& k) override {
-    if (elem_builder_) {
-      elem_builder_->onKey(k);
-      return true;
-    }
+    if (capturing_element_) return true;
     if (depth_ == 1) {
       current_key_ = k;
     }
@@ -277,16 +255,11 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool end_object() override {
-    if (elem_builder_) {
-      if (elem_depth_ > 0) {
-        elem_builder_->onEndObject();
-        --elem_depth_;
-        return true;
+    if (capturing_element_) {
+      if (--elem_depth_ == 0) {
+        storeElement();
+        --depth_;  // depth_ was 3 (element level) → 2 (array level)
       }
-      // Element root is closing: finish capture and return to array depth.
-      elem_builder_->onEndObject();
-      storeElement();
-      --depth_;  // depth_ was 3 (element level) → 2 (array level)
       return true;
     }
     --depth_;
@@ -294,8 +267,7 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool start_array(std::size_t) override {
-    if (elem_builder_) {
-      elem_builder_->onStartArray();
+    if (capturing_element_) {
       ++elem_depth_;
       return true;
     }
@@ -304,24 +276,20 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
       if      (current_key_ == "messages") { in_messages_ = true;  in_tools_ = false; }
       else if (current_key_ == "tools")    { in_tools_    = true; in_messages_ = false; }
     } else if (depth_ == 3 && (in_messages_ || in_tools_)) {
-      // Defensive: array-typed element inside messages/tools (unusual but valid JSON).
-      elem_builder_ = std::make_unique<SubtreeBuilder>();
-      elem_depth_   = 0;
-      elem_builder_->onStartArray();
+      // Array-typed element inside messages/tools (unusual but valid JSON).
+      capturing_element_ = true;
+      elem_depth_        = 1;
+      elem_start_        = *parser_pos_ - 1;
     }
     return true;
   }
 
   bool end_array() override {
-    if (elem_builder_) {
-      if (elem_depth_ > 0) {
-        elem_builder_->onEndArray();
-        --elem_depth_;
-        return true;
+    if (capturing_element_) {
+      if (--elem_depth_ == 0) {
+        storeElement();
+        --depth_;
       }
-      elem_builder_->onEndArray();
-      storeElement();
-      --depth_;  // depth_ was 3 (element level) → 2 (array level)
       return true;
     }
     --depth_;
@@ -341,10 +309,11 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
 
 private:
   void storeElement() {
-    json      elem = elem_builder_->takeResult();
-    elem_builder_.reset();
-    elem_depth_ = 0;
-    PayloadRef ref = store_.store(elem.dump(), PayloadKind::JsonObject);
+    // Slice the raw bytes of this element directly from the body slab chain.
+    // parser_pos_ is one past the closing } or ] at the moment this fires.
+    std::string raw = sliceBuffer(*slices_, elem_start_, *parser_pos_);
+    capturing_element_ = false;
+    PayloadRef ref = store_.store(std::move(raw), PayloadKind::JsonObject);
     if (in_messages_) {
       payload_.messages.push_back(std::move(ref));
     } else {
@@ -357,8 +326,13 @@ private:
 // AgentSAXHandler
 //
 // SAX handler for JSON-RPC 2.0 agent bodies. Extracts the envelope (id,
-// method) inline; captures the params value in a SubtreeBuilder so it can
-// be stored as a PayloadRef without holding the full body DOM.
+// method) inline; captures the params value via byte-range capture — records
+// the position of the params opening { or [ and slices raw bytes when the
+// matching close fires. No DOM is held during the SAX pass.
+//
+// AgentBodyParser::finish does one json::parse of the captured params string
+// for field extraction (tool_name, resource_uri, etc.), then moves the exact-
+// byte string into the store for params_raw.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct AgentSAXHandler : public nlohmann::json_sax<json> {
@@ -368,44 +342,31 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
   using number_float_t    = json::number_float_t;
   using binary_t          = json::binary_t;
 
-  AiRequest& request_;
+  AiRequest&                    request_;
+  const size_t*                 parser_pos_;
+  const Buffer::RawSliceVector* slices_;
 
   int         depth_{0};
   std::string current_key_;
 
-  std::unique_ptr<SubtreeBuilder> params_builder_;
-  int                             params_depth_{0};
-  json                            params_value_;
-  bool                            params_captured_{false};
+  bool   capturing_params_{false};
+  size_t params_start_{0};
+  int    params_depth_{0};
+  bool   params_captured_{false};
+  std::string params_json_;
 
   bool        has_error_{false};
   std::string error_;
 
-  explicit AgentSAXHandler(AiRequest& r) : request_(r) {}
+  AgentSAXHandler(AiRequest& r, const size_t* pos, const Buffer::RawSliceVector* slices)
+      : request_(r), parser_pos_(pos), slices_(slices) {}
 
-  bool null() override {
-    if (params_builder_) {
-      params_builder_->onNull();
-      checkParamsDone();
-    }
-    return true;
-  }
+  bool null() override { return true; }
 
-  bool boolean(bool v) override {
-    if (params_builder_) {
-      params_builder_->onBool(v);
-      checkParamsDone();
-      return true;
-    }
-    return true;
-  }
+  bool boolean(bool /*v*/) override { return true; }
 
   bool number_integer(number_integer_t v) override {
-    if (params_builder_) {
-      params_builder_->onInt(v);
-      checkParamsDone();
-      return true;
-    }
+    if (capturing_params_) return true;
     if (depth_ == 1 && current_key_ == "id") {
       request_.jsonrpc_id = std::to_string(v);
     }
@@ -413,23 +374,15 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool number_unsigned(number_unsigned_t v) override {
-    if (params_builder_) {
-      params_builder_->onUint(v);
-      checkParamsDone();
-      return true;
-    }
+    if (capturing_params_) return true;
     if (depth_ == 1 && current_key_ == "id") {
       request_.jsonrpc_id = std::to_string(v);
     }
     return true;
   }
 
-  bool number_float(number_float_t v, const string_t&) override {
-    if (params_builder_) {
-      params_builder_->onFloat(v);
-      checkParamsDone();
-      return true;
-    }
+  bool number_float(number_float_t v, const string_t& /*raw*/) override {
+    if (capturing_params_) return true;
     if (depth_ == 1 && current_key_ == "id") {
       request_.jsonrpc_id = std::to_string(static_cast<int64_t>(v));
     }
@@ -437,11 +390,7 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool string(string_t& v) override {
-    if (params_builder_) {
-      params_builder_->onString(v);
-      checkParamsDone();
-      return true;
-    }
+    if (capturing_params_) return true;
     if (depth_ == 1) {
       if      (current_key_ == "id")     request_.jsonrpc_id = v;
       else if (current_key_ == "method") request_.rpc_method = v;
@@ -452,25 +401,21 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
   bool binary(binary_t& /*v*/) override { return true; }
 
   bool start_object(std::size_t) override {
-    if (params_builder_) {
-      params_builder_->onStartObject();
+    if (capturing_params_) {
       ++params_depth_;
       return true;
     }
     ++depth_;
     if (depth_ == 2 && current_key_ == "params") {
-      params_builder_ = std::make_unique<SubtreeBuilder>();
-      params_depth_   = 0;
-      params_builder_->onStartObject();
+      capturing_params_ = true;
+      params_depth_     = 1;
+      params_start_     = *parser_pos_ - 1;
     }
     return true;
   }
 
   bool key(string_t& k) override {
-    if (params_builder_) {
-      params_builder_->onKey(k);
-      return true;
-    }
+    if (capturing_params_) return true;
     if (depth_ == 1) {
       current_key_ = k;
     }
@@ -478,14 +423,8 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool end_object() override {
-    if (params_builder_) {
-      if (params_depth_ > 0) {
-        params_builder_->onEndObject();
-        --params_depth_;
-        return true;
-      }
-      params_builder_->onEndObject();
-      captureParams();
+    if (capturing_params_) {
+      if (--params_depth_ == 0) captureParams();
       return true;
     }
     --depth_;
@@ -493,30 +432,23 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool start_array(std::size_t) override {
-    if (params_builder_) {
-      params_builder_->onStartArray();
+    if (capturing_params_) {
       ++params_depth_;
       return true;
     }
     ++depth_;
     // params may be an array per JSON-RPC spec (positional arguments).
     if (depth_ == 2 && current_key_ == "params") {
-      params_builder_ = std::make_unique<SubtreeBuilder>();
-      params_depth_   = 0;
-      params_builder_->onStartArray();
+      capturing_params_ = true;
+      params_depth_     = 1;
+      params_start_     = *parser_pos_ - 1;
     }
     return true;
   }
 
   bool end_array() override {
-    if (params_builder_) {
-      if (params_depth_ > 0) {
-        params_builder_->onEndArray();
-        --params_depth_;
-        return true;
-      }
-      params_builder_->onEndArray();
-      captureParams();
+    if (capturing_params_) {
+      if (--params_depth_ == 0) captureParams();
       return true;
     }
     --depth_;
@@ -531,19 +463,13 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
   }
 
   bool hasParams() const { return params_captured_; }
-  const json& params() const { return params_value_; }
+  std::string takeParamsJson() { return std::move(params_json_); }
 
 private:
-  void checkParamsDone() {
-    if (params_builder_ && params_builder_->complete()) {
-      captureParams();
-    }
-  }
-
   void captureParams() {
-    params_value_    = params_builder_->takeResult();
-    params_captured_ = true;
-    params_builder_.reset();
+    params_json_      = sliceBuffer(*slices_, params_start_, *parser_pos_);
+    params_captured_  = true;
+    capturing_params_ = false;
   }
 };
 
@@ -557,9 +483,9 @@ private:
 //
 // At onEndStream, runs a SAX parse pass directly over the buffer's
 // RawSliceVector via BufferByteIterator — no contiguous copy. Scalar fields
-// are extracted inline; each messages[] and tools[] element is captured via
-// SubtreeBuilder and stored as an individual PayloadRef (one at a time in
-// memory, never the full array).
+// are extracted inline; each messages[] and tools[] element is captured by
+// slicing raw bytes directly from the slab chain (no DOM, no re-serialization,
+// byte-identical to the original request body).
 //
 // residual_params receives the entire body buffer via store(Buffer::Instance&),
 // which does a zero-copy slab transfer (Buffer::move) for payloads above the
@@ -578,15 +504,19 @@ public:
       return absl::OkStatus();
     }
 
-    // Obtain slice descriptors — these are pointers into the slab memory, no copy.
     Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
     const size_t           first  = firstNonEmpty(slices);
-    BufferByteIterator     begin(slices, first, 0);
-    BufferByteIterator     end(slices, slices.size(), 0);
 
-    InferenceSAXHandler handler(payload, request, store);
+    // pos tracks bytes consumed by the parser; handlers read it to locate
+    // element boundaries and slice raw bytes via sliceBuffer().
+    size_t pos = 0;
+    BufferByteIterator begin(slices, first, 0, &pos);
+    BufferByteIterator end(slices, slices.size(), 0);
+
+    InferenceSAXHandler handler(payload, request, store, &pos, &slices);
     const bool ok = nlohmann::json::sax_parse(
-        begin, end, &handler, nlohmann::detail::input_format_t::json, /*strict=*/false);
+        std::move(begin), std::move(end), &handler,
+        nlohmann::detail::input_format_t::json, /*strict=*/false);
 
     if (!ok || handler.has_error_) {
       return absl::InvalidArgumentError(absl::StrCat(
@@ -594,8 +524,6 @@ public:
           handler.has_error_ ? handler.error_ : "invalid JSON"));
     }
 
-    // Move the body buffer into residual_params. For payloads above the inline
-    // threshold this is a zero-copy slab transfer (Buffer::OwnedImpl::move).
     payload.residual_params = store.store(body_buffer_, PayloadKind::JsonObject);
 
     (void)config;
@@ -610,10 +538,10 @@ private:
 // AgentBodyParser
 //
 // Same external-buffer + SAX strategy for JSON-RPC 2.0 agent bodies.
-// The AgentSAXHandler extracts id and method inline; the params value is
-// captured in a SubtreeBuilder. Invocation-specific fields (tool_name,
-// resource_uri, …) are extracted from the captured params JSON after the
-// rpc_method is known and the second classify() call runs.
+// AgentSAXHandler extracts id and method inline; params is captured as raw
+// bytes via byte-range slicing — no DOM during the SAX pass. AgentBodyParser::
+// finish does one json::parse of the exact-byte params string for field
+// extraction, then moves the string into the store for params_raw.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class RequestDecoder::AgentBodyParser {
@@ -634,12 +562,15 @@ public:
 
     Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
     const size_t           first  = firstNonEmpty(slices);
-    BufferByteIterator     begin(slices, first, 0);
-    BufferByteIterator     end(slices, slices.size(), 0);
 
-    AgentSAXHandler handler(request);
+    size_t pos = 0;
+    BufferByteIterator begin(slices, first, 0, &pos);
+    BufferByteIterator end(slices, slices.size(), 0);
+
+    AgentSAXHandler handler(request, &pos, &slices);
     const bool ok = nlohmann::json::sax_parse(
-        begin, end, &handler, nlohmann::detail::input_format_t::json, /*strict=*/false);
+        std::move(begin), std::move(end), &handler,
+        nlohmann::detail::input_format_t::json, /*strict=*/false);
 
     if (!ok || handler.has_error_) {
       return absl::InvalidArgumentError(absl::StrCat(
@@ -647,7 +578,6 @@ public:
           handler.has_error_ ? handler.error_ : "invalid JSON"));
     }
 
-    // Re-classify with the now-known rpc_method to determine AgentInvocation.
     if (!request.rpc_method.empty()) {
       ClassifyResult r2  = classify({http_method_, path_, headers_, request.rpc_method});
       request.protocol   = r2.protocol;
@@ -658,14 +588,17 @@ public:
                                                                    : AgentDialect::A2a;
     }
 
-    // Extract invocation-specific params fields from the captured sub-tree.
     if (handler.hasParams()) {
-      const json& params = handler.params();
-      populateParams(params, payload, store);
-      payload.params_raw = store.store(params.dump(), PayloadKind::JsonObject);
+      // Parse the exact-byte params string for field extraction, then move it
+      // into the store. One DOM parse, no extra copy, bytes identical to input.
+      std::string params_json = handler.takeParamsJson();
+      const json params = json::parse(params_json, nullptr, /*allow_exceptions=*/false);
+      if (!params.is_discarded()) {
+        populateParams(params, payload, store);
+      }
+      payload.params_raw = store.store(std::move(params_json), PayloadKind::JsonObject);
     }
 
-    // Full body as residual — zero-copy slab transfer for large payloads.
     payload.residual_params = store.store(body_buffer_, PayloadKind::JsonObject);
 
     return absl::OkStatus();
@@ -788,7 +721,7 @@ absl::Status RequestDecoder::onHeaders(const Http::RequestHeaderMap& headers) {
       request_.http_method,
       request_.path,
       headers,
-      "",  // rpc_method — body not yet available
+      "",
   });
   request_.protocol = result.protocol;
   for (auto& [k, v] : result.path_params) {

@@ -296,7 +296,7 @@ void AiProtocolManagerFilter::dispatch() {
     if (!*alive) {
       return;
     }
-    Codec::prefetchExternalRefs(
+    Codec::prefetchExternalPayloadRefs(
         request_, decoder_callbacks_->dispatcher(),
         [this, alive]() {
           if (!*alive) {

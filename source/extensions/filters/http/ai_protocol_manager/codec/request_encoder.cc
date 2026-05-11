@@ -77,7 +77,7 @@ std::string RequestEncoder::encodeAgentBody(const AiRequest& request) {
     params->addString(payload->tool_name);
     if (!payload->arguments.empty()) {
       params->addKey("arguments");
-      params->addRawJson(materializeRef(payload->arguments, request));
+      params->addRawJson(convertPayloadRefToString(payload->arguments, request));
     }
     break;
   }
@@ -99,7 +99,7 @@ std::string RequestEncoder::encodeAgentBody(const AiRequest& request) {
     params->addString(payload->prompt_name);
     if (!payload->arguments.empty()) {
       params->addKey("arguments");
-      params->addRawJson(materializeRef(payload->arguments, request));
+      params->addRawJson(convertPayloadRefToString(payload->arguments, request));
     }
     break;
   }
@@ -114,7 +114,7 @@ std::string RequestEncoder::encodeAgentBody(const AiRequest& request) {
     if (payload->params_raw.empty()) {
       root->addRawJson("{}");
     } else {
-      root->addRawJson(materializeRef(payload->params_raw, request));
+      root->addRawJson(convertPayloadRefToString(payload->params_raw, request));
     }
     break;
   }
@@ -298,7 +298,7 @@ RequestEncoder::encodeAgentBodyAsRest(const AiRequest& request,
   case AgentInvocation::ToolsCall:
     rule = transcoder.toolRule(payload->tool_name);
     if (!payload->arguments.empty()) {
-      args = json::parse(materializeRef(payload->arguments, request), nullptr, /*allow_exceptions=*/false);
+      args = json::parse(convertPayloadRefToString(payload->arguments, request), nullptr, /*allow_exceptions=*/false);
       if (args.is_discarded()) {
         return absl::nullopt;
       }
@@ -377,7 +377,7 @@ std::string RequestEncoder::encodeInferenceBody(const AiRequest& request) {
   // ── Step 1: seed from residual (full original body) ──────────────────────
   json body;
   if (!payload->residual_params.empty()) {
-    body = json::parse(materializeRef(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
+    body = json::parse(convertPayloadRefToString(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
     if (body.is_discarded()) {
       body = json::object();
     }
@@ -420,7 +420,7 @@ std::string RequestEncoder::encodeInferenceBody(const AiRequest& request) {
       if (ref.empty()) {
         continue;
       }
-      auto elem = json::parse(materializeRef(ref, request), nullptr, /*allow_exceptions=*/false);
+      auto elem = json::parse(convertPayloadRefToString(ref, request), nullptr, /*allow_exceptions=*/false);
       if (!elem.is_discarded()) {
         msgs.push_back(std::move(elem));
       }
@@ -435,7 +435,7 @@ std::string RequestEncoder::encodeInferenceBody(const AiRequest& request) {
       if (ref.empty()) {
         continue;
       }
-      auto elem = json::parse(materializeRef(ref, request), nullptr, /*allow_exceptions=*/false);
+      auto elem = json::parse(convertPayloadRefToString(ref, request), nullptr, /*allow_exceptions=*/false);
       if (!elem.is_discarded()) {
         tools_arr.push_back(std::move(elem));
       }

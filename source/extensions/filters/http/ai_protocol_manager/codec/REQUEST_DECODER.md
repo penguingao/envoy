@@ -26,8 +26,9 @@ Two complementary designs eliminate both problems:
    into a DOM. `nlohmann::json::sax_parse()` reads directly from Envoy's
    `Buffer::OwnedImpl` slab chain via a zero-copy iterator. Scalar fields are
    extracted as SAX events fire; large sub-documents (`messages[]` elements,
-   `tools[]` entries, `params`) are captured one at a time via `SubtreeBuilder`
-   and immediately handed to the store. The full-body DOM never exists.
+   `tools[]` entries, `params`) are captured by recording their start/end byte
+   positions in the buffer and copying the raw byte range directly — no DOM, no
+   re-serialization, bytes identical to the original request body.
 
 2. **Payload store** (`PayloadRef` + `PayloadStore`) — separates the *handle* to a
    field value from its *storage*. Small fields stay inline in process memory for
@@ -87,17 +88,47 @@ Buffer::OwnedImpl (slab chain)
 
 No intermediate allocation. The slab memory is read in place.
 
-### `SubtreeBuilder` — element-at-a-time capture
+### `sliceBuffer` + byte-range capture — zero-normalization element extraction
 
-`SubtreeBuilder` reconstructs one `nlohmann::json` value from a subsequence of
-SAX events. It maintains a `stack_` of in-progress containers (objects/arrays)
-and a completed `result_`.
+For `messages[]` / `tools[]` elements (inference) and the `params` object
+(agent), the parser uses **byte-range capture** rather than any form of
+re-serialization:
 
-Only **one sub-tree is live in memory at a time**. When `InferenceSAXHandler`
-detects the start of a `messages[]` or `tools[]` element it allocates a
-`SubtreeBuilder`; when the element closes it calls `store_.store(elem.dump())`
-and resets the builder. The full messages/tools array DOM is never in memory
-simultaneously.
+1. `BufferByteIterator` tracks how many bytes `nlohmann::json::sax_parse()` has
+   consumed via a caller-supplied `size_t* pos` counter that is incremented on
+   every `operator++`.
+2. When `start_object` / `start_array` fires at the element boundary depth, the
+   handler records `elem_start_ = *parser_pos_ - 1` (the opening `{` or `[` was
+   the last byte consumed).
+3. All SAX events inside the element are ignored — the handler just increments a
+   nesting depth counter and returns `true`.
+4. When the matching `end_object` / `end_array` fires and `elem_depth_` reaches
+   zero, `sliceBuffer(*slices_, elem_start_, *parser_pos_)` copies the byte range
+   `[elem_start_, parser_pos_)` from the non-contiguous slab chain into a
+   `std::string`. That string is handed directly to `store_.store()`.
+
+`sliceBuffer` walks `RawSliceVector`, skipping slices before `start`, copying
+the overlapping region from each, stopping once `end` is reached. The output
+string is `reserve`d to the exact final size before any copying, so there is
+exactly one allocation and one or more `memcpy` calls (one per slice that
+overlaps the range).
+
+**Why this is strictly better than `SubtreeSerializer` (and `SubtreeBuilder`):**
+
+| | `SubtreeBuilder` | `SubtreeSerializer` | Byte-range capture |
+|---|---|---|---|
+| DOM construction | yes (per element) | no | no |
+| Per-event work inside element | full DOM node alloc | string append + escaping | `++elem_depth_` only |
+| Output normalization | yes (`dump()` re-encodes) | yes (re-escapes strings) | **none** — raw bytes |
+| Per-element heap alloc | `unique_ptr` per element | none (value member) | none |
+| Allocation on capture | `dump()` output string | growing string (reallocs) | one exact-sized `reserve` |
+
+Because all SAX events inside a captured element are discarded (depth counter
+only), the work per byte inside any `messages[]` element is a single branch and
+counter increment — significantly cheaper than the per-event string-append path
+of `SubtreeSerializer`. The stored bytes are bit-for-bit identical to what
+appeared in the original request body: no unicode normalization (`A` stays
+`A`), no whitespace changes, no `\b`/`\f` edge cases.
 
 ### `InferenceSAXHandler` — OpenAI REST body parsing
 
@@ -107,8 +138,9 @@ Handles `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, etc.
 |---|---|
 | depth=1 scalar | Extract `model`, `stream`, `temperature`, `top_p`, `max_tokens`, `n`, `seed`, `stop` directly into `InferencePayload` / `AiRequest` |
 | depth=2 array open (`messages` or `tools`) | Set `in_messages_` / `in_tools_` flag |
-| depth=3 element open | Allocate `SubtreeBuilder`, start capturing |
-| depth=3 element close | Serialize element, call `store_.store()`, push `PayloadRef` into `payload_.messages` or `payload_.tools` |
+| depth=3 element open (`{` or `[`) | Record `elem_start_ = *parser_pos_ - 1`; set `capturing_element_ = true`, `elem_depth_ = 1` |
+| all events while `capturing_element_` | Increment/decrement `elem_depth_` on object/array events; all scalar events return `true` immediately |
+| depth=3 element close (`elem_depth_` reaches 0) | `sliceBuffer(*slices_, elem_start_, *parser_pos_)` → `store_.store()` → push `PayloadRef` into `payload_.messages` or `payload_.tools` |
 | all other keys/values | Preserved via `residual_params` (the full body buffer stored verbatim) |
 
 After SAX parse completes, `residual_params` receives the entire body via
@@ -124,7 +156,7 @@ Handles MCP and A2A agent requests.
 |---|---|
 | `id` | Stored as `request_.jsonrpc_id` (string or number) |
 | `method` | Stored as `request_.rpc_method`; triggers re-classify to determine `AgentInvocation` |
-| `params` | Captured in a `SubtreeBuilder`; then `populateParams()` extracts invocation-specific fields (`tool_name`, `resource_uri`, `prompt_name`, `arguments`, `capabilities`) |
+| `params` | Captured via byte-range slicing (`params_start_` recorded at opening `{`/`[`, raw bytes sliced at close); `AgentBodyParser::finish()` does one `json::parse()` of the exact-byte string for `populateParams()`, then moves the string into the store for `params_raw` — no DOM held during the SAX pass, bytes identical to input |
 
 Two classification passes:
 1. **Headers-time** (`onHeaders`): classify by HTTP method + path alone (no body yet); determines if Inference, AgenticMcp, or AgenticA2a.
@@ -148,7 +180,7 @@ Storage::External  — field stored in the backing file of a MmapPayloadStore;
 region of the associated store.
 
 **Important**: `PayloadRef::toString()` PANICs on `External` refs. Callers that
-may encounter external refs must use `materializeRef(ref, request)` (see below).
+may encounter external refs must use `convertPayloadRefToString(ref, request)` (see below).
 
 ### `PayloadStore` — storage backend interface
 
@@ -202,11 +234,11 @@ single-threaded filter chain model.
 
 ---
 
-## `materializeRef` — safe cross-storage accessor
+## `convertPayloadRefToString` — safe cross-storage accessor
 
 ```cpp
 // ai_request.h / ai_request.cc
-std::string materializeRef(const PayloadRef& ref, const AiRequest& request);
+std::string convertPayloadRefToString(const PayloadRef& ref, const AiRequest& request);
 ```
 
 Routes through the correct path for every storage variant:
@@ -216,7 +248,7 @@ Routes through the correct path for every storage variant:
   mmap region.
 
 All encoder call sites (`request_encoder.cc`, `anthropic_request_encoder.cc`) use
-`materializeRef` rather than `ref.toString()` so they remain correct regardless of
+`convertPayloadRefToString` rather than `ref.toString()` so they remain correct regardless of
 which store the filter is using.
 
 ---
@@ -252,7 +284,7 @@ event loop thread              detached thread
       │  callback fires with Buffer
 ```
 
-**Layer 2 — `prefetchExternalRefs` (`ai_request.cc`)**
+**Layer 2 — `prefetchExternalPayloadRefs` (`ai_request.cc`)**
 
 Walks all `PayloadRef` fields in `AiRequest` (messages, tools, attachments,
 parts, arguments, capabilities, params_raw, residual_params) and collects every
@@ -265,13 +297,13 @@ call `ref.toString()` without knowing the store type.
 **Layer 3 — wired into `dispatch()` (`filter.cc`)**
 
 `dispatch()` already posted `doDispatch()` to the next event loop tick to satisfy
-Envoy's re-entrancy rules. The post now calls `prefetchExternalRefs` first;
+Envoy's re-entrancy rules. The post now calls `prefetchExternalPayloadRefs` first;
 `doDispatch()` runs only after all External refs have been materialized:
 
 ```
 dispatch()
   └─ dispatcher.post()              ← re-entrancy guard (pre-existing)
-       └─ prefetchExternalRefs()
+       └─ prefetchExternalPayloadRefs()
             ├─ no External refs  →  doDispatch() immediately
             └─ N External refs   →  fan out fetchAsync × N
                                      └─ on_done: doDispatch()
@@ -288,7 +320,7 @@ dispatch()
   destroyed mid-flight `pread()` returns -1 and the callback still fires with an
   empty buffer rather than crashing.
 - **`InMemoryPayloadStore` unaffected**: its refs are never `External`, so
-  `prefetchExternalRefs` returns via the `external.empty()` fast path immediately.
+  `prefetchExternalPayloadRefs` returns via the `external.empty()` fast path immediately.
 
 ### Why writes are synchronous
 
@@ -359,6 +391,9 @@ write and the async cost on every read regardless of memory pressure.
 
 ---
 
+### Alternative considered
+TODO(tyxia): RapidJSON fastest otpion but it has a history of security vulnerabilities. Have optimized the nlohmann SAX to avoid DOM, intestigate further. 
+
 ## End-to-end data flow
 
 ```
@@ -375,11 +410,13 @@ decodeTrailers() / end_stream
   └─ RequestDecoder::onEndStream()
        └─ InferenceBodyParser::finish()  (or AgentBodyParser::finish())
             ├─ getRawSlices() → BufferByteIterator (no copy)
-            ├─ sax_parse(begin, end, &handler)
+            ├─ sax_parse(begin, end, &handler)  ← pos counter incremented each byte
             │    ├─ scalar fields → InferencePayload / AiRequest directly
-            │    └─ messages[i] / tools[i]:
-            │         SubtreeBuilder captures element
-            │         → store_.store(elem.dump())
+            │    └─ messages[i] / tools[i] — byte-range capture:
+            │         record elem_start_ = *pos - 1 at opening { or [
+            │         ignore all events inside (depth counter only)
+            │         at close: sliceBuffer(slices, elem_start_, *pos)
+            │         → store_.store(raw_bytes)
             │              ├─ size ≤ threshold → PayloadRef::Inline
             │              └─ size >  threshold → PayloadRef::External
             │                                      (offset+len into mmap file)
@@ -388,7 +425,7 @@ decodeTrailers() / end_stream
 dispatch
   └─ filter.cc::dispatch()
        └─ dispatcher.post()            ← re-entrancy guard
-            └─ prefetchExternalRefs()
+            └─ prefetchExternalPayloadRefs()
                  ├─ Inline/Buffered refs → on_done() immediately
                  └─ External refs → fetchAsync() × N (detached threads + pread)
                                      └─ dispatcher.post(on_done) when all complete
@@ -396,7 +433,7 @@ dispatch
 
 encode
   └─ RequestEncoder / AnthropicRequestEncoder
-       └─ materializeRef(ref, request)
+       └─ convertPayloadRefToString(ref, request)
             ├─ Inline/Buffered → ref.toString()   ← all External already upgraded
             └─ External        → store.fetch()    ← only if prefetch was skipped
 ```
@@ -430,7 +467,7 @@ larger fields are offloaded to the backing file as `External` refs.
 ## Invariants
 
 1. `PayloadRef::toString()` **must not** be called on `External` refs — it will
-   PANIC. Use `materializeRef(ref, request)` at every encoder call site.
+   PANIC. Use `convertPayloadRefToString(ref, request)` at every encoder call site.
 2. The `MmapPayloadStore` instance must outlive all `External` `PayloadRef`s
    created from it. The filter satisfies this: the store is a filter member and
    refs are owned by `AiRequest`, which is destroyed before the filter.

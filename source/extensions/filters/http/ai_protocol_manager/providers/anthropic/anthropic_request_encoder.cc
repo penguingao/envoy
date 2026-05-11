@@ -232,7 +232,7 @@ void buildMessages(const std::vector<Codec::PayloadRef>& refs, json& messages_ou
     if (ref.empty()) {
       continue;
     }
-    auto msg = json::parse(Codec::materializeRef(ref, request), nullptr, /*allow_exceptions=*/false);
+    auto msg = json::parse(Codec::convertPayloadRefToString(ref, request), nullptr, /*allow_exceptions=*/false);
     if (!msg.is_discarded()) {
       parsed.push_back(std::move(msg));
     }
@@ -352,7 +352,7 @@ AnthropicRequestEncoder::encode(const Codec::AiRequest& request) {
     std::string prompt_text;
     if (!payload->residual_params.empty()) {
       auto residual =
-          json::parse(Codec::materializeRef(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
+          json::parse(Codec::convertPayloadRefToString(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
       if (!residual.is_discarded() && residual.contains("prompt")) {
         const auto& p = residual["prompt"];
         if (p.is_string()) {
@@ -377,7 +377,7 @@ AnthropicRequestEncoder::encode(const Codec::AiRequest& request) {
       if (ref.empty()) {
         continue;
       }
-      auto tool = json::parse(Codec::materializeRef(ref, request), nullptr, /*allow_exceptions=*/false);
+      auto tool = json::parse(Codec::convertPayloadRefToString(ref, request), nullptr, /*allow_exceptions=*/false);
       if (!tool.is_discarded()) {
         tools_arr.push_back(convertToolDef(tool));
       }
@@ -392,7 +392,7 @@ AnthropicRequestEncoder::encode(const Codec::AiRequest& request) {
   // so we read it back from the full original body stored in residual_params.
   if (!payload->residual_params.empty()) {
     auto residual =
-        json::parse(Codec::materializeRef(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
+        json::parse(Codec::convertPayloadRefToString(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
     if (!residual.is_discarded() && residual.contains("tool_choice")) {
       body["tool_choice"] = convertToolChoice(residual["tool_choice"]);
     }

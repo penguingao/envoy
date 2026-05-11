@@ -14,7 +14,7 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 namespace Codec {
 
-std::string materializeRef(const PayloadRef& ref, const AiRequest& request) {
+std::string convertPayloadRefToString(const PayloadRef& ref, const AiRequest& request) {
   if (ref.storage() != PayloadRef::Storage::External) {
     return ref.toString();
   }
@@ -30,7 +30,7 @@ std::string materializeRef(const PayloadRef& ref, const AiRequest& request) {
   return result;
 }
 
-void prefetchExternalRefs(AiRequest& request, Event::Dispatcher& dispatcher,
+void prefetchExternalPayloadRefs(AiRequest& request, Event::Dispatcher& dispatcher,
                           std::function<void()> on_done) {
   if (request.payload_store == nullptr) {
     on_done();
