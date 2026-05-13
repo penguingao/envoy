@@ -23,6 +23,18 @@ struct DecoderConfig {
   // JSON-body fields whose serialized size is at or below this threshold are
   // stored as Inline PayloadRefs; larger fields are stored as Buffered refs.
   size_t max_inline_bytes{4096};
+
+  // Hard limit: requests whose body exceeds this size are rejected with
+  // ResourceExhausted. Enforced incrementally in feed() so memory never
+  // grows beyond this ceiling. Default: 4 MB.
+  size_t max_body_bytes{4 * 1024 * 1024};
+
+  // Soft limit: bodies at or below this size get full per-element byte-range
+  // capture (messages[], tools[]). Bodies above this limit still have their
+  // scalar fields extracted (model, stream, sampling params) but individual
+  // element PayloadRefs are not populated — avoids the 2× memory cost of
+  // copying large element bytes out of the slab chain. Default: 256 KB.
+  size_t max_element_capture_bytes{256 * 1024};
 };
 
 // RequestDecoder translates an HTTP request (headers + streamed body) into a

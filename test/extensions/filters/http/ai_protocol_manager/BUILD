@@ -30,3 +30,14 @@ envoy_cc_test(
         "//source/common/buffer:buffer_lib",
     ],
 )
+
+envoy_cc_test(
+    name = "request_decoder_test",
+    srcs = ["request_decoder_test.cc"],
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager/codec:request_decoder_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/codec:ai_payload_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/codec:ai_request_lib",
+        "//test/test_common:utility_lib",
+    ],
+)

@@ -160,6 +160,10 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
   const size_t*                 parser_pos_;  // bytes consumed by nlohmann so far
   const Buffer::RawSliceVector* slices_;      // body slab chain for byte slicing
 
+  // When false (body above max_element_capture_bytes), element byte-range
+  // capture is skipped. Scalar fields are still extracted normally.
+  bool capture_elements_{true};
+
   int         depth_{0};
   std::string current_key_;
 
@@ -175,8 +179,10 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
   std::string error_;
 
   InferenceSAXHandler(InferencePayload& p, AiRequest& r, PayloadStore& s,
-                      const size_t* pos, const Buffer::RawSliceVector* slices)
-      : payload_(p), request_(r), store_(s), parser_pos_(pos), slices_(slices) {}
+                      const size_t* pos, const Buffer::RawSliceVector* slices,
+                      bool capture_elements)
+      : payload_(p), request_(r), store_(s), parser_pos_(pos), slices_(slices),
+        capture_elements_(capture_elements) {}
 
   // Scalars inside a captured element are ignored — byte-range capture
   // records the raw bytes, so we don't need to process individual values.
@@ -238,7 +244,7 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
       return true;
     }
     ++depth_;
-    if (depth_ == 3 && (in_messages_ || in_tools_)) {
+    if (capture_elements_ && depth_ == 3 && (in_messages_ || in_tools_)) {
       capturing_element_ = true;
       elem_depth_        = 1;
       elem_start_        = *parser_pos_ - 1;  // { was the last byte consumed
@@ -275,7 +281,7 @@ struct InferenceSAXHandler : public nlohmann::json_sax<json> {
     if (depth_ == 2) {
       if      (current_key_ == "messages") { in_messages_ = true;  in_tools_ = false; }
       else if (current_key_ == "tools")    { in_tools_    = true; in_messages_ = false; }
-    } else if (depth_ == 3 && (in_messages_ || in_tools_)) {
+    } else if (capture_elements_ && depth_ == 3 && (in_messages_ || in_tools_)) {
       // Array-typed element inside messages/tools (unusual but valid JSON).
       capturing_element_ = true;
       elem_depth_        = 1;
@@ -349,6 +355,10 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
   int         depth_{0};
   std::string current_key_;
 
+  // When false (body above max_element_capture_bytes), params byte-range
+  // capture is skipped. Scalar fields (id, method) are still extracted.
+  bool capture_params_{true};
+
   bool   capturing_params_{false};
   size_t params_start_{0};
   int    params_depth_{0};
@@ -358,8 +368,9 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
   bool        has_error_{false};
   std::string error_;
 
-  AgentSAXHandler(AiRequest& r, const size_t* pos, const Buffer::RawSliceVector* slices)
-      : request_(r), parser_pos_(pos), slices_(slices) {}
+  AgentSAXHandler(AiRequest& r, const size_t* pos, const Buffer::RawSliceVector* slices,
+                  bool capture_params)
+      : request_(r), parser_pos_(pos), slices_(slices), capture_params_(capture_params) {}
 
   bool null() override { return true; }
 
@@ -406,7 +417,7 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
       return true;
     }
     ++depth_;
-    if (depth_ == 2 && current_key_ == "params") {
+    if (capture_params_ && depth_ == 2 && current_key_ == "params") {
       capturing_params_ = true;
       params_depth_     = 1;
       params_start_     = *parser_pos_ - 1;
@@ -438,7 +449,7 @@ struct AgentSAXHandler : public nlohmann::json_sax<json> {
     }
     ++depth_;
     // params may be an array per JSON-RPC spec (positional arguments).
-    if (depth_ == 2 && current_key_ == "params") {
+    if (capture_params_ && depth_ == 2 && current_key_ == "params") {
       capturing_params_ = true;
       params_depth_     = 1;
       params_start_     = *parser_pos_ - 1;
@@ -494,12 +505,18 @@ private:
 
 class RequestDecoder::InferenceBodyParser {
 public:
-  void feed(absl::string_view chunk) {
+  explicit InferenceBodyParser(const DecoderConfig& config) : config_(config) {}
+
+  absl::Status feed(absl::string_view chunk) {
+    if (body_buffer_.length() + chunk.size() > config_.max_body_bytes) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "inference request body exceeds limit of ", config_.max_body_bytes, " bytes"));
+    }
     body_buffer_.add(chunk.data(), chunk.size());
+    return absl::OkStatus();
   }
 
-  absl::Status finish(InferencePayload& payload, AiRequest& request, PayloadStore& store,
-                      const DecoderConfig& config) {
+  absl::Status finish(InferencePayload& payload, AiRequest& request, PayloadStore& store) {
     if (body_buffer_.length() == 0) {
       return absl::OkStatus();
     }
@@ -507,13 +524,18 @@ public:
     Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
     const size_t           first  = firstNonEmpty(slices);
 
+    // Bodies above max_element_capture_bytes skip per-element byte-range capture
+    // to avoid the 2× memory cost of copying large element bytes out of the slab
+    // chain. Scalar fields (model, stream, sampling params) are always extracted.
+    const bool capture_elements = body_buffer_.length() <= config_.max_element_capture_bytes;
+
     // pos tracks bytes consumed by the parser; handlers read it to locate
     // element boundaries and slice raw bytes via sliceBuffer().
     size_t pos = 0;
     BufferByteIterator begin(slices, first, 0, &pos);
     BufferByteIterator end(slices, slices.size(), 0);
 
-    InferenceSAXHandler handler(payload, request, store, &pos, &slices);
+    InferenceSAXHandler handler(payload, request, store, &pos, &slices, capture_elements);
     const bool ok = nlohmann::json::sax_parse(
         std::move(begin), std::move(end), &handler,
         nlohmann::detail::input_format_t::json, /*strict=*/false);
@@ -525,13 +547,12 @@ public:
     }
 
     payload.residual_params = store.store(body_buffer_, PayloadKind::JsonObject);
-
-    (void)config;
     return absl::OkStatus();
   }
 
 private:
-  Buffer::OwnedImpl body_buffer_;
+  const DecoderConfig& config_;
+  Buffer::OwnedImpl    body_buffer_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -547,10 +568,14 @@ private:
 class RequestDecoder::AgentBodyParser {
 public:
   AgentBodyParser(const Http::RequestHeaderMap& headers, absl::string_view http_method,
-                  absl::string_view path)
-      : headers_(headers), http_method_(http_method), path_(path) {}
+                  absl::string_view path, const DecoderConfig& config)
+      : headers_(headers), http_method_(http_method), path_(path), config_(config) {}
 
   absl::Status feed(absl::string_view chunk) {
+    if (body_buffer_.length() + chunk.size() > config_.max_body_bytes) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "agent request body exceeds limit of ", config_.max_body_bytes, " bytes"));
+    }
     body_buffer_.add(chunk.data(), chunk.size());
     return absl::OkStatus();
   }
@@ -563,11 +588,13 @@ public:
     Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
     const size_t           first  = firstNonEmpty(slices);
 
+    const bool capture_params = body_buffer_.length() <= config_.max_element_capture_bytes;
+
     size_t pos = 0;
     BufferByteIterator begin(slices, first, 0, &pos);
     BufferByteIterator end(slices, slices.size(), 0);
 
-    AgentSAXHandler handler(request, &pos, &slices);
+    AgentSAXHandler handler(request, &pos, &slices, capture_params);
     const bool ok = nlohmann::json::sax_parse(
         std::move(begin), std::move(end), &handler,
         nlohmann::detail::input_format_t::json, /*strict=*/false);
@@ -642,6 +669,7 @@ private:
   const Http::RequestHeaderMap& headers_;
   const std::string             http_method_;
   const std::string             path_;
+  const DecoderConfig&          config_;
   Buffer::OwnedImpl             body_buffer_;
 };
 
@@ -757,7 +785,7 @@ absl::Status RequestDecoder::onHeaders(const Http::RequestHeaderMap& headers) {
       payload.target.provider_hint = std::string(ph[0]->value().getStringView());
     }
     request_.payload  = std::move(payload);
-    inference_parser_ = std::make_unique<InferenceBodyParser>();
+    inference_parser_ = std::make_unique<InferenceBodyParser>(config_);
     state_            = DecodeState::ParsingInferenceBody;
   } else {
     AgentPayload payload;
@@ -768,7 +796,7 @@ absl::Status RequestDecoder::onHeaders(const Http::RequestHeaderMap& headers) {
     }
     request_.payload = std::move(payload);
     agent_parser_    = std::make_unique<AgentBodyParser>(headers, request_.http_method,
-                                                         request_.path);
+                                                         request_.path, config_);
     state_           = DecodeState::ParsingAgentBody;
   }
 
@@ -779,7 +807,10 @@ absl::Status RequestDecoder::onData(absl::string_view chunk) {
   switch (state_) {
   case DecodeState::ParsingInferenceBody:
     ASSERT(inference_parser_ != nullptr);
-    inference_parser_->feed(chunk);
+    if (auto s = inference_parser_->feed(chunk); !s.ok()) {
+      state_ = DecodeState::Error;
+      return s;
+    }
     return absl::OkStatus();
 
   case DecodeState::ParsingAgentBody:
@@ -805,7 +836,7 @@ absl::Status RequestDecoder::onEndStream() {
     ASSERT(inference_parser_ != nullptr);
     auto* payload = request_.as_inference();
     ASSERT(payload != nullptr);
-    auto status = inference_parser_->finish(*payload, request_, payload_store_, config_);
+    auto status = inference_parser_->finish(*payload, request_, payload_store_);
     if (!status.ok()) {
       state_ = DecodeState::Error;
       return status;

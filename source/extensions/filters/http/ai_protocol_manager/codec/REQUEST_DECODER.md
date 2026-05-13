@@ -162,6 +162,160 @@ Two classification passes:
 1. **Headers-time** (`onHeaders`): classify by HTTP method + path alone (no body yet); determines if Inference, AgenticMcp, or AgenticA2a.
 2. **Body-time** (`AgentBodyParser::finish`): once `rpc_method` is known, re-classify to determine the specific `AgentInvocation` enum value.
 
+### Body-size tiering — three-tier memory strategy
+
+#### The problem
+
+Even with SAX parsing and byte-range capture, a single large string value inside
+a captured element forces a transient heap allocation. Consider a multimodal
+inference request with a base64-encoded image:
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [{
+    "role": "user",
+    "content": [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}]
+  }]
+}
+```
+
+When `capturing_element_` is `true` the `string()` SAX callback discards the
+value immediately, but `nlohmann` has **already allocated** a `std::string` for
+the unescaped content before calling the handler. For a 10 MB base64 image that
+is a 10 MB transient allocation that exists for exactly one SAX callback, even
+though the handler throws it away. Beyond transient allocations, the byte-range
+capture `sliceBuffer()` copies the entire element into a second `std::string` in
+the store, so peak memory during `finish()` for a large body is roughly:
+
+```
+body_buffer_              ← full body, resident in slab chain
++ max single string value ← nlohmann transient, during any one string() callback
++ Σ element sizes         ← sliceBuffer copies in the store
+```
+
+For typical short conversations this is fine. For vision requests or long
+documents it can mean 2-3× the body size live on heap simultaneously.
+
+Additionally, there is a security constraint: for AI requests, authentication
+covers the body (body-signed requests, or ext_authz that reads body content for
+model-level authorization). The body must be fully buffered and authentication
+must complete before any parsing result is acted upon — ruling out streaming
+parse approaches that would process unauthenticated bytes.
+
+#### Three tiers
+
+`DecoderConfig` exposes two thresholds that carve the body-size space into three
+tiers:
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│ body size          │ behavior                                             │
+├───────────────────────────────────────────────────────────────────────────┤
+│ ≤ max_element_     │ Tier 1 — full capture                                │
+│   capture_bytes    │ Byte-range element capture active.                   │
+│ (default 256 KB)   │ messages[]/tools[] → individual PayloadRefs.         │
+│                    │ params → params_raw + routing fields populated.       │
+├───────────────────────────────────────────────────────────────────────────┤
+│ > max_element_     │ Tier 2 — scalars only                                │
+│   capture_bytes    │ Element/params capture skipped. Top-level scalars    │
+│ ≤ max_body_bytes   │ (model, stream, temperature, max_tokens, id, method) │
+│ (default 4 MB)     │ still extracted — enough for routing and rate-        │
+│                    │ limiting. messages[]/tools[] left empty.              │
+│                    │ params_raw empty; tool_name/resource_uri not set.    │
+├───────────────────────────────────────────────────────────────────────────┤
+│ > max_body_bytes   │ Tier 3 — hard reject                                 │
+│ (default 4 MB)     │ feed() returns ResourceExhausted immediately.        │
+│                    │ Buffer never grows beyond this ceiling.               │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Implementation
+
+**Hard limit — `feed()`**
+
+Both `InferenceBodyParser::feed()` and `AgentBodyParser::feed()` check before
+every `body_buffer_.add()`:
+
+```cpp
+if (body_buffer_.length() + chunk.size() > config_.max_body_bytes) {
+    return absl::ResourceExhaustedError(...);
+}
+```
+
+The error propagates through `onData()` to the filter, which can immediately
+return a 413 response. The buffer never holds more than `max_body_bytes` bytes.
+
+**Soft limit — `finish()`**
+
+After the full body has arrived (and auth has completed), `finish()` compares the
+buffered size against `max_element_capture_bytes` to compute a boolean flag
+passed into the SAX handler:
+
+```cpp
+// InferenceBodyParser::finish()
+const bool capture_elements = body_buffer_.length() <= config_.max_element_capture_bytes;
+InferenceSAXHandler handler(..., capture_elements);
+
+// AgentBodyParser::finish()
+const bool capture_params = body_buffer_.length() <= config_.max_element_capture_bytes;
+AgentSAXHandler handler(..., capture_params);
+```
+
+**SAX handler gating**
+
+`InferenceSAXHandler::capture_elements_` gates the two points where
+`capturing_element_` would otherwise be set:
+
+```cpp
+bool start_object(std::size_t) override {
+    if (capturing_element_) { ++elem_depth_; return true; }
+    ++depth_;
+    if (capture_elements_ && depth_ == 3 && (in_messages_ || in_tools_)) {
+        capturing_element_ = true;    // ← skipped when capture_elements_ false
+        ...
+    }
+    return true;
+}
+```
+
+When `capture_elements_` is `false`, `capturing_element_` is never set. The
+depth counter (`depth_`) still tracks nesting correctly — the SAX callbacks
+continue to fire and the depth increments/decrements normally — but no
+byte positions are recorded and `storeElement()` is never called. The scalar
+extraction paths (`depth_ == 1`) are entirely unaffected.
+
+`AgentSAXHandler::capture_params_` works identically, gating the two points
+where `capturing_params_` is set in `start_object()` and `start_array()`.
+
+#### Memory characteristics per tier
+
+| | Tier 1 (full capture) | Tier 2 (scalars only) | Tier 3 (reject) |
+|---|---|---|---|
+| body_buffer_ | full body | full body | ≤ max_body_bytes (partial) |
+| nlohmann transient | max single string in body | max single string in body | n/a (no parse) |
+| store copies | Σ element/params bytes | none | none |
+| Peak | ≈ 2× body | ≈ body + max string | ≤ max_body_bytes |
+
+In Tier 2 the `sliceBuffer()` copies are eliminated. The remaining cost is
+`body_buffer_` (full body, unavoidable — needed for auth and downstream
+forwarding) plus any transient `std::string` nlohmann allocates for string
+values during parsing. These transient strings are freed immediately after each
+`string()` callback returns.
+
+#### Why the parse still happens in Tier 2
+
+The full SAX parse runs even when element/params capture is disabled because:
+
+1. **Scalar extraction** — `model`, `stream`, `temperature`, `max_tokens`, `id`,
+   `method` are needed for routing and rate-limiting regardless of body size.
+2. **Body forwarding** — the full `body_buffer_` is stored in `residual_params`
+   and forwarded to the upstream AI provider unchanged. The parse is a read-only
+   pass over data that must be resident anyway.
+3. **Auth ordering** — parsing only runs inside `finish()`, which is called from
+   `onEndStream()` after the complete body has been received and any body-covering
+   authentication has completed upstream in the filter chain.
+
 ---
 
 ## Components
@@ -448,9 +602,13 @@ The filter uses `MmapPayloadStore` by default, constructed with:
 MmapPayloadStore payload_store_{"/tmp", config->decoderConfig().max_inline_bytes};
 ```
 
-`max_inline_bytes` (default 4096) controls the inline/offload threshold.
-Fields whose serialized JSON size is at or below this value are stored `Inline`;
-larger fields are offloaded to the backing file as `External` refs.
+`DecoderConfig` exposes three thresholds:
+
+| Field | Default | Effect |
+|---|---|---|
+| `max_inline_bytes` | 4096 B | PayloadStore inline/offload boundary. Fields at or below this size are stored `Inline` (in process memory); larger fields go to the mmap backing file as `External` refs. |
+| `max_element_capture_bytes` | 256 KB | Soft body-size limit. Bodies at or below this size get full per-element byte-range capture (`messages[]`, `tools[]`, `params`). Bodies above it extract scalars only, skipping the `sliceBuffer()` copies. |
+| `max_body_bytes` | 4 MB | Hard body-size limit. `feed()` returns `ResourceExhausted` as soon as a chunk would push the accumulated body past this ceiling. The buffer never grows beyond it. |
 
 ---
 
@@ -459,6 +617,7 @@ larger fields are offloaded to the backing file as `External` refs.
 | Test file | What it covers |
 |---|---|
 | `test/.../payload_store_test.cc` | 23 unit tests: `PayloadRef::External` accessors, inline threshold boundary, fetch roundtrip for strings and multi-slice buffers, capacity doubling (forces `mremap`/`munmap+mmap` path), `InMemoryPayloadStore` regression |
+| `test/.../request_decoder_test.cc` | 6 unit tests: body-size tiering for both `InferenceBodyParser` and `AgentBodyParser` — Tier 1 (elements/params captured), Tier 2 (scalars only, no element copies), Tier 3 (hard limit, `ResourceExhausted` from `onData`) |
 | `mcp_auth_filter_integration_test.cc` | 5 integration tests: `makeLargeToolsCallBody` pads JSON-RPC bodies past 4096 B so the SAX parser stores `messages[]` elements as `External` refs; verifies auth, routing, and tool-name extraction work end-to-end |
 | `mcp_auth_rest_integration_test.cc` | 3 integration tests: large payload REST transcoding through `AgentBodyParser`, unknown-tool fallback, auth-before-transcoding ordering |
 
