@@ -5,7 +5,12 @@
 
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
-#include "nlohmann/json.hpp"
+// simdjson uses C-style casts inside ARM NEON intrinsic macros (arm_neon.h).
+// Suppress the warning precisely around the include rather than for the whole TU.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+#include "simdjson.h"
+#pragma GCC diagnostic pop
 
 namespace Envoy {
 namespace Extensions {
@@ -13,494 +18,21 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 namespace Codec {
 
-namespace {
-
-using nlohmann::json;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BufferByteIterator
-//
-// Input iterator that walks bytes across a Buffer::RawSliceVector without
-// copying slice data. Passed to nlohmann::json::sax_parse() so the parser
-// reads directly from the OwnedImpl slab chain.
-//
-// Optionally tracks how many bytes have been consumed via a caller-supplied
-// size_t counter (pos). The SAX handlers read this counter to record the byte
-// positions of element boundaries and slice raw bytes directly from the buffer
-// — avoiding re-serialization and the normalization it introduces.
-//
-// Copy semantics: pos_ is shared across all copies (= default). nlohmann
-// copies the begin iterator into its internal input_adapter, so all copies
-// must share the same counter or the copy doing the actual advancing will not
-// increment it. This is safe because nlohmann is a sequential reader — only
-// one copy is ever advancing at a time.
-// ─────────────────────────────────────────────────────────────────────────────
-
-class BufferByteIterator {
-public:
-  using iterator_category = std::input_iterator_tag;
-  using value_type        = char;
-  using difference_type   = std::ptrdiff_t;
-  using pointer           = const char*;
-  using reference         = char;
-
-  // Begin iterator — tracks consumed bytes via *pos.
-  BufferByteIterator(const Buffer::RawSliceVector& slices, size_t si, size_t bi, size_t* pos)
-      : slices_(&slices), slice_idx_(si), byte_idx_(bi), pos_(pos) {}
-
-  // End iterator — no position tracking needed.
-  BufferByteIterator(const Buffer::RawSliceVector& slices, size_t si, size_t bi)
-      : slices_(&slices), slice_idx_(si), byte_idx_(bi), pos_(nullptr) {}
-
-  // Default copy/move: pos_ is shared across copies. This is intentional —
-  // nlohmann copies the iterator into its internal adapter, so all copies must
-  // share the same counter. Safe because nlohmann advances only one copy at a
-  // time (sequential reader, no concurrent lookahead copies).
-  BufferByteIterator(const BufferByteIterator&)            = default;
-  BufferByteIterator(BufferByteIterator&&)                 = default;
-  BufferByteIterator& operator=(const BufferByteIterator&) = default;
-  BufferByteIterator& operator=(BufferByteIterator&&)      = default;
-
-  char operator*() const {
-    return static_cast<const char*>((*slices_)[slice_idx_].mem_)[byte_idx_];
-  }
-
-  BufferByteIterator& operator++() {
-    if (slice_idx_ >= slices_->size()) {
-      return *this;
-    }
-    if (++byte_idx_ >= (*slices_)[slice_idx_].len_) {
-      ++slice_idx_;
-      byte_idx_ = 0;
-    }
-    if (pos_) {
-      ++(*pos_);
-    }
-    return *this;
-  }
-
-  bool operator==(const BufferByteIterator& o) const {
-    return slice_idx_ == o.slice_idx_ && byte_idx_ == o.byte_idx_;
-  }
-  bool operator!=(const BufferByteIterator& o) const { return !(*this == o); }
-
-private:
-  const Buffer::RawSliceVector* slices_;
-  size_t                        slice_idx_;
-  size_t                        byte_idx_;
-  size_t*                       pos_;
-};
-
-// Index of the first non-empty slice (begin iterator seed).
-size_t firstNonEmpty(const Buffer::RawSliceVector& slices) {
-  for (size_t i = 0; i < slices.size(); ++i) {
-    if (slices[i].len_ > 0) {
-      return i;
-    }
-  }
-  return slices.size();
-}
-
-// Copies bytes [start, end) from a non-contiguous RawSliceVector into a
-// std::string. Used to extract element sub-ranges from the body slab chain
-// without going through the SAX event re-serialization path.
-std::string sliceBuffer(const Buffer::RawSliceVector& slices, size_t start, size_t end) {
-  std::string result;
-  if (end <= start) {
-    return result;
-  }
-  result.reserve(end - start);
-  size_t offset = 0;
-  for (const auto& slice : slices) {
-    const size_t slice_end = offset + slice.len_;
-    if (slice_end <= start) {
-      offset = slice_end;
-      continue;
-    }
-    if (offset >= end) {
-      break;
-    }
-    const size_t copy_from = std::max(start, offset) - offset;
-    const size_t copy_to   = std::min(end, slice_end) - offset;
-    result.append(static_cast<const char*>(slice.mem_) + copy_from, copy_to - copy_from);
-    offset = slice_end;
-  }
-  return result;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// InferenceSAXHandler
-//
-// SAX handler for OpenAI-style REST bodies. Extracts scalar fields (model,
-// stream, sampling params) inline as SAX events fire.
-//
-// For messages[] and tools[] elements, uses byte-range capture: records the
-// buffer position when an element's opening { or [ is consumed, then slices
-// the raw bytes [start, end) from the slab chain when the matching close fires.
-// No DOM is constructed and no re-serialization is performed — the bytes stored
-// in the PayloadRef are identical to what appeared in the original request body.
-//
-// This is strictly better than the previous SubtreeSerializer approach:
-//   - No re-escaping of strings (unicode sequences preserved exactly)
-//   - No character-by-character scan of large content strings
-//   - Events inside a captured element are entirely ignored (no per-event work)
-//   - Element capture is a simple depth counter + two memcpy calls
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct InferenceSAXHandler : public nlohmann::json_sax<json> {
-  using string_t          = json::string_t;
-  using number_integer_t  = json::number_integer_t;
-  using number_unsigned_t = json::number_unsigned_t;
-  using number_float_t    = json::number_float_t;
-  using binary_t          = json::binary_t;
-
-  InferencePayload&             payload_;
-  AiRequest&                    request_;
-  PayloadStore&                 store_;
-  const size_t*                 parser_pos_;  // bytes consumed by nlohmann so far
-  const Buffer::RawSliceVector* slices_;      // body slab chain for byte slicing
-
-  // When false (body above max_element_capture_bytes), element byte-range
-  // capture is skipped. Scalar fields are still extracted normally.
-  bool capture_elements_{true};
-
-  int         depth_{0};
-  std::string current_key_;
-
-  bool in_messages_{false};
-  bool in_tools_{false};
-
-  // Byte-range capture state.
-  bool   capturing_element_{false};
-  size_t elem_start_{0};   // position of element's opening { or [
-  int    elem_depth_{0};   // nesting depth inside the captured element
-
-  bool        has_error_{false};
-  std::string error_;
-
-  InferenceSAXHandler(InferencePayload& p, AiRequest& r, PayloadStore& s,
-                      const size_t* pos, const Buffer::RawSliceVector* slices,
-                      bool capture_elements)
-      : payload_(p), request_(r), store_(s), parser_pos_(pos), slices_(slices),
-        capture_elements_(capture_elements) {}
-
-  // Scalars inside a captured element are ignored — byte-range capture
-  // records the raw bytes, so we don't need to process individual values.
-
-  bool null() override { return true; }
-
-  bool boolean(bool v) override {
-    if (capturing_element_) return true;
-    if (depth_ == 1 && current_key_ == "stream") {
-      request_.streaming = v;
-    }
-    return true;
-  }
-
-  bool number_integer(number_integer_t v) override {
-    if (capturing_element_) return true;
-    if (depth_ == 1) {
-      if      (current_key_ == "max_tokens") payload_.sampling.max_tokens = static_cast<int32_t>(v);
-      else if (current_key_ == "n")          payload_.sampling.n          = static_cast<int32_t>(v);
-      else if (current_key_ == "seed")       payload_.sampling.seed       = v;
-    }
-    return true;
-  }
-
-  bool number_unsigned(number_unsigned_t v) override {
-    if (capturing_element_) return true;
-    if (depth_ == 1) {
-      if      (current_key_ == "max_tokens") payload_.sampling.max_tokens = static_cast<int32_t>(v);
-      else if (current_key_ == "n")          payload_.sampling.n          = static_cast<int32_t>(v);
-      else if (current_key_ == "seed")       payload_.sampling.seed       = static_cast<int64_t>(v);
-    }
-    return true;
-  }
-
-  bool number_float(number_float_t v, const string_t& /*raw*/) override {
-    if (capturing_element_) return true;
-    if (depth_ == 1) {
-      if      (current_key_ == "temperature") payload_.sampling.temperature = v;
-      else if (current_key_ == "top_p")       payload_.sampling.top_p       = v;
-    }
-    return true;
-  }
-
-  bool string(string_t& v) override {
-    if (capturing_element_) return true;
-    if (depth_ == 1 && current_key_ == "model") {
-      payload_.target.name = v;
-    } else if (current_key_ == "stop" && (depth_ == 1 || depth_ == 2)) {
-      payload_.sampling.stop.push_back(v);
-    }
-    return true;
-  }
-
-  bool binary(binary_t& /*v*/) override { return true; }
-
-  bool start_object(std::size_t) override {
-    if (capturing_element_) {
-      ++elem_depth_;
-      return true;
-    }
-    ++depth_;
-    if (capture_elements_ && depth_ == 3 && (in_messages_ || in_tools_)) {
-      capturing_element_ = true;
-      elem_depth_        = 1;
-      elem_start_        = *parser_pos_ - 1;  // { was the last byte consumed
-    }
-    return true;
-  }
-
-  bool key(string_t& k) override {
-    if (capturing_element_) return true;
-    if (depth_ == 1) {
-      current_key_ = k;
-    }
-    return true;
-  }
-
-  bool end_object() override {
-    if (capturing_element_) {
-      if (--elem_depth_ == 0) {
-        storeElement();
-        --depth_;  // depth_ was 3 (element level) → 2 (array level)
-      }
-      return true;
-    }
-    --depth_;
-    return true;
-  }
-
-  bool start_array(std::size_t) override {
-    if (capturing_element_) {
-      ++elem_depth_;
-      return true;
-    }
-    ++depth_;
-    if (depth_ == 2) {
-      if      (current_key_ == "messages") { in_messages_ = true;  in_tools_ = false; }
-      else if (current_key_ == "tools")    { in_tools_    = true; in_messages_ = false; }
-    } else if (capture_elements_ && depth_ == 3 && (in_messages_ || in_tools_)) {
-      // Array-typed element inside messages/tools (unusual but valid JSON).
-      capturing_element_ = true;
-      elem_depth_        = 1;
-      elem_start_        = *parser_pos_ - 1;
-    }
-    return true;
-  }
-
-  bool end_array() override {
-    if (capturing_element_) {
-      if (--elem_depth_ == 0) {
-        storeElement();
-        --depth_;
-      }
-      return true;
-    }
-    --depth_;
-    if (depth_ == 1) {
-      in_messages_ = false;
-      in_tools_    = false;
-    }
-    return true;
-  }
-
-  bool parse_error(std::size_t pos, const std::string& /*token*/,
-                   const nlohmann::detail::exception& ex) override {
-    has_error_ = true;
-    error_     = absl::StrCat("JSON parse error at byte ", pos, ": ", ex.what());
-    return false;
-  }
-
-private:
-  void storeElement() {
-    // Slice the raw bytes of this element directly from the body slab chain.
-    // parser_pos_ is one past the closing } or ] at the moment this fires.
-    std::string raw = sliceBuffer(*slices_, elem_start_, *parser_pos_);
-    capturing_element_ = false;
-    PayloadRef ref = store_.store(std::move(raw), PayloadKind::JsonObject);
-    if (in_messages_) {
-      payload_.messages.push_back(std::move(ref));
-    } else {
-      payload_.tools.push_back(std::move(ref));
-    }
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AgentSAXHandler
-//
-// SAX handler for JSON-RPC 2.0 agent bodies. Extracts the envelope (id,
-// method) inline; captures the params value via byte-range capture — records
-// the position of the params opening { or [ and slices raw bytes when the
-// matching close fires. No DOM is held during the SAX pass.
-//
-// AgentBodyParser::finish does one json::parse of the captured params string
-// for field extraction (tool_name, resource_uri, etc.), then moves the exact-
-// byte string into the store for params_raw.
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct AgentSAXHandler : public nlohmann::json_sax<json> {
-  using string_t          = json::string_t;
-  using number_integer_t  = json::number_integer_t;
-  using number_unsigned_t = json::number_unsigned_t;
-  using number_float_t    = json::number_float_t;
-  using binary_t          = json::binary_t;
-
-  AiRequest&                    request_;
-  const size_t*                 parser_pos_;
-  const Buffer::RawSliceVector* slices_;
-
-  int         depth_{0};
-  std::string current_key_;
-
-  // When false (body above max_element_capture_bytes), params byte-range
-  // capture is skipped. Scalar fields (id, method) are still extracted.
-  bool capture_params_{true};
-
-  bool   capturing_params_{false};
-  size_t params_start_{0};
-  int    params_depth_{0};
-  bool   params_captured_{false};
-  std::string params_json_;
-
-  bool        has_error_{false};
-  std::string error_;
-
-  AgentSAXHandler(AiRequest& r, const size_t* pos, const Buffer::RawSliceVector* slices,
-                  bool capture_params)
-      : request_(r), parser_pos_(pos), slices_(slices), capture_params_(capture_params) {}
-
-  bool null() override { return true; }
-
-  bool boolean(bool /*v*/) override { return true; }
-
-  bool number_integer(number_integer_t v) override {
-    if (capturing_params_) return true;
-    if (depth_ == 1 && current_key_ == "id") {
-      request_.jsonrpc_id = std::to_string(v);
-    }
-    return true;
-  }
-
-  bool number_unsigned(number_unsigned_t v) override {
-    if (capturing_params_) return true;
-    if (depth_ == 1 && current_key_ == "id") {
-      request_.jsonrpc_id = std::to_string(v);
-    }
-    return true;
-  }
-
-  bool number_float(number_float_t v, const string_t& /*raw*/) override {
-    if (capturing_params_) return true;
-    if (depth_ == 1 && current_key_ == "id") {
-      request_.jsonrpc_id = std::to_string(static_cast<int64_t>(v));
-    }
-    return true;
-  }
-
-  bool string(string_t& v) override {
-    if (capturing_params_) return true;
-    if (depth_ == 1) {
-      if      (current_key_ == "id")     request_.jsonrpc_id = v;
-      else if (current_key_ == "method") request_.rpc_method = v;
-    }
-    return true;
-  }
-
-  bool binary(binary_t& /*v*/) override { return true; }
-
-  bool start_object(std::size_t) override {
-    if (capturing_params_) {
-      ++params_depth_;
-      return true;
-    }
-    ++depth_;
-    if (capture_params_ && depth_ == 2 && current_key_ == "params") {
-      capturing_params_ = true;
-      params_depth_     = 1;
-      params_start_     = *parser_pos_ - 1;
-    }
-    return true;
-  }
-
-  bool key(string_t& k) override {
-    if (capturing_params_) return true;
-    if (depth_ == 1) {
-      current_key_ = k;
-    }
-    return true;
-  }
-
-  bool end_object() override {
-    if (capturing_params_) {
-      if (--params_depth_ == 0) captureParams();
-      return true;
-    }
-    --depth_;
-    return true;
-  }
-
-  bool start_array(std::size_t) override {
-    if (capturing_params_) {
-      ++params_depth_;
-      return true;
-    }
-    ++depth_;
-    // params may be an array per JSON-RPC spec (positional arguments).
-    if (capture_params_ && depth_ == 2 && current_key_ == "params") {
-      capturing_params_ = true;
-      params_depth_     = 1;
-      params_start_     = *parser_pos_ - 1;
-    }
-    return true;
-  }
-
-  bool end_array() override {
-    if (capturing_params_) {
-      if (--params_depth_ == 0) captureParams();
-      return true;
-    }
-    --depth_;
-    return true;
-  }
-
-  bool parse_error(std::size_t pos, const std::string& /*token*/,
-                   const nlohmann::detail::exception& ex) override {
-    has_error_ = true;
-    error_     = absl::StrCat("JSON-RPC parse error at byte ", pos, ": ", ex.what());
-    return false;
-  }
-
-  bool hasParams() const { return params_captured_; }
-  std::string takeParamsJson() { return std::move(params_json_); }
-
-private:
-  void captureParams() {
-    params_json_      = sliceBuffer(*slices_, params_start_, *parser_pos_);
-    params_captured_  = true;
-    capturing_params_ = false;
-  }
-};
-
-} // namespace
-
 // ─────────────────────────────────────────────────────────────────────────────
 // InferenceBodyParser
 //
 // Accumulates the full OpenAI-style REST JSON body in a Buffer::OwnedImpl
-// (Envoy's iovec slab allocator) rather than a std::string.
+// and parses it at onEndStream using simdjson on-demand.
 //
-// At onEndStream, runs a SAX parse pass directly over the buffer's
-// RawSliceVector via BufferByteIterator — no contiguous copy. Scalar fields
-// are extracted inline; each messages[] and tools[] element is captured by
-// slicing raw bytes directly from the slab chain (no DOM, no re-serialization,
-// byte-identical to the original request body).
+// simdjson on-demand is truly lazy: values you do not access are never lexed,
+// so skipping a 10 MB base64 image string in a large message element costs
+// zero allocation. For elements we do capture, raw_json() returns a
+// string_view into the padded buffer — one copy into the PayloadStore.
 //
-// residual_params receives the entire body buffer via store(Buffer::Instance&),
-// which does a zero-copy slab transfer (Buffer::move) for payloads above the
-// inline threshold.
+// Three-tier memory strategy (enforced in feed() / finish()):
+//   Tier 1 (body ≤ max_element_capture_bytes): full element capture.
+//   Tier 2 (body ≤ max_body_bytes):            scalars only; elements skipped.
+//   Tier 3 (body > max_body_bytes):            ResourceExhausted from feed().
 // ─────────────────────────────────────────────────────────────────────────────
 
 class RequestDecoder::InferenceBodyParser {
@@ -521,29 +53,82 @@ public:
       return absl::OkStatus();
     }
 
-    Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
-    const size_t           first  = firstNonEmpty(slices);
-
-    // Bodies above max_element_capture_bytes skip per-element byte-range capture
-    // to avoid the 2× memory cost of copying large element bytes out of the slab
-    // chain. Scalar fields (model, stream, sampling params) are always extracted.
     const bool capture_elements = body_buffer_.length() <= config_.max_element_capture_bytes;
 
-    // pos tracks bytes consumed by the parser; handlers read it to locate
-    // element boundaries and slice raw bytes via sliceBuffer().
-    size_t pos = 0;
-    BufferByteIterator begin(slices, first, 0, &pos);
-    BufferByteIterator end(slices, slices.size(), 0);
-
-    InferenceSAXHandler handler(payload, request, store, &pos, &slices, capture_elements);
-    const bool ok = nlohmann::json::sax_parse(
-        std::move(begin), std::move(end), &handler,
-        nlohmann::detail::input_format_t::json, /*strict=*/false);
-
-    if (!ok || handler.has_error_) {
+    // simdjson requires a contiguous padded buffer. toString() does at most one
+    // copy (no-op if the OwnedImpl is already a single slab); padded_string adds
+    // SIMDJSON_PADDING bytes so the SIMD overread is safe.
+    const std::string        body_str = body_buffer_.toString();
+    simdjson::padded_string  padded(body_str.data(), body_str.size());
+    simdjson::ondemand::parser parser;
+    simdjson::ondemand::document doc;
+    if (auto err = parser.iterate(padded).get(doc); err) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "inference body JSON parse error: ",
-          handler.has_error_ ? handler.error_ : "invalid JSON"));
+          "inference body JSON parse error: ", simdjson::error_message(err)));
+    }
+
+    simdjson::ondemand::object obj;
+    if (auto err = doc.get_object().get(obj); err) {
+      return absl::InvalidArgumentError("inference body: expected JSON object at top level");
+    }
+
+    for (auto field : obj) {
+      std::string_view key;
+      if (field.unescaped_key().get(key)) continue;
+
+      if (key == "model") {
+        std::string_view v;
+        if (!field.value().get_string().get(v)) payload.target.name = std::string(v);
+      } else if (key == "stream") {
+        bool v;
+        if (!field.value().get_bool().get(v)) request.streaming = v;
+      } else if (key == "max_tokens") {
+        int64_t v;
+        if (!field.value().get_int64().get(v)) payload.sampling.max_tokens = static_cast<int32_t>(v);
+      } else if (key == "n") {
+        int64_t v;
+        if (!field.value().get_int64().get(v)) payload.sampling.n = static_cast<int32_t>(v);
+      } else if (key == "seed") {
+        int64_t v;
+        if (!field.value().get_int64().get(v)) payload.sampling.seed = v;
+      } else if (key == "temperature") {
+        double v;
+        if (!field.value().get_double().get(v)) payload.sampling.temperature = v;
+      } else if (key == "top_p") {
+        double v;
+        if (!field.value().get_double().get(v)) payload.sampling.top_p = v;
+      } else if (key == "stop") {
+        auto val = field.value();
+        simdjson::ondemand::json_type type;
+        if (!val.type().get(type)) {
+          if (type == simdjson::ondemand::json_type::string) {
+            std::string_view sv;
+            if (!val.get_string().get(sv)) payload.sampling.stop.push_back(std::string(sv));
+          } else if (type == simdjson::ondemand::json_type::array) {
+            simdjson::ondemand::array arr;
+            if (!val.get_array().get(arr)) {
+              for (auto elem : arr) {
+                std::string_view sv;
+                if (!elem.get_string().get(sv)) payload.sampling.stop.push_back(std::string(sv));
+              }
+            }
+          }
+        }
+      } else if (key == "messages" || key == "tools") {
+        if (!capture_elements) continue;  // simdjson auto-skips the array; zero allocation
+        simdjson::ondemand::array arr;
+        if (field.value().get_array().get(arr)) continue;
+        const bool is_messages = (key == "messages");
+        for (auto elem : arr) {
+          std::string_view raw;
+          if (elem.raw_json().get(raw)) continue;
+          PayloadRef ref = store.store(std::string(raw), PayloadKind::JsonObject);
+          if (is_messages) payload.messages.push_back(std::move(ref));
+          else             payload.tools.push_back(std::move(ref));
+        }
+      }
+      // All other fields: simdjson automatically skips the value when the
+      // iterator advances — no allocation for unrecognised fields.
     }
 
     payload.residual_params = store.store(body_buffer_, PayloadKind::JsonObject);
@@ -558,11 +143,10 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 // AgentBodyParser
 //
-// Same external-buffer + SAX strategy for JSON-RPC 2.0 agent bodies.
-// AgentSAXHandler extracts id and method inline; params is captured as raw
-// bytes via byte-range slicing — no DOM during the SAX pass. AgentBodyParser::
-// finish does one json::parse of the exact-byte params string for field
-// extraction, then moves the string into the store for params_raw.
+// Same buffer-first strategy for JSON-RPC 2.0 agent bodies. simdjson on-demand
+// extracts id and method in a single pass; params is captured via raw_json()
+// — a zero-copy view into the padded buffer — then parsed in a second on-demand
+// pass for field extraction (tool_name, resource_uri, etc.).
 // ─────────────────────────────────────────────────────────────────────────────
 
 class RequestDecoder::AgentBodyParser {
@@ -585,24 +169,50 @@ public:
       return absl::OkStatus();
     }
 
-    Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
-    const size_t           first  = firstNonEmpty(slices);
-
     const bool capture_params = body_buffer_.length() <= config_.max_element_capture_bytes;
 
-    size_t pos = 0;
-    BufferByteIterator begin(slices, first, 0, &pos);
-    BufferByteIterator end(slices, slices.size(), 0);
-
-    AgentSAXHandler handler(request, &pos, &slices, capture_params);
-    const bool ok = nlohmann::json::sax_parse(
-        std::move(begin), std::move(end), &handler,
-        nlohmann::detail::input_format_t::json, /*strict=*/false);
-
-    if (!ok || handler.has_error_) {
+    const std::string       body_str = body_buffer_.toString();
+    simdjson::padded_string padded(body_str.data(), body_str.size());
+    simdjson::ondemand::parser parser;
+    simdjson::ondemand::document doc;
+    if (auto err = parser.iterate(padded).get(doc); err) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "agent body JSON-RPC parse error: ",
-          handler.has_error_ ? handler.error_ : "invalid JSON"));
+          "agent body JSON parse error: ", simdjson::error_message(err)));
+    }
+
+    simdjson::ondemand::object obj;
+    if (auto err = doc.get_object().get(obj); err) {
+      return absl::InvalidArgumentError("agent body: expected JSON object at top level");
+    }
+
+    std::string params_raw_str;
+
+    for (auto field : obj) {
+      std::string_view key;
+      if (field.unescaped_key().get(key)) continue;
+
+      if (key == "id") {
+        auto val = field.value();
+        simdjson::ondemand::json_type type;
+        if (!val.type().get(type)) {
+          if (type == simdjson::ondemand::json_type::string) {
+            std::string_view sv;
+            if (!val.get_string().get(sv)) request.jsonrpc_id = std::string(sv);
+          } else if (type == simdjson::ondemand::json_type::number) {
+            int64_t v;
+            if (!val.get_int64().get(v)) request.jsonrpc_id = std::to_string(v);
+          }
+        }
+      } else if (key == "method") {
+        std::string_view v;
+        if (!field.value().get_string().get(v)) request.rpc_method = std::string(v);
+      } else if (key == "params" && capture_params) {
+        std::string_view raw;
+        if (!field.value().raw_json().get(raw)) {
+          params_raw_str = std::string(raw);
+        }
+      }
+      // All other fields auto-skipped.
     }
 
     if (!request.rpc_method.empty()) {
@@ -615,54 +225,75 @@ public:
                                                                    : AgentDialect::A2a;
     }
 
-    if (handler.hasParams()) {
-      // Parse the exact-byte params string for field extraction, then move it
-      // into the store. One DOM parse, no extra copy, bytes identical to input.
-      std::string params_json = handler.takeParamsJson();
-      const json params = json::parse(params_json, nullptr, /*allow_exceptions=*/false);
-      if (!params.is_discarded()) {
-        populateParams(params, payload, store);
-      }
-      payload.params_raw = store.store(std::move(params_json), PayloadKind::JsonObject);
+    if (!params_raw_str.empty()) {
+      populateParams(params_raw_str, payload, store);
+      payload.params_raw = store.store(std::move(params_raw_str), PayloadKind::JsonObject);
     }
 
     payload.residual_params = store.store(body_buffer_, PayloadKind::JsonObject);
-
     return absl::OkStatus();
   }
 
 private:
-  static void populateParams(const json& params, AgentPayload& payload, PayloadStore& store) {
-    auto str = [&](const char* k) -> std::string {
-      return (params.contains(k) && params[k].is_string()) ? params[k].get<std::string>() : "";
-    };
-    auto field = [&](const char* k) -> PayloadRef {
-      return params.contains(k) ? store.store(params[k].dump(), PayloadKind::JsonObject)
-                                : PayloadRef{};
-    };
+  static void populateParams(const std::string& params_str, AgentPayload& payload,
+                             PayloadStore& store) {
+    simdjson::padded_string    padded(params_str.data(), params_str.size());
+    simdjson::ondemand::parser parser;
+    simdjson::ondemand::document doc;
+    if (parser.iterate(padded).get(doc)) return;
 
-    switch (payload.invocation) {
-    case AgentInvocation::ToolsCall:
-      payload.tool_name = str("name");
-      payload.arguments = field("arguments");
-      break;
-    case AgentInvocation::ResourcesRead:
-    case AgentInvocation::ResourcesSubscribe:
-    case AgentInvocation::ResourcesUnsubscribe:
-      payload.resource_uri = str("uri");
-      break;
-    case AgentInvocation::PromptsGet:
-      payload.prompt_name = str("name");
-      payload.arguments   = field("arguments");
-      break;
-    case AgentInvocation::CompletionComplete:
-      payload.completion_ref = str("ref");
-      break;
-    case AgentInvocation::Initialize:
-      payload.capabilities = field("capabilities");
-      break;
-    default:
-      break;
+    simdjson::ondemand::object obj;
+    if (doc.get_object().get(obj)) return;
+
+    for (auto field : obj) {
+      std::string_view key;
+      if (field.unescaped_key().get(key)) continue;
+
+      switch (payload.invocation) {
+      case AgentInvocation::ToolsCall:
+        if (key == "name") {
+          std::string_view v;
+          if (!field.value().get_string().get(v)) payload.tool_name = std::string(v);
+        } else if (key == "arguments") {
+          std::string_view raw;
+          if (!field.value().raw_json().get(raw))
+            payload.arguments = store.store(std::string(raw), PayloadKind::JsonObject);
+        }
+        break;
+      case AgentInvocation::ResourcesRead:
+      case AgentInvocation::ResourcesSubscribe:
+      case AgentInvocation::ResourcesUnsubscribe:
+        if (key == "uri") {
+          std::string_view v;
+          if (!field.value().get_string().get(v)) payload.resource_uri = std::string(v);
+        }
+        break;
+      case AgentInvocation::PromptsGet:
+        if (key == "name") {
+          std::string_view v;
+          if (!field.value().get_string().get(v)) payload.prompt_name = std::string(v);
+        } else if (key == "arguments") {
+          std::string_view raw;
+          if (!field.value().raw_json().get(raw))
+            payload.arguments = store.store(std::string(raw), PayloadKind::JsonObject);
+        }
+        break;
+      case AgentInvocation::CompletionComplete:
+        if (key == "ref") {
+          std::string_view v;
+          if (!field.value().get_string().get(v)) payload.completion_ref = std::string(v);
+        }
+        break;
+      case AgentInvocation::Initialize:
+        if (key == "capabilities") {
+          std::string_view raw;
+          if (!field.value().raw_json().get(raw))
+            payload.capabilities = store.store(std::string(raw), PayloadKind::JsonObject);
+        }
+        break;
+      default:
+        break;
+      }
     }
   }
 

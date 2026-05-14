@@ -77,7 +77,7 @@ envoy_cc_library(
         "//source/common/common:logger_lib",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/strings",
-        "@nlohmann_json//:json",
+        "@simdjson//:simdjson",
     ],
 )
 
