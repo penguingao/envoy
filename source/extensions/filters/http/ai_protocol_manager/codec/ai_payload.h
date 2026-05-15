@@ -119,6 +119,11 @@ public:
   virtual PayloadRef store(std::string data, PayloadKind kind) = 0;
   virtual PayloadRef store(Buffer::Instance& data, PayloadKind kind) = 0;
 
+  // Returns a ref that describes the byte range [offset, offset+len) within
+  // `parent`. For External refs this is pure offset arithmetic — zero allocation.
+  // For Inline/Buffered refs the substring is materialized into a new entry.
+  virtual PayloadRef slice(const PayloadRef& parent, size_t offset, size_t len) = 0;
+
   // Materializes a ref back into a Buffer::Instance via callback (may be
   // synchronous for Inline/Buffered; async for External backends).
   virtual void fetch(const PayloadRef& ref, FetchCallback cb) = 0;
@@ -158,6 +163,15 @@ public:
     auto buf = std::make_unique<Buffer::OwnedImpl>();
     buf->move(data);
     return PayloadRef::makeBuffered(std::move(buf));
+  }
+
+  PayloadRef slice(const PayloadRef& parent, size_t offset, size_t len) override {
+    // InMemoryPayloadStore never creates External refs, so toString() is safe.
+    std::string s = parent.toString();
+    if (offset >= s.size()) {
+      return PayloadRef::makeInline({});
+    }
+    return store(s.substr(offset, std::min(len, s.size() - offset)), PayloadKind::JsonObject);
   }
 
   void fetch(const PayloadRef& ref, FetchCallback cb) override {

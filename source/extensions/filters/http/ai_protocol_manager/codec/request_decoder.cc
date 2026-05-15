@@ -55,11 +55,23 @@ public:
 
     const bool capture_elements = body_buffer_.length() <= config_.max_element_capture_bytes;
 
-    // simdjson requires a contiguous padded buffer. toString() does at most one
-    // copy (no-op if the OwnedImpl is already a single slab); padded_string adds
-    // SIMDJSON_PADDING bytes so the SIMD overread is safe.
-    const std::string        body_str = body_buffer_.toString();
-    simdjson::padded_string  padded(body_str.data(), body_str.size());
+    // Copy the slab chain directly into a single allocation that already has
+    // SIMDJSON_PADDING zeros appended. This is one copy instead of two
+    // (body_buffer_.toString() + padded_string would copy twice). The tail is
+    // zero-initialised by the () on new[], satisfying simdjson's SIMD overread
+    // requirement without a separate memset.
+    const size_t body_size = body_buffer_.length();
+    std::unique_ptr<char[]> buf(new char[body_size + simdjson::SIMDJSON_PADDING]());
+    {
+      Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
+      size_t offset = 0;
+      for (const auto& slice : slices) {
+        std::memcpy(buf.get() + offset, static_cast<const char*>(slice.mem_), slice.len_);
+        offset += slice.len_;
+      }
+    }
+    simdjson::padded_string_view padded(buf.get(), body_size,
+                                        body_size + simdjson::SIMDJSON_PADDING);
     simdjson::ondemand::parser parser;
     simdjson::ondemand::document doc;
     if (auto err = parser.iterate(padded).get(doc); err) {
@@ -171,8 +183,18 @@ public:
 
     const bool capture_params = body_buffer_.length() <= config_.max_element_capture_bytes;
 
-    const std::string       body_str = body_buffer_.toString();
-    simdjson::padded_string padded(body_str.data(), body_str.size());
+    const size_t body_size = body_buffer_.length();
+    std::unique_ptr<char[]> buf(new char[body_size + simdjson::SIMDJSON_PADDING]());
+    {
+      Buffer::RawSliceVector slices = body_buffer_.getRawSlices();
+      size_t offset = 0;
+      for (const auto& slice : slices) {
+        std::memcpy(buf.get() + offset, static_cast<const char*>(slice.mem_), slice.len_);
+        offset += slice.len_;
+      }
+    }
+    simdjson::padded_string_view padded(buf.get(), body_size,
+                                        body_size + simdjson::SIMDJSON_PADDING);
     simdjson::ondemand::parser parser;
     simdjson::ondemand::document doc;
     if (auto err = parser.iterate(padded).get(doc); err) {
@@ -185,7 +207,10 @@ public:
       return absl::InvalidArgumentError("agent body: expected JSON object at top level");
     }
 
-    std::string params_raw_str;
+    // Record the byte offset of the params value within buf so we can create
+    // params_raw and arguments as slices of residual_params rather than copies.
+    size_t params_start = 0;
+    size_t params_len   = 0;
 
     for (auto field : obj) {
       std::string_view key;
@@ -209,7 +234,9 @@ public:
       } else if (key == "params" && capture_params) {
         std::string_view raw;
         if (!field.value().raw_json().get(raw)) {
-          params_raw_str = std::string(raw);
+          // raw points into buf; compute byte offset within the body.
+          params_start = static_cast<size_t>(raw.data() - buf.get());
+          params_len   = raw.size();
         }
       }
       // All other fields auto-skipped.
@@ -225,19 +252,32 @@ public:
                                                                    : AgentDialect::A2a;
     }
 
-    if (!params_raw_str.empty()) {
-      populateParams(params_raw_str, payload, store);
-      payload.params_raw = store.store(std::move(params_raw_str), PayloadKind::JsonObject);
+    // Store residual_params first so params_raw and arguments can be created
+    // as slices into the same backing storage — zero extra allocation for
+    // External refs (MmapPayloadStore), one substring copy for Inline/Buffered.
+    payload.residual_params = store.store(body_buffer_, PayloadKind::JsonObject);
+
+    if (params_len > 0) {
+      payload.params_raw = store.slice(payload.residual_params, params_start, params_len);
+      populateParams(buf.get() + params_start, params_len, params_start,
+                     payload, store, payload.residual_params);
     }
 
-    payload.residual_params = store.store(body_buffer_, PayloadKind::JsonObject);
     return absl::OkStatus();
   }
 
 private:
-  static void populateParams(const std::string& params_str, AgentPayload& payload,
-                             PayloadStore& store) {
-    simdjson::padded_string    padded(params_str.data(), params_str.size());
+  // Parses the params object and populates invocation-specific fields.
+  // `params_data` points into the caller's padded body buffer at `params_body_offset`
+  // bytes from the start of the body. Sub-objects (arguments, capabilities) are
+  // created as slices of `residual_ref` rather than independent copies.
+  static void populateParams(const char* params_data, size_t params_len,
+                             size_t params_body_offset, AgentPayload& payload,
+                             PayloadStore& store, const PayloadRef& residual_ref) {
+    std::unique_ptr<char[]> pbuf(new char[params_len + simdjson::SIMDJSON_PADDING]());
+    std::memcpy(pbuf.get(), params_data, params_len);
+    simdjson::padded_string_view padded(pbuf.get(), params_len,
+                                        params_len + simdjson::SIMDJSON_PADDING);
     simdjson::ondemand::parser parser;
     simdjson::ondemand::document doc;
     if (parser.iterate(padded).get(doc)) return;
@@ -256,8 +296,10 @@ private:
           if (!field.value().get_string().get(v)) payload.tool_name = std::string(v);
         } else if (key == "arguments") {
           std::string_view raw;
-          if (!field.value().raw_json().get(raw))
-            payload.arguments = store.store(std::string(raw), PayloadKind::JsonObject);
+          if (!field.value().raw_json().get(raw)) {
+            const size_t off = static_cast<size_t>(raw.data() - pbuf.get());
+            payload.arguments = store.slice(residual_ref, params_body_offset + off, raw.size());
+          }
         }
         break;
       case AgentInvocation::ResourcesRead:
@@ -274,8 +316,10 @@ private:
           if (!field.value().get_string().get(v)) payload.prompt_name = std::string(v);
         } else if (key == "arguments") {
           std::string_view raw;
-          if (!field.value().raw_json().get(raw))
-            payload.arguments = store.store(std::string(raw), PayloadKind::JsonObject);
+          if (!field.value().raw_json().get(raw)) {
+            const size_t off = static_cast<size_t>(raw.data() - pbuf.get());
+            payload.arguments = store.slice(residual_ref, params_body_offset + off, raw.size());
+          }
         }
         break;
       case AgentInvocation::CompletionComplete:
@@ -287,8 +331,10 @@ private:
       case AgentInvocation::Initialize:
         if (key == "capabilities") {
           std::string_view raw;
-          if (!field.value().raw_json().get(raw))
-            payload.capabilities = store.store(std::string(raw), PayloadKind::JsonObject);
+          if (!field.value().raw_json().get(raw)) {
+            const size_t off = static_cast<size_t>(raw.data() - pbuf.get());
+            payload.capabilities = store.slice(residual_ref, params_body_offset + off, raw.size());
+          }
         }
         break;
       default:

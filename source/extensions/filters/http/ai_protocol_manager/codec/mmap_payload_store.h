@@ -51,6 +51,10 @@ public:
   PayloadRef store(std::string data,       PayloadKind kind) override;
   PayloadRef store(Buffer::Instance& data, PayloadKind kind) override;
 
+  // For External refs: pure offset arithmetic — zero allocation, zero copy.
+  // For Inline/Buffered refs: materializes the parent and stores the substring.
+  PayloadRef slice(const PayloadRef& parent, size_t offset, size_t len) override;
+
   // Synchronous. External refs are read directly from the mmap region.
   void fetch(const PayloadRef& ref, FetchCallback cb) override;
 

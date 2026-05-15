@@ -127,6 +127,19 @@ PayloadRef MmapPayloadStore::store(Buffer::Instance& data, PayloadKind /*kind*/)
   return PayloadRef::makeExternal(off, len);
 }
 
+PayloadRef MmapPayloadStore::slice(const PayloadRef& parent, size_t offset, size_t len) {
+  if (parent.storage() == PayloadRef::Storage::External) {
+    // Pure offset arithmetic into the same mmap region — zero allocation.
+    return PayloadRef::makeExternal(parent.externalOffset() + offset, len);
+  }
+  // Inline or Buffered: materialize and substring.
+  std::string s = parent.toString();
+  if (offset >= s.size()) {
+    return PayloadRef::makeInline({});
+  }
+  return store(s.substr(offset, std::min(len, s.size() - offset)), PayloadKind::JsonObject);
+}
+
 void MmapPayloadStore::fetch(const PayloadRef& ref, FetchCallback cb) {
   if (ref.empty()) {
     cb(nullptr);
