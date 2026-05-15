@@ -78,6 +78,65 @@ below the capture threshold, the one copy is `std::string(raw)` — identical
 cost to the old `sliceBuffer()` path. If it exceeds the threshold the whole
 element is skipped at zero allocation cost.
 
+### Why the memcpy is not the same cost as nlohmann's allocations
+
+A natural question: if simdjson copies the entire body into `buf` up front,
+the 10 MB base64 bytes are in memory either way — so what does simdjson
+actually save?
+
+The distinction is not about whether bytes are in memory. It is about whether
+a **separate heap object** is allocated for each value.
+
+**What nlohmann does:**
+
+nlohmann's lexer reads each character incrementally and, for every string it
+finds, allocates a `std::string` to hold the unescaped content before calling
+the handler:
+
+```
+lexer reads '"', begins string scan
+lexer reads 10 MB of base64 chars → appended into a growing std::string
+lexer reads closing '"'
+lexer calls handler.string(10MB_string)   ← your code runs here
+10MB_string is destroyed
+```
+
+The `std::string` is a separate heap allocation from the body buffer. It is
+passed to the handler as a completed object. You cannot intercept the
+allocation from the public SAX API.
+
+**What simdjson does:**
+
+simdjson's Stage 1 SIMD pass scans all bytes to build a structural bitmap —
+an index of where `"`, `{`, `}`, `[`, `]`, `:`, `,` appear. No per-value
+strings are allocated during this scan. Stage 2 (on-demand) uses the bitmap
+to jump between positions:
+
+```
+cursor at start of 10 MB string value
+cursor.skip() → bitmap lookup → jump past closing '"'
+→ 0 bytes of the string content processed, 0 heap allocation
+
+raw_json() → string_view{ptr_into_buf, 10MB_len}
+→ pointer arithmetic into buf, 0 heap allocation
+```
+
+**The precise comparison:**
+
+| | nlohmann | simdjson |
+|---|---|---|
+| Body bytes in memory | In slab chain (zero copy) | In pre-allocated `buf` (one memcpy) |
+| Per-value allocation | New `std::string` per string, unconditionally | None — `string_view` into `buf` |
+| Skipping 10 MB image string | 10 MB `std::string` alloc + free, unavoidable | Bitmap jump, 0 bytes processed |
+| Heap allocator pressure under concurrency | O(Σ string sizes) allocs per request | 0 additional allocs per request |
+
+The memcpy is one sequential write into a pre-allocated region — the allocator
+is not involved. nlohmann's per-value `std::string` allocations go through
+`malloc`/`free` repeatedly under concurrent load, causing lock contention and
+heap fragmentation that grow with concurrency. For a single small request the
+two approaches are comparable. For concurrent vision requests with large
+base64 values, the allocator pressure compounds.
+
 ---
 
 ## simdjson concepts used
@@ -167,6 +226,101 @@ residual_params   ← whole body in PayloadStore (mmap or heap)
 ```
 
 No transient allocations survive `finish()`.
+
+---
+
+## Three-tier body handling
+
+Every request is routed into one of three tiers based on body size, controlled
+by two configurable thresholds:
+
+```
+0 ──────────────────────┬───────────────────────────┬──────────────── ∞
+                        │                           │
+               max_element_capture_bytes       max_body_bytes
+               (soft limit, e.g. 256 KB)       (hard limit, e.g. 4 MB)
+
+       ◄────── Tier 1 ──►◄──────── Tier 2 ───────────►◄──── Tier 3 ────►
+```
+
+### Flow
+
+```
+                    HTTP request data arrives
+                           │
+                ┌──────────▼──────────┐
+                │    decodeData()      │  ← called per chunk as data arrives
+                │  accumulate into     │
+                │   body_buffer_       │
+                └──────────┬──────────┘
+                           │
+                body_buffer_.length() > max_body_bytes?
+                           │
+                ┌──────────┴──────────┐
+               YES                    NO
+                │                     │
+                ▼                     │ (keep accumulating)
+        ┌──────────────┐             │
+        │    TIER 3    │        onEndStream()
+        │  Reject now  │             │
+        │  no parse    │             ▼
+        │  no copy     │    ┌──────────────────┐
+        └──────────────┘    │     finish()      │
+                            │                   │
+                            │  body_size ≤       │
+                            │  max_element_      │
+                            │  capture_bytes?    │
+                            └────────┬──────────┘
+                                     │
+                          ┌──────────┴──────────┐
+                         YES                    NO
+                          │                     │
+                          ▼                     ▼
+                    ┌──────────┐         ┌──────────┐
+                    │  TIER 1  │         │  TIER 2  │
+                    └──────────┘         └──────────┘
+                          │                     │
+                memcpy body into buf   memcpy body into buf
+                simdjson parse         simdjson parse
+                          │                     │
+                extract scalars        extract scalars only
+                (model, stream…)       (model, stream…)
+                          │                     │
+                capture elements       skip elements
+                messages[], tools[]    (cursor auto-advances,
+                → copied into store    zero allocation)
+                          │                     │
+                store residual_params  store residual_params
+                (whole body)           (whole body)
+```
+
+### What each tier means
+
+**Tier 3** — body exceeds the hard limit. Rejected in `decodeData()` as chunks
+arrive, before `finish()` is ever called. No `buf` allocation, no `memcpy`, no
+simdjson involvement.
+
+**Tier 2** — body fits within the hard limit but is too large to capture
+individual elements. `finish()` runs: one `memcpy` into `buf`, full simdjson
+structural scan, scalar fields extracted (`model`, `stream`, `max_tokens`,
+etc.), `messages`/`tools` arrays skipped at zero allocation cost (cursor
+auto-advances without lexing interior bytes). Whole body stored in
+`residual_params` for downstream forwarding.
+
+**Tier 1** — body is small enough that capturing individual elements is
+worthwhile. Same as Tier 2 for scalars, plus `messages[]` and `tools[]` are
+iterated: `raw_json()` returns a `string_view` per element, which is copied
+into the PayloadStore. Downstream consumers receive elements as individual
+`PayloadRef`s.
+
+### Why Tier 2 still pays the memcpy
+
+Even though Tier 2 skips element capture, simdjson's Stage 1 SIMD structural
+pass requires the full contiguous body. There is no way to ask simdjson to
+"scan only the first N bytes." For large Tier 2 bodies the memcpy is the
+dominant cost; if that is unacceptable, lowering `max_body_bytes` to shift
+those requests into Tier 3 is the only lever available within the simdjson
+approach.
 
 ---
 
@@ -631,3 +785,27 @@ After fix:   residual_params (502 KB) + two External{uint64+size_t} structs     
 | Vision request, Tier 1 (element captured) | Both pay one element copy; nlohmann also pays 10 MB transient | Both pay one element copy; simdjson pays nothing extra |
 | Agent request, any params size | Independent copies: `arguments` + `params_raw` + `residual_params` = 3× params bytes in store; DOM for params parse | `residual_params` written once; `params_raw` and `arguments` are `External{offset,len}` slices — 0 extra bytes; no DOM |
 | Agent request, 500 KB arguments | ≥ 1.5 MB in store (3× copies) + DOM alloc | 502 KB in store (1× body only) + one 500 KB `padded` alloc freed after second parse |
+
+---
+
+## Difference 
+Tier 3 — No difference. Both approaches reject before any parsing. The parser choice is irrelevant.
+
+Tier 1 — Body is small by definition (≤ max_element_capture_bytes). Both approaches perform similarly:
+
+simdjson's memcpy is cheap because the body is small
+nlohmann's transient string allocations are also small because the values are small
+A 10 MB base64 image can't exist here — if it did, the body would exceed the soft limit and fall into Tier 2
+Tier 2 — This is where the difference is real and meaningful:
+
+nlohmann	simdjson
+Body ingestion	Zero copy — BufferByteIterator walks slabs	Full memcpy into buf
+Skipping messages array	SAX lexer reads every byte, allocates std::string per string value — 10 MB allocation unavoidable	Cursor bitmap-jumps past the array — zero bytes lexed, zero allocation
+So the tradeoff at Tier 2 is:
+
+nlohmann pays zero on body ingestion but 10 MB on skipping a large string value
+simdjson pays 10 MB on body ingestion but zero on skipping that same value
+For a 10 MB body with a 10 MB image, the total bytes moved are the same. What differs is how: nlohmann's cost goes through the heap allocator (causing fragmentation and lock contention under concurrency); simdjson's cost is a single sequential memcpy that never touches the allocator.
+
+This means the simdjson argument is strongest specifically for Tier 2, high-concurrency, vision workloads. If your traffic is predominantly Tier 1 small-body requests, the parser choice barely matters. If it's predominantly Tier 2 with large text fields you don't need to capture, simdjson's bitmap skip is the genuine win.
+
