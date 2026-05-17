@@ -27,7 +27,10 @@
 //   InferenceTrafficSkipsAgenticAuth   POST /v1/chat/completions              InferenceChain (empty), passes through
 //   NotificationErrorOmitsIdField      tools/list   (no id field, no header)  401, error body omits "id" per spec
 //   ResourcesListWithValidIdentity…    resources/list x-mcp-identity: svc     Reaches upstream
-//   NonJsonRpcBodyFallsThrough         POST /mcp app/json, non-JSON-RPC body  Body parse fails → falls through
+//   NonJsonRpcBodyFallsThrough         POST /mcp app/json, non-JSON-RPC body  Body parse OK, no method → falls through
+//   DuplicateParamsKeyRejects400       tools/call  duplicate "params" key     400 — auth never runs
+//   DuplicateMethodKeyRejects400       tools/call  duplicate "method" key     400 — auth never runs
+//   DuplicateParamsAdminStillRej400    tools/call  dup "params", admin header 400 regardless of identity
 
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/extensions/filters/http/ai_filters/mcp_auth/v3/mcp_auth.pb.h"
@@ -323,16 +326,21 @@ TEST_P(McpAuthFilterIntegrationTest, ResourcesListWithValidIdentityPasses) {
 //
 // The MCP classifier uses POST + application/json as a header-only heuristic,
 // so any such request is tentatively classified as AgenticMcp. When the body
-// arrives and fails JSON-RPC parsing (no "jsonrpc" / "method" fields), the
-// filter marks the stream as non-AI and falls through rather than returning 400.
-// AgenticChain (and McpAuthFilter) must NOT run on this request.
+// arrives and parses successfully as JSON but contains no "jsonrpc"/"method"
+// fields, the filter discovers rpc_method is empty during onEndStreamAndDispatch()
+// and marks the stream as non-AI traffic, falling through to upstream unchanged.
+// This handles genuine non-AI application/json endpoints sharing the same listener.
+// Note: this is distinct from a body parse *error* (e.g. duplicate keys), which
+// is rejected with 400 rather than falling through.
 
 TEST_P(McpAuthFilterIntegrationTest, NonJsonRpcBodyFallsThrough) {
   initialize();
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
   // A plain JSON body that is NOT a JSON-RPC message — simulates a webhook or
-  // other application/json endpoint sharing the same listener.
+  // other application/json endpoint sharing the same listener. This body is
+  // valid JSON so AgentBodyParser::feed() returns OK; the fall-through happens
+  // when rpc_method is found empty, not from a parse error.
   const std::string body = R"({"type":"webhook","event":"user.created","user_id":"u_123"})";
 
   auto response = codec_client_->makeRequestWithBody(
@@ -343,7 +351,7 @@ TEST_P(McpAuthFilterIntegrationTest, NonJsonRpcBodyFallsThrough) {
                                      {"content-type", "application/json"}},
       body);
 
-  // The request must reach upstream — the filter fell through on body parse failure.
+  // Valid JSON with no JSON-RPC fields reaches upstream unchanged.
   waitForNextUpstreamRequest();
   const std::string upstream_body = upstream_request_->body().toString();
   EXPECT_THAT(upstream_body, HasSubstr("webhook"));
@@ -351,6 +359,97 @@ TEST_P(McpAuthFilterIntegrationTest, NonJsonRpcBodyFallsThrough) {
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── 11. Duplicate "params" key → 400 (key-smuggling attempt rejected) ─────────
+//
+// A tools/call body with two "params" keys is a classic key-smuggling vector:
+// the first params names a harmless tool, the second names a destructive one.
+// AgentHandler::onKey() detects the duplicate via seen_params_ and the body
+// parser returns InvalidArgument. The filter rejects immediately with 400 —
+// auth never runs and the body never reaches upstream.
+
+TEST_P(McpAuthFilterIntegrationTest, DuplicateParamsKeyRejects400) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"sm1","method":"tools/call",)"
+      R"("params":{"name":"read_only_tool","arguments":{}},)"
+      R"("params":{"name":"destructive_tool","arguments":{}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("400", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("duplicate key"));
+  EXPECT_THAT(response->body(), HasSubstr("params"));
+}
+
+// ── 12. Duplicate "method" key → 400 ─────────────────────────────────────────
+//
+// Two "method" keys allow an attacker to route through auth on an allow-listed
+// method (e.g. "tools/list") while delivering a different method to the upstream
+// provider. AgentHandler::onKey() detects seen_method_ and rejects with 400.
+
+TEST_P(McpAuthFilterIntegrationTest, DuplicateMethodKeyRejects400) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"sm2","method":"tools/list",)"
+      R"("method":"tools/call","params":{"name":"delete","arguments":{}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("400", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("duplicate key"));
+  EXPECT_THAT(response->body(), HasSubstr("method"));
+}
+
+// ── 13. Duplicate "params" key rejected even with a valid identity header ──────
+//
+// Auth cannot be used to bypass the 400 path: the parse error fires before
+// the AgenticChain ever runs, regardless of what identity header is present.
+
+TEST_P(McpAuthFilterIntegrationTest, DuplicateParamsAdminIdentityStillRejects400) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"sm3","method":"tools/call",)"
+      R"("params":{"name":"read_only_tool","arguments":{}},)"
+      R"("params":{"name":"destructive_tool","arguments":{}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "admin"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("400", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("duplicate key"));
+  EXPECT_THAT(response->body(), HasSubstr("params"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1021,6 +1120,461 @@ TEST_P(McpAuthParamConditionIntegrationTest, LargeBodyToolNameExtractedForParamC
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// allowed_unauthenticated_methods tests
+//
+// Verifies that additional methods added to the allow-list bypass the identity
+// check, while non-listed methods still require authentication, and that
+// "initialize" is always present even without explicit configuration.
+//
+// Config: allowed_unauthenticated_methods = ["ping", "notifications/initialized"]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class McpAuthAllowListIntegrationTest
+    : public testing::TestWithParam<Network::Address::IpVersion>,
+      public HttpIntegrationTest {
+public:
+  McpAuthAllowListIntegrationTest()
+      : HttpIntegrationTest(Http::CodecType::HTTP2, GetParam()) {}
+
+  void initialize() override {
+    config_helper_.prependFilter(R"EOF(
+      name: envoy.filters.http.ai_protocol_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+        ai_filters:
+        - name: envoy.ai_filters.mcp_auth
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ai_filters.mcp_auth.v3.McpAuthConfig
+            allowed_unauthenticated_methods: ["ping", "notifications/initialized"]
+    )EOF");
+    HttpIntegrationTest::initialize();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, McpAuthAllowListIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
+
+// ── AL1. Configured allow-listed method bypasses auth ────────────────────────
+
+TEST_P(McpAuthAllowListIntegrationTest, PingBypassesAuth) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body = R"({"jsonrpc":"2.0","id":"al1","method":"ping","params":{}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("ping"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── AL2. Second configured allow-listed method also bypasses ─────────────────
+
+TEST_P(McpAuthAllowListIntegrationTest, NotificationsInitializedBypassesAuth) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"al2","method":"notifications/initialized","params":{}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("notifications/initialized"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── AL3. "initialize" is always in the allow-list regardless of config ────────
+//
+// McpAuthFilterConfig::McpAuthFilterConfig() always inserts "initialize".
+// Even without it in the proto's allowed_unauthenticated_methods, it passes.
+
+TEST_P(McpAuthAllowListIntegrationTest, InitializeAlwaysBypassesAuth) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"al3","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("initialize"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── AL4. Non-allow-listed method still requires the identity header ────────────
+
+TEST_P(McpAuthAllowListIntegrationTest, NonAllowListedMethodRequiresIdentity) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"al4","method":"tools/call","params":{"name":"myTool","arguments":{}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("401", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32001"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"al4\""));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Suffix matcher + multiple param conditions (AND semantics) tests
+//
+// Exercises the suffix variant of StringMatcher and the AND semantics when
+// multiple param_conditions appear on the same policy rule.
+//
+// Policy configured for this fixture:
+//   - resources/read  + resource_uri prefix "secure/" AND suffix ".json"
+//                     → allowed_principals: ["*"]
+//   - resources/read  (catch-all)
+//                     → allowed_principals: ["admin"]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class McpAuthSuffixAndMultiConditionIntegrationTest
+    : public testing::TestWithParam<Network::Address::IpVersion>,
+      public HttpIntegrationTest {
+public:
+  McpAuthSuffixAndMultiConditionIntegrationTest()
+      : HttpIntegrationTest(Http::CodecType::HTTP2, GetParam()) {}
+
+  void initialize() override {
+    config_helper_.prependFilter(R"EOF(
+      name: envoy.filters.http.ai_protocol_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+        ai_filters:
+        - name: envoy.ai_filters.mcp_auth
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ai_filters.mcp_auth.v3.McpAuthConfig
+            method_policies:
+            - method_pattern: "resources/read"
+              allowed_principals: ["*"]
+              param_conditions:
+              - field: RESOURCE_URI
+                matcher:
+                  prefix: "secure/"
+              - field: RESOURCE_URI
+                matcher:
+                  suffix: ".json"
+            - method_pattern: "resources/read"
+              allowed_principals: ["admin"]
+    )EOF");
+    HttpIntegrationTest::initialize();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, McpAuthSuffixAndMultiConditionIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
+
+// ── SM1. URI satisfying both conditions → any authenticated principal passes ──
+//
+// "secure/config.json" has the "secure/" prefix AND the ".json" suffix.
+// Both conditions hold → rule 1 matches → any authenticated principal passes.
+
+TEST_P(McpAuthSuffixAndMultiConditionIntegrationTest, BothConditionsMatchAnyPrincipalPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"sm1","method":"resources/read","params":{"uri":"secure/config.json"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "bob"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("secure/config.json"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── SM2. Prefix matches but suffix fails → rule 1 skipped, catch-all → 403 ───
+//
+// "secure/config.xml" has the "secure/" prefix but NOT the ".json" suffix.
+// Rule 1 does not match (AND requires both) → falls to catch-all →
+// only "admin" allowed → "bob" gets 403.
+
+TEST_P(McpAuthSuffixAndMultiConditionIntegrationTest, SuffixMismatchFallsToCatchAll403) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"sm2","method":"resources/read","params":{"uri":"secure/config.xml"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "bob"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32003"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"sm2\""));
+}
+
+// ── SM3. Suffix matches but prefix fails → rule 1 skipped, catch-all → 403 ───
+//
+// "public/config.json" ends in ".json" but does NOT start with "secure/".
+// Rule 1 does not match → falls to catch-all → non-admin "bob" gets 403.
+
+TEST_P(McpAuthSuffixAndMultiConditionIntegrationTest, PrefixMismatchFallsToCatchAll403) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"sm3","method":"resources/read","params":{"uri":"public/config.json"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "bob"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32003"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"sm3\""));
+}
+
+// ── SM4. Admin principal always passes via the catch-all rule ─────────────────
+
+TEST_P(McpAuthSuffixAndMultiConditionIntegrationTest, CatchAllAdminPrincipalPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"sm4","method":"resources/read","params":{"uri":"secure/config.xml"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "admin"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("resources/read"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// prompts/get + PROMPT_NAME param condition tests
+//
+// Verifies end-to-end that AgentBodyParser extracts prompt_name from
+// params.name for prompts/get requests and that McpAuthFilter evaluates
+// PROMPT_NAME param conditions correctly.
+//
+// Policy configured for this fixture:
+//   - prompts/get + prompt_name exact "system-prompt" → allowed_principals: ["admin"]
+//   - prompts/get (catch-all)                         → allowed_principals: ["*"]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class McpAuthPromptNameIntegrationTest
+    : public testing::TestWithParam<Network::Address::IpVersion>,
+      public HttpIntegrationTest {
+public:
+  McpAuthPromptNameIntegrationTest()
+      : HttpIntegrationTest(Http::CodecType::HTTP2, GetParam()) {}
+
+  void initialize() override {
+    config_helper_.prependFilter(R"EOF(
+      name: envoy.filters.http.ai_protocol_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+        ai_filters:
+        - name: envoy.ai_filters.mcp_auth
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ai_filters.mcp_auth.v3.McpAuthConfig
+            method_policies:
+            - method_pattern: "prompts/get"
+              allowed_principals: ["admin"]
+              param_conditions:
+              - field: PROMPT_NAME
+                matcher:
+                  exact: "system-prompt"
+            - method_pattern: "prompts/get"
+              allowed_principals: ["*"]
+    )EOF");
+    HttpIntegrationTest::initialize();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, McpAuthPromptNameIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
+
+// ── PN1. Restricted prompt + non-admin principal → 403 ───────────────────────
+//
+// "system-prompt" matches the first rule (admin only). "alice" is not admin.
+
+TEST_P(McpAuthPromptNameIntegrationTest, RestrictedPromptNonAdminRejects403) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pn1","method":"prompts/get","params":{"name":"system-prompt"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "alice"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32003"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"pn1\""));
+}
+
+// ── PN2. Restricted prompt + admin principal → passes ────────────────────────
+
+TEST_P(McpAuthPromptNameIntegrationTest, RestrictedPromptAdminPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pn2","method":"prompts/get","params":{"name":"system-prompt"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "admin"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_THAT(upstream_body, HasSubstr("prompts/get"));
+  EXPECT_THAT(upstream_body, HasSubstr("system-prompt"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── PN3. Non-restricted prompt → any authenticated principal passes ────────────
+//
+// "user-prompt" does not match the "system-prompt" exact condition, so rule 1
+// is skipped. The catch-all allows any authenticated principal.
+
+TEST_P(McpAuthPromptNameIntegrationTest, UnrestrictedPromptAnyPrincipalPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pn3","method":"prompts/get","params":{"name":"user-prompt"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "alice"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  const std::string upstream_body = upstream_request_->body().toString();
+  EXPECT_THAT(upstream_body, HasSubstr("prompts/get"));
+  EXPECT_THAT(upstream_body, HasSubstr("user-prompt"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── PN4. prompts/get with no identity header → 401 ───────────────────────────
+//
+// "prompts/get" is not in the default allow-list. A missing identity header
+// is still rejected at step 2 before any policy is evaluated.
+
+TEST_P(McpAuthPromptNameIntegrationTest, PromptGetMissingIdentityRejects401) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"pn4","method":"prompts/get","params":{"name":"user-prompt"}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("401", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32001"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"pn4\""));
 }
 
 } // namespace

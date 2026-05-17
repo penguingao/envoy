@@ -51,6 +51,11 @@ public:
   PayloadRef store(std::string data,       PayloadKind kind) override;
   PayloadRef store(Buffer::Instance& data, PayloadKind kind) override;
 
+  // Opens a streaming write session. Each append() writes directly into the
+  // mmap region; finalize() returns External{start_offset, total} for large
+  // payloads or Inline for payloads at or below max_inline_bytes.
+  std::unique_ptr<StreamWriter> beginStore(PayloadKind kind) override;
+
   // Synchronous. External refs are read directly from the mmap region.
   void fetch(const PayloadRef& ref, FetchCallback cb) override;
 
@@ -63,6 +68,20 @@ public:
 
   // Total bytes written to the backing file. Exposed for testing.
   size_t bytesWritten() const { return write_offset_; }
+
+  // Streaming writer that appends directly into the mmap region.
+  class MmapStreamWriter : public StreamWriter {
+  public:
+    MmapStreamWriter(MmapPayloadStore& store, PayloadKind kind);
+    void       append(absl::string_view bytes) override;
+    PayloadRef finalize() override;
+
+  private:
+    MmapPayloadStore& store_;
+    size_t            start_offset_;
+    size_t            total_written_{0};
+    bool              failed_{false};
+  };
 
 private:
   // Ensures at least `needed` additional bytes are available in the mapping.
@@ -79,6 +98,8 @@ private:
   size_t   capacity_{0};
   size_t   write_offset_{0};
   size_t   max_inline_bytes_;
+
+  friend class MmapStreamWriter;
 };
 
 } // namespace Codec

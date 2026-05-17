@@ -103,22 +103,22 @@ private:
   enum class DecodeState {
     AwaitingHeaders,
     BodilessComplete,     // no body expected; AiRequest fully populated by onHeaders
-    ParsingInferenceBody, // accumulating REST-JSON body bytes
-    ParsingAgentBody,     // buffering JSON-RPC body for end-of-stream parse
+    ParsingInferenceBody, // streaming REST-JSON body through incremental tokenizer
+    ParsingAgentBody,     // streaming JSON-RPC body through incremental tokenizer
     BodyComplete,         // onEndStream done; take() is valid
     Error,
   };
 
   // ── Inner body parsers (defined in request_decoder.cc) ────────────────────
 
-  // Accumulates the full inference JSON body in a buffer and parses it at
-  // onEndStream using Json::Factory::loadFromString. Extracts scalar sampling
-  // params, and stores each messages/tools element as a PayloadRef.
+  // Incrementally parses the inference JSON body as chunks arrive using a
+  // custom streaming tokenizer. Extracts scalar sampling params per chunk;
+  // streams messages[]/tools[] elements directly into the PayloadStore.
   class InferenceBodyParser;
 
-  // Buffers the full JSON-RPC body and parses it at onEndStream using
-  // nlohmann::json. Extracts the envelope (id, method), re-classifies with
-  // rpc_method to determine AgentInvocation, and populates AgentPayload params.
+  // Incrementally parses the JSON-RPC body as chunks arrive. Extracts the
+  // envelope (id, method) and captures the params object via streaming capture
+  // for later json::parse() in finish().
   class AgentBodyParser;
 
   // ── Helpers ────────────────────────────────────────────────────────────────

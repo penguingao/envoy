@@ -111,6 +111,17 @@ private:
 
 using FetchCallback = std::function<void(Buffer::InstancePtr)>;
 
+// StreamWriter allows bytes to be appended to a PayloadStore entry
+// incrementally rather than supplying the full content upfront. Call
+// append() for each chunk, then finalize() once to obtain the PayloadRef.
+// A StreamWriter instance must not outlive the PayloadStore that created it.
+class StreamWriter {
+public:
+  virtual ~StreamWriter() = default;
+  virtual void append(absl::string_view bytes) = 0;
+  virtual PayloadRef finalize() = 0;
+};
+
 // PayloadStore manages the lifecycle of large field values.
 class PayloadStore {
 public:
@@ -118,6 +129,10 @@ public:
 
   virtual PayloadRef store(std::string data, PayloadKind kind) = 0;
   virtual PayloadRef store(Buffer::Instance& data, PayloadKind kind) = 0;
+
+  // Open a streaming write session. append() the bytes as they arrive,
+  // then call finalize() to commit and obtain the PayloadRef.
+  virtual std::unique_ptr<StreamWriter> beginStore(PayloadKind kind) = 0;
 
   // Materializes a ref back into a Buffer::Instance via callback (may be
   // synchronous for Inline/Buffered; async for External backends).
@@ -159,6 +174,8 @@ public:
     buf->move(data);
     return PayloadRef::makeBuffered(std::move(buf));
   }
+
+  std::unique_ptr<StreamWriter> beginStore(PayloadKind kind) override;
 
   void fetch(const PayloadRef& ref, FetchCallback cb) override {
     if (ref.empty()) {

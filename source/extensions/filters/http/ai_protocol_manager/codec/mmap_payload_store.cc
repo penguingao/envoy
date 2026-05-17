@@ -127,6 +127,48 @@ PayloadRef MmapPayloadStore::store(Buffer::Instance& data, PayloadKind /*kind*/)
   return PayloadRef::makeExternal(off, len);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MmapStreamWriter
+// ─────────────────────────────────────────────────────────────────────────────
+
+MmapPayloadStore::MmapStreamWriter::MmapStreamWriter(MmapPayloadStore& store, PayloadKind /*kind*/)
+    : store_(store), start_offset_(store.write_offset_) {}
+
+void MmapPayloadStore::MmapStreamWriter::append(absl::string_view bytes) {
+  if (failed_ || bytes.empty()) {
+    return;
+  }
+  if (store_.fd_ == -1 || !store_.ensureSpace(bytes.size())) {
+    failed_ = true;
+    return;
+  }
+  store_.appendBytes(bytes.data(), bytes.size());
+  total_written_ += bytes.size();
+}
+
+PayloadRef MmapPayloadStore::MmapStreamWriter::finalize() {
+  if (failed_ || store_.fd_ == -1) {
+    // mmap unavailable; read back whatever was written to a heap buffer.
+    auto buf = std::make_unique<Buffer::OwnedImpl>();
+    if (!failed_ && total_written_ > 0) {
+      buf->add(store_.map_ + start_offset_, total_written_);
+    }
+    return PayloadRef::makeBuffered(std::move(buf));
+  }
+  if (total_written_ <= store_.max_inline_bytes_) {
+    // Small enough to be inline: copy back from the mmap region.
+    // The arena space is intentionally left allocated (not reclaimed) —
+    // the waste is bounded by max_inline_bytes_ and avoids complexity.
+    return PayloadRef::makeInline(
+        std::string(reinterpret_cast<char*>(store_.map_ + start_offset_), total_written_));
+  }
+  return PayloadRef::makeExternal(static_cast<uint64_t>(start_offset_), total_written_);
+}
+
+std::unique_ptr<StreamWriter> MmapPayloadStore::beginStore(PayloadKind kind) {
+  return std::make_unique<MmapStreamWriter>(*this, kind);
+}
+
 void MmapPayloadStore::fetch(const PayloadRef& ref, FetchCallback cb) {
   if (ref.empty()) {
     cb(nullptr);

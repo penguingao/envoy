@@ -86,12 +86,15 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
 
 // ── decodeData ────────────────────────────────────────────────────────────────
 //
-// Body parse failures fall through to upstream (non_ai_traffic_ = true +
-// Continue) rather than rejecting with 400. This handles false positives from
-// the header-only classifier: e.g. a webhook POST application/json that was
-// tentatively classified as AgenticMcp but whose body is not JSON-RPC.
-// Returning Continue from StopSingleIteration state causes the FM to deliver
-// headers + data to subsequent filters via commonContinue().
+// Body parse errors are rejected with 400. This differs from header-phase
+// classification failures (which fall through) because a parse error here
+// means the classifier already committed to a protocol and the body violates
+// that protocol's schema — e.g. duplicate JSON keys used for key-smuggling.
+//
+// The webhook false-positive case (valid application/json body that is not
+// JSON-RPC) is handled separately: such bodies parse successfully with no
+// error; the fall-through happens later in onEndStreamAndDispatch() when
+// rpc_method is found to be empty.
 
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data,
                                                            bool end_stream) {
@@ -100,11 +103,12 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
   }
   auto status = decoder_.onData(data.toString());
   if (!status.ok()) {
-    ENVOY_STREAM_LOG(debug, "ai_protocol_manager: body decode failed, passing through: {}",
+    ENVOY_STREAM_LOG(debug, "ai_protocol_manager: body decode error, rejecting: {}",
                      *decoder_callbacks_, status.message());
-    config_->stats().rq_classify_unknown_.inc();
-    non_ai_traffic_ = true;
-    return Http::FilterDataStatus::Continue;
+    config_->stats().rq_decode_error_.inc();
+    decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, status.message(),
+                                       nullptr, absl::nullopt, "");
+    return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
   if (end_stream) {
