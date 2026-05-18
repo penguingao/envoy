@@ -1,4 +1,4 @@
-# Request Decoder & Payload Store — AI Protocol Manager Codec
+# AI Protocol Parsing
 
 ## Motivation
 
