@@ -43,16 +43,22 @@ public:
   struct Handler {
     virtual ~Handler() = default;
     // depth_ is already incremented inside the handler before these return.
-    virtual bool onKey(absl::string_view key)  = 0;
-    virtual bool onString(absl::string_view v) = 0;
-    virtual bool onInt(int64_t v)              = 0;
-    virtual bool onFloat(double v)             = 0;
-    virtual bool onBool(bool v)                = 0;
-    virtual bool onNull()                      = 0;
-    virtual bool onStartObject()               = 0;
-    virtual bool onEndObject()                 = 0;
-    virtual bool onStartArray()                = 0;
-    virtual bool onEndArray()                  = 0;
+    // String values use three-phase streaming: onStringStart fires on the
+    // opening quote, onStringChunk fires for each batch of decoded bytes
+    // (plain bytes in bulk, escape sequences one char at a time), and
+    // onStringEnd fires on the closing quote.  No accumulation in token_buf_.
+    virtual bool onKey(absl::string_view key)           = 0;
+    virtual bool onStringStart()                         = 0;
+    virtual bool onStringChunk(absl::string_view chunk)  = 0;
+    virtual bool onStringEnd()                           = 0;
+    virtual bool onInt(int64_t v)                        = 0;
+    virtual bool onFloat(double v)                       = 0;
+    virtual bool onBool(bool v)                          = 0;
+    virtual bool onNull()                                = 0;
+    virtual bool onStartObject()                         = 0;
+    virtual bool onEndObject()                           = 0;
+    virtual bool onStartArray()                          = 0;
+    virtual bool onEndArray()                            = 0;
   };
 
   explicit IncrementalJsonTokenizer(Handler& h) : handler_(h) {}
@@ -76,7 +82,8 @@ public:
   absl::Status feed(absl::string_view chunk);
   absl::Status finish(); // error if parse is incomplete at end of input
 
-  int depth() const { return depth_; }
+  int    depth()          const { return depth_; }
+  size_t currentFeedPos() const { return current_feed_pos_; }
 
 private:
   enum class ParseState {
@@ -116,12 +123,33 @@ private:
   int   cap_depth_counter_{0};
   bool  cap_in_string_{false};
   bool  cap_in_escape_{false};
+
+  // Index of the byte currently being processed within the active feed() chunk.
+  // Updated at the top of every feed() loop iteration so handler callbacks can
+  // read it to compute the byte's absolute position in the body stream.
+  size_t current_feed_pos_{0};
 };
 
 // ─── feed / finish ───────────────────────────────────────────────────────────
 
 absl::Status IncrementalJsonTokenizer::feed(absl::string_view chunk) {
   for (size_t i = 0; i < chunk.size(); ) {
+    current_feed_pos_ = i;
+    // Batch-scan plain string bytes to avoid per-byte virtual dispatch.
+    if (state_ == ParseState::InStringValue) {
+      size_t j = i;
+      while (j < chunk.size() &&
+             static_cast<unsigned char>(chunk[j]) >= 0x20 &&
+             chunk[j] != '"' && chunk[j] != '\\') {
+        ++j;
+      }
+      if (j > i) {
+        if (!handler_.onStringChunk(chunk.substr(i, j - i)))
+          return absl::InvalidArgumentError("handler error in onStringChunk");
+        i = j;
+        continue;
+      }
+    }
     bool reprocess = false;
     auto s = processByte(static_cast<unsigned char>(chunk[i]), reprocess);
     if (!s.ok()) return s;
@@ -230,7 +258,8 @@ absl::Status IncrementalJsonTokenizer::processByte(unsigned char c, bool& reproc
         return absl::InvalidArgumentError("handler error in onEndArray");
       state_ = (depth_ == 0) ? ParseState::Done : ParseState::ExpectCommaOrClose;
     } else if (c == '"') {
-      token_buf_.clear();
+      if (!handler_.onStringStart())
+        return absl::InvalidArgumentError("handler error in onStringStart");
       state_ = ParseState::InStringValue;
     } else if (c == '-' || std::isdigit(c)) {
       token_buf_.clear();
@@ -344,48 +373,61 @@ absl::Status IncrementalJsonTokenizer::processByte(unsigned char c, bool& reproc
   // ── Value string ─────────────────────────────────────────────────────────
   case ParseState::InStringValue:
     if (c == '"') {
-      if (!handler_.onString(token_buf_))
-        return absl::InvalidArgumentError("handler error in onString");
-      token_buf_.clear();
+      if (!handler_.onStringEnd())
+        return absl::InvalidArgumentError("handler error in onStringEnd");
       state_ = ParseState::ExpectCommaOrClose;
     } else if (c == '\\') {
       state_ = ParseState::InStringEscape;
     } else if (c >= 0x20) {
-      token_buf_.push_back(static_cast<char>(c));
+      // Single byte (the batch path in feed() handles runs; this handles
+      // the final byte before a special character).
+      const char ch = static_cast<char>(c);
+      if (!handler_.onStringChunk({&ch, 1}))
+        return absl::InvalidArgumentError("handler error in onStringChunk");
     } else {
       return absl::InvalidArgumentError("control character inside string value");
     }
     break;
 
-  case ParseState::InStringEscape:
+  case ParseState::InStringEscape: {
+    // Resolve escape and fire the decoded byte(s) as a chunk.  For \uXXXX
+    // the escape prefix is fired here and each hex digit in InStringUnicode,
+    // preserving the sequence verbatim so callers get byte-identical output.
+    char out;
     switch (c) {
-    case '"':  token_buf_.push_back('"');  break;
-    case '\\': token_buf_.push_back('\\'); break;
-    case '/':  token_buf_.push_back('/');  break;
-    case 'b':  token_buf_.push_back('\b'); break;
-    case 'f':  token_buf_.push_back('\f'); break;
-    case 'n':  token_buf_.push_back('\n'); break;
-    case 'r':  token_buf_.push_back('\r'); break;
-    case 't':  token_buf_.push_back('\t'); break;
-    case 'u':
-      // Preserve the \uXXXX sequence verbatim in token_buf_ so callers
-      // receive the escape rather than a decoded codepoint.  This keeps
-      // stop sequences byte-identical to the original request body.
-      token_buf_.push_back('\\');
-      token_buf_.push_back('u');
+    case '"':  out = '"';  break;
+    case '\\': out = '\\'; break;
+    case '/':  out = '/';  break;
+    case 'b':  out = '\b'; break;
+    case 'f':  out = '\f'; break;
+    case 'n':  out = '\n'; break;
+    case 'r':  out = '\r'; break;
+    case 't':  out = '\t'; break;
+    case 'u': {
+      const char seq[2] = {'\\', 'u'};
+      if (!handler_.onStringChunk({seq, 2}))
+        return absl::InvalidArgumentError("handler error in onStringChunk");
       unicode_count_ = 0;
       state_ = ParseState::InStringUnicode;
       return absl::OkStatus();
+    }
     default:
       return absl::InvalidArgumentError("invalid escape in string value");
     }
+    if (!handler_.onStringChunk({&out, 1}))
+      return absl::InvalidArgumentError("handler error in onStringChunk");
     state_ = ParseState::InStringValue;
     break;
+  }
 
   case ParseState::InStringUnicode:
     if (!std::isxdigit(c))
       return absl::InvalidArgumentError("non-hex digit in \\uXXXX escape");
-    token_buf_.push_back(static_cast<char>(c));
+    {
+      const char ch = static_cast<char>(c);
+      if (!handler_.onStringChunk({&ch, 1}))
+        return absl::InvalidArgumentError("handler error in onStringChunk");
+    }
     if (++unicode_count_ == 4) {
       unicode_count_ = 0;
       state_ = ParseState::InStringValue;
@@ -562,6 +604,13 @@ private:
     bool seen_seed_{false};
     bool seen_stop_{false};
 
+    // ── string streaming state ──
+    // str_target_ points to the field being accumulated (null = discard).
+    // string_val_ is a scratch buffer reused for stop strings; model_ is
+    // accumulated directly since it has its own field.
+    std::string* str_target_{nullptr};
+    std::string  string_val_;
+
     // ── element capture state ──
     bool                         is_capturing_{false};
     int                          capture_depth_{0};
@@ -668,14 +717,30 @@ private:
       return true;
     }
 
-    bool onString(absl::string_view v) override {
+    bool onStringStart() override {
+      str_target_ = nullptr;
       if (depth_ == 1 && current_key_ == "model") {
-        model_ = std::string(v);
-      } else if (depth_ == 1 && current_key_ == "stop") {
-        sampling_.stop.push_back(std::string(v)); // stop as a scalar string
-      } else if (depth_ == 2 && in_stop_array_) {
-        sampling_.stop.push_back(std::string(v)); // stop as an array element
+        model_.clear();
+        str_target_ = &model_;
+      } else if ((depth_ == 1 && current_key_ == "stop") ||
+                 (depth_ == 2 && in_stop_array_)) {
+        string_val_.clear();
+        str_target_ = &string_val_;
       }
+      return true;
+    }
+
+    bool onStringChunk(absl::string_view chunk) override {
+      if (str_target_) str_target_->append(chunk);
+      return true;
+    }
+
+    bool onStringEnd() override {
+      if (str_target_ == &string_val_) {
+        sampling_.stop.push_back(std::move(string_val_));
+        string_val_.clear();
+      }
+      str_target_ = nullptr;
       return true;
     }
 
@@ -742,6 +807,7 @@ public:
       residual_writer_ = store_.beginStore(PayloadKind::JsonObject);
     }
     residual_writer_->append(chunk);
+    chunk_base_ = total_bytes_ - chunk.size();
     auto s = tokenizer_.feed(chunk);
     if (!s.ok() && handler_.has_error_) {
       return absl::InvalidArgumentError(handler_.error_);
@@ -773,17 +839,53 @@ public:
     }
 
     if (handler_.params_captured_) {
+      // Tier 1: use nlohmann to extract routing fields from the captured params JSON.
       std::string params_json = std::move(handler_.params_buf_);
       const json params = json::parse(params_json, nullptr, /*allow_exceptions=*/false);
       if (!params.is_discarded()) {
         populateParams(params, payload, store_);
       }
       payload.params_raw = store_.store(std::move(params_json), PayloadKind::JsonObject);
+    } else if (handler_.params_seen_) {
+      // Tier 2: routing fields were extracted via streaming callbacks during parse.
+      populateParamsFromFields(handler_, payload);
     }
 
     if (residual_writer_) {
       payload.residual_params = residual_writer_->finalize();
     }
+
+    // Tier 2: params_raw as a sub-range of residual_params.
+    //
+    // params_byte_start_ / params_byte_end_ record the exact byte offsets of
+    // the params container within the full body (set by AgentHandler during
+    // the Tier 2 semantic parse).  Creating a sub-range costs nothing for
+    // MmapPayloadStore (External ref = {offset, length} pair) and does a small
+    // substring copy for InMemoryPayloadStore (used only in tests).
+    //
+    // This populates params_raw for all Tier 2 invocations — both Category A
+    // (ToolsCall) and Category B (Initialize, Ping, A2A) — so that subsequent
+    // chain filters always have access to the raw params content.
+    if (!handler_.params_captured_ && handler_.params_seen_ &&
+        params_byte_end_ > params_byte_start_) {
+      const size_t pstart = params_byte_start_;
+      const size_t plen   = params_byte_end_ - params_byte_start_;
+
+      if (payload.residual_params.storage() == PayloadRef::Storage::External) {
+        // MmapPayloadStore: zero-cost pointer into the already-mapped region.
+        payload.params_raw = PayloadRef::makeExternal(
+            payload.residual_params.externalOffset() + pstart, plen);
+      } else if (!payload.residual_params.empty()) {
+        // InMemoryPayloadStore: extract the params substring.
+        std::string full = payload.residual_params.toString();
+        if (pstart < full.size()) {
+          payload.params_raw = store_.store(
+              full.substr(pstart, std::min(plen, full.size() - pstart)),
+              PayloadKind::JsonObject);
+        }
+      }
+    }
+
     return absl::OkStatus();
   }
 
@@ -802,8 +904,8 @@ private:
 
     std::string id_;
     std::string method_;
-    bool        params_captured_{false};
-    std::string params_buf_;
+    bool        params_captured_{false};  // Tier 1: capture mode completed
+    std::string params_buf_;              // Tier 1: captured params JSON
     bool        has_error_{false};
     std::string error_;
 
@@ -816,9 +918,38 @@ private:
     bool seen_method_{false};
     bool seen_params_{false};
 
+    // ── Tier 1 params capture ──
     bool        capturing_params_{false};
     int         params_capture_depth_{0};
     StringStreamWriter params_writer_;
+
+    // ── Tier 2 semantic params parsing ──
+    // Set when the "params" key/value is entered regardless of tier.
+    // In Tier 1 capture mode fires immediately; in Tier 2 we parse semantically.
+    bool        params_seen_{false};
+    bool        in_params_{false};    // true while inside the params container
+    int         params_depth_{0};     // handler depth_ when we entered params
+    std::string params_key_;          // current key inside params (when in_params_)
+
+    // Routing fields extracted from params in Tier 2 (and optionally Tier 1).
+    std::string params_name_;         // "name" field  (ToolsCall, PromptsGet)
+    std::string params_uri_;          // "uri"  field  (Resources*)
+    std::string params_ref_;          // "ref"  field  (CompletionComplete)
+
+    // Object/array fields captured inside params (Tier 1 only for Tier 2 bodies;
+    // captureEnabled() gates startCapture so these are empty when body is large).
+    PayloadRef  params_arguments_;
+    PayloadRef  params_capabilities_;
+
+    // Active capture for a single params sub-field (arguments / capabilities).
+    bool                          capturing_param_field_{false};
+    int                           param_field_depth_{0};
+    std::unique_ptr<StreamWriter> param_field_writer_;
+    enum class ParamField { None, Arguments, Capabilities } current_param_field_{ParamField::None};
+
+    // String streaming: str_target_ is set to the field to accumulate (null = discard).
+    std::string* str_target_{nullptr};
+    std::string  string_val_;  // scratch for short string fields
 
     AgentBodyParser& parser_;
 
@@ -828,33 +959,89 @@ private:
 
     bool onStartObject() override {
       ++depth_;
-      if (!capturing_params_ && captureEnabled() &&
-          depth_ == 2 && current_key_ == "params") {
-        capturing_params_    = true;
-        params_capture_depth_ = depth_;
-        parser_.tokenizer_.startCapture(params_writer_);
+      if (depth_ == 2 && current_key_ == "params") {
+        params_seen_ = true;
+        if (captureEnabled()) {
+          // Tier 1: capture verbatim for params_raw + nlohmann extraction in finish().
+          capturing_params_     = true;
+          params_capture_depth_ = depth_;
+          parser_.tokenizer_.startCapture(params_writer_);
+          return true;
+        }
+        // Tier 2: parse params semantically.
+        in_params_    = true;
+        params_depth_ = depth_;
+        parser_.params_byte_start_ = parser_.currentBodyPos();
+        return true;
+      }
+      // Inside params in Tier 2: capture arguments/capabilities if small enough.
+      if (in_params_ && !capturing_param_field_ && depth_ == params_depth_ + 1) {
+        if (params_key_ == "arguments" || params_key_ == "capabilities") {
+          if (captureEnabled()) {
+            capturing_param_field_ = true;
+            param_field_depth_     = depth_;
+            current_param_field_   = (params_key_ == "arguments")
+                                         ? ParamField::Arguments
+                                         : ParamField::Capabilities;
+            param_field_writer_ = parser_.store_.beginStore(PayloadKind::JsonObject);
+            parser_.tokenizer_.startCapture(*param_field_writer_);
+          }
+        }
       }
       return true;
     }
 
     bool onEndObject() override {
+      // Tier 1 params capture close.
       if (capturing_params_ && depth_ == params_capture_depth_) {
         capturing_params_ = false;
         params_captured_  = true;
         params_buf_       = std::move(params_writer_.buf);
       }
+      // Tier 2 param sub-field capture close.
+      if (capturing_param_field_ && depth_ == param_field_depth_) {
+        capturing_param_field_ = false;
+        PayloadRef ref = param_field_writer_->finalize();
+        param_field_writer_.reset();
+        if (current_param_field_ == ParamField::Arguments)
+          params_arguments_ = std::move(ref);
+        else if (current_param_field_ == ParamField::Capabilities)
+          params_capabilities_ = std::move(ref);
+        current_param_field_ = ParamField::None;
+      }
       --depth_;
+      if (in_params_ && depth_ < params_depth_) {
+        parser_.params_byte_end_ = parser_.currentBodyPos() + 1;
+        in_params_ = false;
+      }
       return true;
     }
 
     bool onStartArray() override {
       ++depth_;
       // params may be an array per JSON-RPC spec (positional arguments).
-      if (!capturing_params_ && captureEnabled() &&
-          depth_ == 2 && current_key_ == "params") {
-        capturing_params_    = true;
-        params_capture_depth_ = depth_;
-        parser_.tokenizer_.startCapture(params_writer_);
+      if (depth_ == 2 && current_key_ == "params") {
+        params_seen_ = true;
+        if (captureEnabled()) {
+          capturing_params_     = true;
+          params_capture_depth_ = depth_;
+          parser_.tokenizer_.startCapture(params_writer_);
+          return true;
+        }
+        in_params_    = true;
+        params_depth_ = depth_;
+        parser_.params_byte_start_ = parser_.currentBodyPos();
+        return true;
+      }
+      // Array-valued "arguments" inside params in Tier 2.
+      if (in_params_ && !capturing_param_field_ && depth_ == params_depth_ + 1) {
+        if (params_key_ == "arguments" && captureEnabled()) {
+          capturing_param_field_ = true;
+          param_field_depth_     = depth_;
+          current_param_field_   = ParamField::Arguments;
+          param_field_writer_    = parser_.store_.beginStore(PayloadKind::JsonArray);
+          parser_.tokenizer_.startCapture(*param_field_writer_);
+        }
       }
       return true;
     }
@@ -865,7 +1052,19 @@ private:
         params_captured_  = true;
         params_buf_       = std::move(params_writer_.buf);
       }
+      if (capturing_param_field_ && depth_ == param_field_depth_) {
+        capturing_param_field_ = false;
+        PayloadRef ref = param_field_writer_->finalize();
+        param_field_writer_.reset();
+        if (current_param_field_ == ParamField::Arguments)
+          params_arguments_ = std::move(ref);
+        current_param_field_ = ParamField::None;
+      }
       --depth_;
+      if (in_params_ && depth_ < params_depth_) {
+        parser_.params_byte_end_ = parser_.currentBodyPos() + 1;
+        in_params_ = false;
+      }
       return true;
     }
 
@@ -887,15 +1086,34 @@ private:
         }
 
         current_key_ = key;
+      } else if (in_params_ && depth_ == params_depth_) {
+        // Keys inside the params object (Tier 2 semantic parsing).
+        params_key_ = key;
       }
       return true;
     }
 
-    bool onString(absl::string_view v) override {
+    bool onStringStart() override {
+      str_target_ = nullptr;
       if (depth_ == 1) {
-        if      (current_key_ == "id")     id_     = std::string(v);
-        else if (current_key_ == "method") method_ = std::string(v);
+        if      (current_key_ == "id")     { id_.clear();     str_target_ = &id_; }
+        else if (current_key_ == "method") { method_.clear(); str_target_ = &method_; }
+      } else if (in_params_ && depth_ == params_depth_) {
+        // Short string fields inside params — only set target for known routing fields.
+        if      (params_key_ == "name") { params_name_.clear(); str_target_ = &params_name_; }
+        else if (params_key_ == "uri")  { params_uri_.clear();  str_target_ = &params_uri_; }
+        else if (params_key_ == "ref")  { params_ref_.clear();  str_target_ = &params_ref_; }
       }
+      return true;
+    }
+
+    bool onStringChunk(absl::string_view chunk) override {
+      if (str_target_) str_target_->append(chunk);
+      return true;
+    }
+
+    bool onStringEnd() override {
+      str_target_ = nullptr;
       return true;
     }
 
@@ -913,6 +1131,37 @@ private:
     bool onBool(bool /*v*/) override { return true; }
     bool onNull()           override { return true; }
   };
+
+  // Populate payload routing fields from the semantically-parsed params fields
+  // extracted by AgentHandler in Tier 2 (no nlohmann, no params_raw).
+  static void populateParamsFromFields(AgentHandler& h, AgentPayload& payload) {
+    switch (payload.invocation) {
+    case AgentInvocation::ToolsCall:
+      payload.tool_name = std::move(h.params_name_);
+      if (!h.params_arguments_.empty())
+        payload.arguments = std::move(h.params_arguments_);
+      break;
+    case AgentInvocation::ResourcesRead:
+    case AgentInvocation::ResourcesSubscribe:
+    case AgentInvocation::ResourcesUnsubscribe:
+      payload.resource_uri = std::move(h.params_uri_);
+      break;
+    case AgentInvocation::PromptsGet:
+      payload.prompt_name = std::move(h.params_name_);
+      if (!h.params_arguments_.empty())
+        payload.arguments = std::move(h.params_arguments_);
+      break;
+    case AgentInvocation::CompletionComplete:
+      payload.completion_ref = std::move(h.params_ref_);
+      break;
+    case AgentInvocation::Initialize:
+      if (!h.params_capabilities_.empty())
+        payload.capabilities = std::move(h.params_capabilities_);
+      break;
+    default:
+      break;
+    }
+  }
 
   static void populateParams(const json& params, AgentPayload& payload, PayloadStore& store) {
     auto str = [&](const char* k) -> std::string {
@@ -947,12 +1196,22 @@ private:
     }
   }
 
+  // currentBodyPos() returns the absolute byte offset within the full body of
+  // the byte currently being processed by the tokenizer.  Valid only while
+  // inside tokenizer_.feed() (i.e., during handler callbacks).
+  size_t currentBodyPos() const {
+    return chunk_base_ + tokenizer_.currentFeedPos();
+  }
+
   const Http::RequestHeaderMap& headers_;
   const std::string             http_method_;
   const std::string             path_;
   const DecoderConfig&          config_;
   PayloadStore&                 store_;
   size_t                        total_bytes_{0};
+  size_t                        chunk_base_{0};      // absolute offset of current chunk start
+  size_t                        params_byte_start_{0}; // body offset of params '{' or '['
+  size_t                        params_byte_end_{0};   // body offset one past params '}' or ']'
   AgentHandler                  handler_;        // must be before tokenizer_
   IncrementalJsonTokenizer      tokenizer_;
   std::unique_ptr<StreamWriter> residual_writer_;

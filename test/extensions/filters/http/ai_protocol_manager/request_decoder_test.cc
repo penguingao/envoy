@@ -253,7 +253,11 @@ TEST_F(AgentDecoderTest, SmallBody_ParamsCaptured) {
   EXPECT_EQ("search", payload->tool_name);
 }
 
-// Tier 2: body > soft limit → scalars extracted, params NOT captured.
+// Tier 2: body > soft limit → scalars extracted, params NOT captured via
+// startCapture.  Routing fields (tool_name) are extracted via streaming
+// callbacks.  params_raw is now populated as a byte-range sub-range of the
+// residual body — zero-cost for MmapPayloadStore; substring copy for
+// InMemoryPayloadStore (test backend).
 TEST_F(AgentDecoderTest, LargeBody_ScalarsOnlyNoParams) {
   // Prefix ~86 bytes; 80-char argument → ~171 bytes total.
   const std::string large_arg(80, 'y');
@@ -273,9 +277,74 @@ TEST_F(AgentDecoderTest, LargeBody_ScalarsOnlyNoParams) {
   // Top-level scalar method still extracted.
   EXPECT_EQ("tools/call", result->rpc_method);
 
-  // Params capture skipped — params_raw empty, tool_name not populated.
-  EXPECT_TRUE(payload->params_raw.empty());
-  EXPECT_TRUE(payload->tool_name.empty());
+  // tool_name extracted via Tier 2 semantic parse of params.
+  EXPECT_EQ("search", payload->tool_name);
+  // arguments not captured (body > soft limit).
+  EXPECT_TRUE(payload->arguments.empty());
+
+  // params_raw now populated via byte-range sub-range of the residual body.
+  EXPECT_FALSE(payload->params_raw.empty());
+  // Content must start with '{' and contain the name field.
+  const std::string params_str = payload->params_raw.toString();
+  EXPECT_EQ('{', params_str.front());
+  EXPECT_EQ('}', params_str.back());
+  EXPECT_NE(std::string::npos, params_str.find("search"));
+}
+
+// Tier 2: Category B (initialize) body > soft limit → params_raw populated
+// via byte-range even though startCapture was skipped.  This is the core fix:
+// subsequent filters can access full params content for Category B invocations
+// regardless of body size.
+TEST_F(AgentDecoderTest, Tier2_CategoryB_ParamsRawPopulated) {
+  // Build a Tier 2 body: initialize method with clientInfo padding to push
+  // total size past kSoftLimit while keeping params content itself small.
+  const std::string padding(60, 'x');
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":1,"method":"initialize",)"
+      R"("params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":")" +
+      padding + R"("}}})" ;
+  ASSERT_GT(body.size(), kSoftLimit);
+  ASSERT_LT(body.size(), kHardLimit);
+
+  auto result = runDecoder(dec_, kAgentHeaders, body);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  const auto* payload = result->as_agent();
+  ASSERT_NE(nullptr, payload);
+
+  EXPECT_EQ("initialize", result->rpc_method);
+
+  // params_raw populated as byte-range sub-range of residual body.
+  EXPECT_FALSE(payload->params_raw.empty());
+  const std::string params_str = payload->params_raw.toString();
+  EXPECT_EQ('{', params_str.front());
+  EXPECT_EQ('}', params_str.back());
+  EXPECT_NE(std::string::npos, params_str.find("protocolVersion"));
+  EXPECT_NE(std::string::npos, params_str.find("2024-11-05"));
+}
+
+// Tier 2: verify params_raw content is exactly the params object from the body.
+TEST_F(AgentDecoderTest, Tier2_CategoryB_ParamsRawContent) {
+  // Construct body so we know the exact expected params substring.
+  const std::string padding(60, 'z');
+  const std::string expected_params =
+      R"({"protocolVersion":"2024-11-05","clientInfo":{"name":")" +
+      padding + R"("}})";
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":)" +
+      expected_params + R"(})";
+  ASSERT_GT(body.size(), kSoftLimit);
+  ASSERT_LT(body.size(), kHardLimit);
+
+  auto result = runDecoder(dec_, kAgentHeaders, body);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  const auto* payload = result->as_agent();
+  ASSERT_NE(nullptr, payload);
+  ASSERT_FALSE(payload->params_raw.empty());
+
+  // The extracted params_raw must exactly match the params object in the body.
+  EXPECT_EQ(expected_params, payload->params_raw.toString());
 }
 
 // Tier 3: body > hard limit → onData returns ResourceExhausted.
