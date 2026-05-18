@@ -336,217 +336,8 @@ for those elements. Scalar extraction at depth 1 is entirely unaffected.
 | Peak heap | O(1) — token_buf_ bounded by depth-1 scalars | ≈ largest string value anywhere in body (token_buf_) | ≤ one chunk |
 | Peak RSS | B + Σ elements (evictable mmap) | B (evictable mmap) + token_buf_ heap | ≤ one chunk |
 
-See [Peak Memory Analysis](#peak-memory-analysis) for the full breakdown by tier,
+See [Deep Memory Analysis](#deep-memory-analysis) for the full breakdown by tier,
 including the multimodal worst-case.
-
----
-
-## Peak Memory Analysis
-
-This section analyses both **heap** (process allocator, shows in `jemalloc` /
-`ASAN`) and **RSS** (total resident physical memory, including mmap pages).
-
-The mmap arena (`MAP_SHARED` backed by the unlinked temp file) is not heap — its
-pages are kernel page-cache that the OS can evict under memory pressure
-independently of `malloc`. They do count toward RSS once written to, because a
-write page-fault makes the page physically resident.
-
-### Old approach — nlohmann SAX
-
-#### The eager-lexer problem
-
-`nlohmann::json::sax_parse()` fully tokenizes each JSON value before calling any
-SAX callback. For string values this means allocating a `std::string` for the
-fully-unescaped content before `string()` is called — regardless of whether the
-handler keeps the value or immediately discards it. There is no way to intercept
-at the byte level through the public SAX API.
-
-For a multimodal inference request carrying a 10 MB base64-encoded image:
-
-```json
-{
-  "messages": [{
-    "role": "user",
-    "content": [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,<10MB>"}}]
-  }]
-}
-```
-
-Even with `capturing_element_ = true` (which makes the handler return `true`
-immediately), nlohmann has already allocated a ~13.3 MB `std::string` for the
-unescaped base64 value before the `string()` callback fires. That string is
-purely transient — it exists for exactly one callback invocation and is then
-destroyed.
-
-#### Precise peak sequence (old approach, Tier 1 element capture)
-
-The transient (`string()` callback) and the `sliceBuffer` result (element close)
-are **sequential, not simultaneous**. `sliceBuffer` only runs when the element's
-closing `}` is reached — after the transient for every value inside the element
-has already been freed:
-
-```
-time →
-
-[sax_parse encounters base64 string at depth ~6]
-  heap: body_buffer_ (B) + nlohmann transient (S)   ← peak A = B + S
-  transient freed immediately after string() returns
-
-[sax_parse encounters messages[0] closing `}` at depth 3]
-  heap: body_buffer_ (B) + sliceBuffer result (E)   ← peak B = B + E
-  sliceBuffer result handed to store_.store():
-    MmapPayloadStore: memcpy to mmap, string freed → heap drops back to B
-```
-
-Where `B` = body size, `S` = largest string value in the body, `E` = element size.
-For the single-message multimodal case, `S ≈ E ≈ B`, so both peaks are ≈ 2× body.
-They do not stack: **peak heap ≈ body + max(largest string value, largest element)**.
-
-For Tier 2 (no element capture), `sliceBuffer` is never called, leaving only:
-**peak heap ≈ body + largest string value**.
-
-| | Tier 1 (≤256 KB body) | Tier 2 (≤4 MB body) | Tier 3 (reject) |
-|---|---|---|---|
-| Heap | `B` + max(`S`, `E`) ≈ **2× body** | `B` + `S` ≈ **body + max string** | ≤ `max_body_bytes` |
-| RSS | same (all heap) | same | same |
-
-All of this memory is non-evictable heap.
-
-### New approach — incremental tokenizer
-
-Heap and RSS contributions are now independent, with behavior that differs between
-Tier 1 and Tier 2 because of how `captureEnabled()` gates InCapture mode.
-
-#### Tier 1 (body ≤ `max_element_capture_bytes`, default 256 KB)
-
-`captureEnabled()` returns `true`. When `messages[i]` or `tools[i]` opens at
-depth 3, `startCapture(*elem_writer_)` is called and the tokenizer enters
-`ParseState::InCapture`.
-
-In InCapture mode, `processByte()` skips all token-building paths entirely:
-`token_buf_` is not touched. Every byte goes directly to
-`elem_writer_->append()`, which writes into the mmap arena. No string is
-built for any value inside the captured element, regardless of its size or
-content.
-
-```
-heap contributors (Tier 1):
-  token_buf_       — holds the current scalar outside capture (model name, etc.)
-                     max = longest depth-1 string field, typically < 256 bytes
-  handler members  — model_, messages_ vector of PayloadRef (12 B each), sampling_
-                     < 1 KB total
-  writer structs   — residual_writer_ + elem_writer_, ~32 bytes each on heap
-
-RSS contributors (Tier 1):
-  residual mmap    — full body streamed via residual_writer_           = B
-  element mmap     — each captured element streamed via elem_writer_   = Σ E_i
-  total            — B + Σ E_i  (evictable page-cache)
-```
-
-**Peak heap Tier 1: < 2 KB, O(1) with respect to body or element size.**
-
-#### Tier 2 (body > `max_element_capture_bytes`, ≤ `max_body_bytes`)
-
-`captureEnabled()` returns `false`. When `messages[i]` opens at depth 3,
-`startCapture()` is **not** called. The tokenizer stays in normal mode and
-continues tokenizing content inside the element at all depths. This means
-`token_buf_` accumulates the full content of every string value encountered
-inside the element, including large ones like base64 images.
-
-This is the same per-string heap cost as the nlohmann transient — the mechanism
-differs (`token_buf_` vs nlohmann's internal string) but the heap scaling is
-identical: proportional to the largest string value in the body. The benefit in
-Tier 2 is that `body_buffer_` is eliminated — the full body is in evictable mmap
-page-cache rather than on heap.
-
-```
-heap contributors (Tier 2):
-  token_buf_       — grows to the largest string value in the body (anywhere in doc)
-                     max = S (may be large for multimodal)
-  handler members  — < 1 KB
-
-RSS contributors (Tier 2):
-  residual mmap    — full body streamed via residual_writer_    = B
-  no element mmap  — captureEnabled() false, no elem_writer_
-```
-
-**Peak heap Tier 2: ≈ `S` (largest string value) — body moved off heap, but per-string cost remains.**
-
-| | Tier 1 (≤256 KB body) | Tier 2 (≤4 MB body) | Tier 3 (reject) |
-|---|---|---|---|
-| Heap | < 2 KB (O(1)) | ≈ `S` (largest string value in body) | ≤ one chunk |
-| RSS (mmap) | `B` + Σ elements | `B` only | 0 |
-| RSS total | `B` + Σ elements | `B` + `S` | ≤ one chunk |
-| Heap OS-evictable | — | — | — |
-| RSS OS-evictable | yes (all page-cache) | yes (mmap portion) | n/a |
-
-### Multimodal worst-case walkthrough
-
-**Scenario**: single message carrying a 10 MB raw image, base64-encoded to ~13.3 MB.
-Total body ≈ 13.4 MB. Assume `max_body_bytes` is configured above this threshold;
-`max_element_capture_bytes` = 256 KB (default).
-
-Because body (13.4 MB) > `max_element_capture_bytes` (256 KB), this is **Tier 2**.
-With default `max_body_bytes` = 4 MB the request would be Tier 3 (rejected).
-
-```
-Old approach, Tier 2:
-
-  onData() chunks accumulated → body_buffer_ = 13.4 MB heap
-  finish() → sax_parse()
-    at base64 string (depth ~6):
-      nlohmann allocates 13.3 MB std::string transient         heap: 13.4 + 13.3 = 26.7 MB ← peak
-      string() callback: handler returns true (captureEnabled=false)
-      transient freed                                           heap: 13.4 MB
-    element close: no sliceBuffer (Tier 2)
-  body_buffer_ freed after finish()
-
-  Peak heap: 26.7 MB (body + transient)
-  Peak RSS:  26.7 MB (all non-evictable heap)
-
-New approach, Tier 2:
-
-  onData() chunks:
-    residual_writer_->append(chunk) → mmap arena              RSS:  grows to 13.4 MB (page-cache)
-    tokenizer_.feed(chunk):
-      captureEnabled()=false, no startCapture() at element open
-      tokenizer stays in normal mode inside messages[0]
-      at base64 string: token_buf_ accumulates 13.3 MB         heap: grows to 13.3 MB ← peak
-      onString(token_buf_): handler ignores (depth > 1, Tier 2)
-      token_buf_.clear()  — capacity retained at 13.3 MB
-  finish() → finalize residual_writer_ → PayloadRef::External
-
-  Peak heap: 13.3 MB (token_buf_ only — body is in mmap, not heap)
-  Peak RSS:  13.4 MB (mmap, evictable) + 13.3 MB (token_buf_, heap) = 26.7 MB
-```
-
-Summary for this scenario:
-
-| | Old (nlohmann, Tier 2) | New (tokenizer, Tier 2) |
-|---|---|---|
-| Body on heap | 13.4 MB | 0 (in mmap page-cache) |
-| Large-string transient on heap | 13.3 MB (nlohmann std::string) | 13.3 MB (token_buf_) |
-| Peak heap | **26.7 MB** | **13.3 MB** |
-| Peak RSS | 26.7 MB (non-evictable) | 26.7 MB (13.4 MB evictable + 13.3 MB heap) |
-
-The body is removed from heap (saving `B` = 13.4 MB of non-evictable heap), but
-the large-string heap cost is not eliminated in Tier 2 — it is replaced by
-`token_buf_` growth. Peak heap is halved; peak RSS is unchanged.
-
-### Side-by-side comparison
-
-| | Old (nlohmann SAX) | New (tokenizer, Tier 1) | New (tokenizer, Tier 2) |
-|---|---|---|---|
-| Body on heap | yes (`body_buffer_`) | no — mmap | no — mmap |
-| Large-string heap transient | yes (nlohmann eager lexer) | **no** — InCapture skips tokenization | yes (`token_buf_` grows) |
-| Per-element heap copy | yes (`sliceBuffer` string) | no — bytes go to mmap | n/a (no capture) |
-| Peak heap | `B` + max(`S`,`E`) ≈ 2× body | < 2 KB | ≈ `S` |
-| Peak RSS | same (all non-evictable heap) | `B` + Σ elements (evictable) | `B` + `S` (B evictable) |
-| Large-string problem eliminated | — | **yes**, via InCapture mode | no, `token_buf_` has same scaling |
-
-The large-string transient is fully eliminated only in **Tier 1**, where
-`captureEnabled()` is true and InCapture mode is active. In Tier 2 the body
-moves off heap (a meaningful improvement), but per-string heap scaling remains.
 
 ---
 
@@ -821,6 +612,8 @@ when memory pressure actually forces a page out.
 
 ## Full Request Workflow
 
+### Inference workload — `POST /v1/chat/completions`
+
 This section traces a complete `POST /v1/chat/completions` request from arrival
 to dispatch, showing exactly what happens at each stage with the incremental
 tokenizer and streaming store.
@@ -941,6 +734,192 @@ doDispatch()
 
 All `External` refs have been upgraded to `Buffered` by `prefetchExternalPayloadRefs`
 before `doDispatch()` runs. Encoders call `ref.toString()` with no mmap access.
+
+---
+
+### Agentic workload — `POST /mcp` (`tools/call`)
+
+This traces a complete MCP `tools/call` request from arrival to dispatch, showing
+where the agentic path diverges from inference.
+
+**Example request body:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "r1",
+  "method": "tools/call",
+  "params": {
+    "name": "read_file",
+    "arguments": {"path": "/etc/config.json"}
+  }
+}
+```
+
+#### Phase 1 — Headers (`decodeHeaders` → `onHeaders`)
+
+```
+decodeHeaders(headers, end_stream=false)
+  └─ RequestDecoder::onHeaders(headers)
+       ├─ classify(method="POST", path="/mcp", content-type="application/json")
+       │    → heuristic: POST + application/json → candidate ProtocolKind::AgenticMcp
+       │    (body needed to confirm — no rpc_method yet)
+       ├─ state_ = ParsingAgentBody
+       └─ AgentBodyParser constructed:
+            ├─ residual_writer_ = store_.beginStore(PayloadKind::ResidualParams)
+            │    → MmapStreamWriter{ start_offset_=0, total_written_=0 }
+            └─ IncrementalJsonTokenizer initialized, AgentHandler attached
+```
+
+Two classification passes are required. The first pass (headers-time) flags the
+request as a JSON-RPC candidate. The second pass (body-time, in `finish()`) pins
+the exact `AgentInvocation` once `rpc_method` is known.
+
+#### Phase 2 — Body chunks (`decodeData` → `onData`, called 1..N times)
+
+For each HTTP data frame:
+
+```
+decodeData(chunk, end_stream=false)
+  └─ RequestDecoder::onData(chunk)
+       └─ AgentBodyParser::feed(chunk)
+            ├─ check: total_bytes_ + chunk.size() ≤ max_body_bytes  [Tier 3 guard]
+            ├─ total_bytes_ += chunk.size()
+            ├─ residual_writer_->append(chunk)          ← streams to mmap arena
+            └─ tokenizer_.feed(chunk)
+                 └─ processByte(c, reprocess) for each byte c in chunk:
+                      ├─ [depth=1, key="jsonrpc"]  → AgentHandler::onKey("jsonrpc")
+                      │    → seen_jsonrpc_ = true
+                      ├─ [depth=1, string "2.0"]   → AgentHandler::onString("2.0")
+                      │    (version stored / validated)
+                      ├─ [depth=1, key="id"]       → seen_id_ = true
+                      ├─ [depth=1, string "r1"]    → handler_.id_ = "r1"
+                      ├─ [depth=1, key="method"]   → seen_method_ = true
+                      ├─ [depth=1, string "tools/call"]
+                      │    → handler_.rpc_method_ = "tools/call"
+                      ├─ [depth=1, key="params"]   → [if captureEnabled()]
+                      │    params_writer_ = StringStreamWriter{}  ← heap std::string
+                      │    tokenizer_.startCapture(*params_writer_)
+                      │    state_ = InCapture
+                      ├─ [InCapture bytes] → params_writer_->append({&c, 1})
+                      │    → StringStreamWriter appends into params_buf_ (heap string)
+                      └─ [InCapture end: cap_depth_counter_==0 on `}`]
+                           params_writer_->finalize()  [no-op; buf_ already in params_buf_]
+                           state_ = ExpectCommaOrClose
+```
+
+Unlike the inference path, `params` capture uses a `StringStreamWriter` (a
+lightweight `std::string` accumulator) rather than a `PayloadStore`-backed
+`StreamWriter`. The captured bytes must survive until `finish()` so they can be
+re-parsed by `nlohmann` for sub-field extraction. The heap cost is bounded by the
+size of the `params` object, not the full body.
+
+**Duplicate-key detection** fires inline. `AgentHandler::onKey()` checks `seen_*`
+bool flags for `jsonrpc`, `id`, `method`, and `params`. A second occurrence of any
+of these returns `false`, the tokenizer converts it to `InvalidArgument`, and
+`filter.cc::decodeData()` sends a 400 before any auth or routing runs.
+
+After each `onData()` returns:
+- `residual_writer_` holds all body bytes received so far in the mmap arena.
+- `handler_.rpc_method_` is populated as soon as the `"method"` string token
+  completes — which may happen before `params` is fully received.
+- `params_buf_` (inside `StringStreamWriter`) accumulates raw params bytes as they
+  arrive.
+
+#### Phase 3 — End of stream (`onEndStream` → `AgentBodyParser::finish()`)
+
+```
+decodeData(last_chunk, end_stream=true)   [or decodeTrailers()]
+  └─ RequestDecoder::onData(last_chunk)   [same as Phase 2]
+  └─ RequestDecoder::onEndStream()
+       └─ AgentBodyParser::finish()
+            ├─ tokenizer_.finish()             ← validates document is complete
+            ├─ residual_writer_->finalize()
+            │    → PayloadRef for full body (External if > max_inline_bytes)
+            │      stored as payload.residual_params
+            │
+            ├─ Second-pass classification (body-time):
+            │    rpc_method = handler_.rpc_method_   ("tools/call")
+            │    AgentInvocation = ToolCall
+            │
+            ├─ params sub-field extraction:
+            │    nlohmann::json::parse(params_buf_)    ← only params bytes, not full body
+            │         → tool_name  = "read_file"
+            │         → arguments  = {"path": "/etc/config.json"}
+            │    store_.store(tool_name)    → PayloadRef::Inline (short string)
+            │    store_.store(arguments)    → PayloadRef::Inline or External
+            │
+            └─ Move all fields into AgentPayload → AiRequest:
+                 payload.rpc_method   = "tools/call"
+                 payload.jsonrpc_id   = "r1"
+                 payload.invocation   = AgentInvocation::ToolCall
+                 payload.tool_name    = PayloadRef (Inline "read_file")
+                 payload.arguments    = PayloadRef
+                 payload.residual     = PayloadRef (External, full body)
+       └─ state_ = BodyComplete
+```
+
+The params re-parse with `nlohmann` is scoped only to `params_buf_` — the
+already-isolated params bytes — not the full body. This is the only remaining use
+of `nlohmann` in the agent path. Its heap cost scales with params size, not body
+size.
+
+Auth ordering is satisfied: `rpc_method` and `tool_name` are only moved into the
+`AiRequest` inside `finish()`, after body-covering auth has completed.
+
+#### Phase 4 — Chain and dispatch
+
+```
+RequestDecoder::take()
+  └─ returns std::move(request_)   [AiRequest with AgentPayload fully populated]
+
+filter.cc::onEndStreamAndDispatch()
+  ├─ request_.rpc_method = "tools/call"  (non-empty → not a false-positive)
+  ├─ selectAndBuildChain() → agentic_chain_ = AgenticChain
+  └─ runChainRequest()
+       └─ active_chain_->runRequestMetadata(request_, ...)
+            ├─ McpAuthFilter::onRequestMetadata():
+            │    inspect request_.rpc_method    "tools/call"
+            │    inspect request_.tool_name     "read_file"  (via convertPayloadRefToString)
+            │    inspect request_.principal     from identity header
+            │    → policy match → allow / 401 / 403
+            └─ on_ready callback:
+                 dispatch()
+                   └─ dispatcher.post()
+                        └─ prefetchExternalPayloadRefs(request_, ...)
+                             ├─ collect External refs (residual_params, arguments if large)
+                             └─ fetchAsync × N  →  doDispatch() when all done
+```
+
+Auth and routing decisions consume only plain string fields (`rpc_method`,
+`tool_name`, `principal`) and never touch `PayloadStore` directly. The store is
+accessed only during dispatch when External refs are prefetched.
+
+#### Phase 5 — Encode and forward
+
+```
+doDispatch()
+  └─ AgenticDispatch::dispatch(request_, decoder_callbacks_, transcoder_config_)
+       ├─ If McpRestTranscoderRouteConfig present:
+       │    re-encode AgentPayload as REST call (transcoding path)
+       └─ Otherwise (chain-forward):
+            re-encode as JSON-RPC 2.0:
+              body = {"jsonrpc":"2.0","id":"r1","method":"tools/call",
+                      "params":{...}}
+            All PayloadRefs now Buffered (prefetch complete):
+              convertPayloadRefToString(arguments, request_) → ref.toString()
+            decoder_callbacks_->addDecodedData(body_buf, false)
+            decoder_callbacks_->continueDecoding()
+```
+
+**Differences from the inference encode path:**
+
+| | Inference (`InferenceDispatch`) | Agentic (`AgenticDispatch`) |
+|---|---|---|
+| Re-encoded format | OpenAI JSON (`messages[]`, `tools[]`) | JSON-RPC 2.0 body or REST endpoint |
+| Per-element iteration | loops over `messages` and `tools` refs | single `params` / `arguments` ref |
+| Transcoding | not applicable | optional: JSON-RPC → REST via `McpRestTranscoderRouteConfig` |
+| continueDecoding | called by `InferenceDispatch` | called by `AgenticDispatch` |
 
 ---
 
@@ -1195,6 +1174,204 @@ file descriptor remains open.
 ---
 
 ## Deep Memory Analysis
+
+### Peak memory by tier
+
+#### Old approach — nlohmann SAX
+
+##### The eager-lexer problem
+
+`nlohmann::json::sax_parse()` fully tokenizes each JSON value before calling any
+SAX callback. For string values this means allocating a `std::string` for the
+fully-unescaped content before `string()` is called — regardless of whether the
+handler keeps the value or immediately discards it. There is no way to intercept
+at the byte level through the public SAX API.
+
+For a multimodal inference request carrying a 10 MB base64-encoded image:
+
+```json
+{
+  "messages": [{
+    "role": "user",
+    "content": [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,<10MB>"}}]
+  }]
+}
+```
+
+Even with `capturing_element_ = true` (which makes the handler return `true`
+immediately), nlohmann has already allocated a ~13.3 MB `std::string` for the
+unescaped base64 value before the `string()` callback fires. That string is
+purely transient — it exists for exactly one callback invocation and is then
+destroyed.
+
+##### Precise peak sequence (old approach, Tier 1 element capture)
+
+The transient (`string()` callback) and the `sliceBuffer` result (element close)
+are **sequential, not simultaneous**. `sliceBuffer` only runs when the element's
+closing `}` is reached — after the transient for every value inside the element
+has already been freed:
+
+```
+time →
+
+[sax_parse encounters base64 string at depth ~6]
+  heap: body_buffer_ (B) + nlohmann transient (S)   ← peak A = B + S
+  transient freed immediately after string() returns
+
+[sax_parse encounters messages[0] closing `}` at depth 3]
+  heap: body_buffer_ (B) + sliceBuffer result (E)   ← peak B = B + E
+  sliceBuffer result handed to store_.store():
+    MmapPayloadStore: memcpy to mmap, string freed → heap drops back to B
+```
+
+Where `B` = body size, `S` = largest string value in the body, `E` = element size.
+For the single-message multimodal case, `S ≈ E ≈ B`, so both peaks are ≈ 2× body.
+They do not stack: **peak heap ≈ body + max(largest string value, largest element)**.
+
+For Tier 2 (no element capture), `sliceBuffer` is never called, leaving only:
+**peak heap ≈ body + largest string value**.
+
+| | Tier 1 (≤256 KB body) | Tier 2 (≤4 MB body) | Tier 3 (reject) |
+|---|---|---|---|
+| Heap | `B` + max(`S`, `E`) ≈ **2× body** | `B` + `S` ≈ **body + max string** | ≤ `max_body_bytes` |
+| RSS | same (all heap) | same | same |
+
+All of this memory is non-evictable heap.
+
+#### New approach — incremental tokenizer
+
+Heap and RSS contributions are now independent, with behavior that differs between
+Tier 1 and Tier 2 because of how `captureEnabled()` gates InCapture mode.
+
+##### Tier 1 (body ≤ `max_element_capture_bytes`, default 256 KB)
+
+`captureEnabled()` returns `true`. When `messages[i]` or `tools[i]` opens at
+depth 3, `startCapture(*elem_writer_)` is called and the tokenizer enters
+`ParseState::InCapture`.
+
+In InCapture mode, `processByte()` skips all token-building paths entirely:
+`token_buf_` is not touched. Every byte goes directly to
+`elem_writer_->append()`, which writes into the mmap arena. No string is
+built for any value inside the captured element, regardless of its size or
+content.
+
+```
+heap contributors (Tier 1):
+  token_buf_       — holds the current scalar outside capture (model name, etc.)
+                     max = longest depth-1 string field, typically < 256 bytes
+  handler members  — model_, messages_ vector of PayloadRef (12 B each), sampling_
+                     < 1 KB total
+  writer structs   — residual_writer_ + elem_writer_, ~32 bytes each on heap
+
+RSS contributors (Tier 1):
+  residual mmap    — full body streamed via residual_writer_           = B
+  element mmap     — each captured element streamed via elem_writer_   = Σ E_i
+  total            — B + Σ E_i  (evictable page-cache)
+```
+
+**Peak heap Tier 1: < 2 KB, O(1) with respect to body or element size.**
+
+##### Tier 2 (body > `max_element_capture_bytes`, ≤ `max_body_bytes`)
+
+`captureEnabled()` returns `false`. When `messages[i]` opens at depth 3,
+`startCapture()` is **not** called. The tokenizer stays in normal mode and
+continues tokenizing content inside the element at all depths. This means
+`token_buf_` accumulates the full content of every string value encountered
+inside the element, including large ones like base64 images.
+
+This is the same per-string heap cost as the nlohmann transient — the mechanism
+differs (`token_buf_` vs nlohmann's internal string) but the heap scaling is
+identical: proportional to the largest string value in the body. The benefit in
+Tier 2 is that `body_buffer_` is eliminated — the full body is in evictable mmap
+page-cache rather than on heap.
+
+```
+heap contributors (Tier 2):
+  token_buf_       — grows to the largest string value in the body (anywhere in doc)
+                     max = S (may be large for multimodal)
+  handler members  — < 1 KB
+
+RSS contributors (Tier 2):
+  residual mmap    — full body streamed via residual_writer_    = B
+  no element mmap  — captureEnabled() false, no elem_writer_
+```
+
+**Peak heap Tier 2: ≈ `S` (largest string value) — body moved off heap, but per-string cost remains.**
+
+| | Tier 1 (≤256 KB body) | Tier 2 (≤4 MB body) | Tier 3 (reject) |
+|---|---|---|---|
+| Heap | < 2 KB (O(1)) | ≈ `S` (largest string value in body) | ≤ one chunk |
+| RSS (mmap) | `B` + Σ elements | `B` only | 0 |
+| RSS total | `B` + Σ elements | `B` + `S` | ≤ one chunk |
+| RSS OS-evictable | yes (all page-cache) | yes (mmap portion) | n/a |
+
+#### Multimodal worst-case walkthrough
+
+**Scenario**: single message carrying a 10 MB raw image, base64-encoded to ~13.3 MB.
+Total body ≈ 13.4 MB. Assume `max_body_bytes` is configured above this threshold;
+`max_element_capture_bytes` = 256 KB (default).
+
+Because body (13.4 MB) > `max_element_capture_bytes` (256 KB), this is **Tier 2**.
+With default `max_body_bytes` = 4 MB the request would be Tier 3 (rejected).
+
+```
+Old approach, Tier 2:
+
+  onData() chunks accumulated → body_buffer_ = 13.4 MB heap
+  finish() → sax_parse()
+    at base64 string (depth ~6):
+      nlohmann allocates 13.3 MB std::string transient         heap: 13.4 + 13.3 = 26.7 MB ← peak
+      string() callback: handler returns true (captureEnabled=false)
+      transient freed                                           heap: 13.4 MB
+    element close: no sliceBuffer (Tier 2)
+  body_buffer_ freed after finish()
+
+  Peak heap: 26.7 MB (body + transient)
+  Peak RSS:  26.7 MB (all non-evictable heap)
+
+New approach, Tier 2:
+
+  onData() chunks:
+    residual_writer_->append(chunk) → mmap arena              RSS:  grows to 13.4 MB (page-cache)
+    tokenizer_.feed(chunk):
+      captureEnabled()=false, no startCapture() at element open
+      tokenizer stays in normal mode inside messages[0]
+      at base64 string: token_buf_ accumulates 13.3 MB         heap: grows to 13.3 MB ← peak
+      onString(token_buf_): handler ignores (depth > 1, Tier 2)
+      token_buf_.clear()  — capacity retained at 13.3 MB
+  finish() → finalize residual_writer_ → PayloadRef::External
+
+  Peak heap: 13.3 MB (token_buf_ only — body is in mmap, not heap)
+  Peak RSS:  13.4 MB (mmap, evictable) + 13.3 MB (token_buf_, heap) = 26.7 MB
+```
+
+| | Old (nlohmann, Tier 2) | New (tokenizer, Tier 2) |
+|---|---|---|
+| Body on heap | 13.4 MB | 0 (in mmap page-cache) |
+| Large-string transient on heap | 13.3 MB (nlohmann std::string) | 13.3 MB (token_buf_) |
+| Peak heap | **26.7 MB** | **13.3 MB** |
+| Peak RSS | 26.7 MB (non-evictable) | 26.7 MB (13.4 MB evictable + 13.3 MB heap) |
+
+The body is removed from heap (saving `B` = 13.4 MB of non-evictable heap), but
+the large-string heap cost is not eliminated in Tier 2 — it is replaced by
+`token_buf_` growth. Peak heap is halved; peak RSS is unchanged.
+
+#### Side-by-side comparison
+
+| | Old (nlohmann SAX) | New (tokenizer, Tier 1) | New (tokenizer, Tier 2) |
+|---|---|---|---|
+| Body on heap | yes (`body_buffer_`) | no — mmap | no — mmap |
+| Large-string heap transient | yes (nlohmann eager lexer) | **no** — InCapture skips tokenization | yes (`token_buf_` grows) |
+| Per-element heap copy | yes (`sliceBuffer` string) | no — bytes go to mmap | n/a (no capture) |
+| Peak heap | `B` + max(`S`,`E`) ≈ 2× body | < 2 KB | ≈ `S` |
+| Peak RSS | same (all non-evictable heap) | `B` + Σ elements (evictable) | `B` + `S` (B evictable) |
+| Large-string problem eliminated | — | **yes**, via InCapture mode | no, `token_buf_` has same scaling |
+
+The large-string transient is fully eliminated only in **Tier 1**, where
+`captureEnabled()` is true and InCapture mode is active. In Tier 2 the body
+moves off heap (a meaningful improvement), but per-string heap scaling remains.
+
+---
 
 ### Taxonomy: heap vs RSS
 
