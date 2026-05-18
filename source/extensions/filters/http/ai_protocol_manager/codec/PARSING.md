@@ -9,13 +9,11 @@ pushing the JSON body into the hundreds of kilobytes. Under concurrent load the
 naive approach — buffer the full body, parse it into a DOM, copy each field into a
 `std::string` — creates two compounding problems:
 
-**Problem 1 — full-body buffer before parse**: `nlohmann::json::parse()` and even
-`nlohmann::json::sax_parse()` require the entire body to be present in memory
-before any event fires, because their internal parse state lives on the C++ call
-stack (recursive descent). There is no way to pause and resume across HTTP chunk
-boundaries. For a 200 KB body across thousands of concurrent streams this means
-hundreds of megabytes of heap just to hold transient input, all of which becomes
-garbage the moment fields are extracted.
+**Problem 1 — full-body DOM parse**: `nlohmann::json::parse()` requires the entire
+body to be contiguous in memory before it returns anything. For a 200 KB body
+across thousands of concurrent streams this means hundreds of megabytes of heap
+just to hold transient parse input, all of which becomes garbage the moment fields
+are extracted.
 
 **Problem 2 — field copies as heap strings**: Once parsed, each `messages[]`
 element and `tools[]` definition is typically stored as a re-serialized
@@ -78,6 +76,15 @@ AwaitingHeaders
 ---
 
 ## `IncrementalJsonTokenizer` — streaming JSON parser
+
+### Motivation
+**full-body buffer before parse**: `nlohmann::json::parse()` and even
+`nlohmann::json::sax_parse()` require the entire body to be present in memory
+before any event fires, because their internal parse state lives on the C++ call
+stack (recursive descent). There is no way to pause and resume across HTTP chunk
+boundaries. For a 200 KB body across thousands of concurrent streams this means
+hundreds of megabytes of heap just to hold transient input, all of which becomes
+garbage the moment fields are extracted.
 
 ### Design
 
