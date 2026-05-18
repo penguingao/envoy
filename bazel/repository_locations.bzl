@@ -392,6 +392,15 @@ REPOSITORY_LOCATIONS_SPEC = dict(
         # This has replaced rapidJSON used in extensions and may also be a fast
         # replacement for protobuf JSON.
     ),
+    wuffs = dict(
+        version = "0.4.0-alpha.9",
+        sha256 = "9ca4f5401a76be244362de8b39138f01f2456c444b03584703a9f1db90491ba6",
+        strip_prefix = "wuffs-mirror-release-c-{version}",
+        urls = ["https://github.com/google/wuffs-mirror-release-c/archive/refs/tags/v{version}.tar.gz"],
+        # Wuffs: memory-safe, high-performance JSON (and other format) tokenizer.
+        # The amalgamated C file at release/c/wuffs-v0.4.c is both the header
+        # (declarations) and implementation (when WUFFS_IMPLEMENTATION is defined).
+    ),
     # This is an external dependency needed while running the
     # envoy docker image. A bazel target has been created since
     # there is no binary package available for the utility on Ubuntu

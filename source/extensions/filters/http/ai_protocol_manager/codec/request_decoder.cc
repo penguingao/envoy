@@ -6,9 +6,13 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
 
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
-#include "nlohmann/json.hpp"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/wuffs_json.h"
+
+// Wuffs declarations only (WUFFS_IMPLEMENTATION lives in wuffs_impl.c).
+#include "release/c/wuffs-v0.4.c"
 
 namespace Envoy {
 namespace Extensions {
@@ -17,8 +21,6 @@ namespace AiProtocolManager {
 namespace Codec {
 
 namespace {
-
-using nlohmann::json;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IncrementalJsonTokenizer
@@ -780,14 +782,17 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AgentBodyParser
+// AgentBodyParser  (Wuffs streaming)
 //
-// Same incremental streaming strategy for JSON-RPC 2.0 bodies.
+// Replaces the old IncrementalJsonTokenizer-based implementation.  The Wuffs
+// stackless coroutine in dec_ preserves all parse state across feed() calls,
+// so no token_buf_ accumulation occurs for arbitrarily large or deeply nested
+// keys — each Wuffs token is at most 65535 bytes and is processed in place.
 //
-// id and method are extracted as scalars at depth=1.  The params value
-// (object or array at depth=2) is captured verbatim into a std::string via
-// a StringStreamWriter so it can be passed to json::parse() for field
-// extraction (tool_name, resource_uri, etc.) in finish().
+// Tier 1 (body ≤ max_element_capture_bytes) and Tier 2 share one code path.
+// params_raw, arguments, and capabilities are recorded as byte-range sub-refs
+// of residual_params — zero-copy for MmapPayloadStore, substring for tests.
+// arguments/capabilities sub-ranges are only recorded when captureEnabled().
 // ─────────────────────────────────────────────────────────────────────────────
 
 class RequestDecoder::AgentBodyParser {
@@ -795,7 +800,11 @@ public:
   AgentBodyParser(const Http::RequestHeaderMap& headers, absl::string_view http_method,
                   absl::string_view path, const DecoderConfig& config, PayloadStore& store)
       : headers_(headers), http_method_(http_method), path_(path),
-        config_(config), store_(store), handler_(*this), tokenizer_(handler_) {}
+        config_(config), store_(store) {
+    dec_     = wuffs_json__decoder::alloc();
+    tok_buf_ = wuffs_base__slice_token__writer(
+        wuffs_base__make_slice_token(tok_data_, kTokBufLen));
+  }
 
   absl::Status feed(absl::string_view chunk) {
     total_bytes_ += chunk.size();
@@ -807,30 +816,23 @@ public:
       residual_writer_ = store_.beginStore(PayloadKind::JsonObject);
     }
     residual_writer_->append(chunk);
-    chunk_base_ = total_bytes_ - chunk.size();
-    auto s = tokenizer_.feed(chunk);
-    if (!s.ok() && handler_.has_error_) {
-      return absl::InvalidArgumentError(handler_.error_);
-    }
-    return s;
+    return feedChunk(chunk, /*closed=*/false);
   }
 
   absl::Status finish(AgentPayload& payload, AiRequest& request) {
-    auto s = tokenizer_.finish();
-    if (!s.ok()) return absl::InvalidArgumentError(
-        absl::StrCat("agent body parse error: ", s.message()));
-
-    if (handler_.has_error_) {
+    auto s = feedChunk("", /*closed=*/true);
+    if (!s.ok()) return s;
+    if (has_error_) {
       return absl::InvalidArgumentError(
-          absl::StrCat("agent body JSON-RPC parse error: ", handler_.error_));
+          absl::StrCat("agent body JSON-RPC parse error: ", error_));
     }
 
-    request.jsonrpc_id = std::move(handler_.id_);
-    request.rpc_method = std::move(handler_.method_);
+    request.jsonrpc_id = std::move(id_);
+    request.rpc_method = std::move(method_);
 
     if (!request.rpc_method.empty()) {
-      ClassifyResult r2  = classify({http_method_, path_, headers_, request.rpc_method});
-      request.protocol   = r2.protocol;
+      ClassifyResult r2 = classify({http_method_, path_, headers_, request.rpc_method});
+      request.protocol  = r2.protocol;
       if (auto* inv = std::get_if<AgentInvocation>(&r2.invocation)) {
         payload.invocation = *inv;
       }
@@ -838,383 +840,352 @@ public:
                                                                    : AgentDialect::A2a;
     }
 
-    if (handler_.params_captured_) {
-      // Tier 1: use nlohmann to extract routing fields from the captured params JSON.
-      std::string params_json = std::move(handler_.params_buf_);
-      const json params = json::parse(params_json, nullptr, /*allow_exceptions=*/false);
-      if (!params.is_discarded()) {
-        populateParams(params, payload, store_);
-      }
-      payload.params_raw = store_.store(std::move(params_json), PayloadKind::JsonObject);
-    } else if (handler_.params_seen_) {
-      // Tier 2: routing fields were extracted via streaming callbacks during parse.
-      populateParamsFromFields(handler_, payload);
-    }
+    populatePayload(payload);
 
     if (residual_writer_) {
       payload.residual_params = residual_writer_->finalize();
     }
 
-    // Tier 2: params_raw as a sub-range of residual_params.
-    //
-    // params_byte_start_ / params_byte_end_ record the exact byte offsets of
-    // the params container within the full body (set by AgentHandler during
-    // the Tier 2 semantic parse).  Creating a sub-range costs nothing for
-    // MmapPayloadStore (External ref = {offset, length} pair) and does a small
-    // substring copy for InMemoryPayloadStore (used only in tests).
-    //
-    // This populates params_raw for all Tier 2 invocations — both Category A
-    // (ToolsCall) and Category B (Initialize, Ping, A2A) — so that subsequent
-    // chain filters always have access to the raw params content.
-    if (!handler_.params_captured_ && handler_.params_seen_ &&
-        params_byte_end_ > params_byte_start_) {
-      const size_t pstart = params_byte_start_;
-      const size_t plen   = params_byte_end_ - params_byte_start_;
-
-      if (payload.residual_params.storage() == PayloadRef::Storage::External) {
-        // MmapPayloadStore: zero-cost pointer into the already-mapped region.
-        payload.params_raw = PayloadRef::makeExternal(
-            payload.residual_params.externalOffset() + pstart, plen);
-      } else if (!payload.residual_params.empty()) {
-        // InMemoryPayloadStore: extract the params substring.
-        std::string full = payload.residual_params.toString();
-        if (pstart < full.size()) {
-          payload.params_raw = store_.store(
-              full.substr(pstart, std::min(plen, full.size() - pstart)),
-              PayloadKind::JsonObject);
-        }
-      }
+    if (params_byte_end_ > params_byte_start_) {
+      makeSubRef(payload.params_raw, params_byte_start_,
+                 params_byte_end_ - params_byte_start_,
+                 payload.residual_params, PayloadKind::JsonObject);
+    }
+    if (arguments_byte_end_ > arguments_byte_start_) {
+      makeSubRef(payload.arguments, arguments_byte_start_,
+                 arguments_byte_end_ - arguments_byte_start_,
+                 payload.residual_params, arguments_kind_);
+    }
+    if (capabilities_byte_end_ > capabilities_byte_start_) {
+      makeSubRef(payload.capabilities, capabilities_byte_start_,
+                 capabilities_byte_end_ - capabilities_byte_start_,
+                 payload.residual_params, PayloadKind::JsonObject);
     }
 
     return absl::OkStatus();
   }
 
 private:
-  // Minimal StreamWriter that accumulates into a std::string.  Used for params
-  // capture so the bytes can be passed to json::parse() in finish().
-  struct StringStreamWriter : public StreamWriter {
-    std::string buf;
-    void       append(absl::string_view bytes) override { buf.append(bytes); }
-    PayloadRef finalize() override { return PayloadRef{}; } // unused
-  };
+  bool captureEnabled() const {
+    return total_bytes_ <= config_.max_element_capture_bytes;
+  }
 
-  // ── AgentHandler ─────────────────────────────────────────────────────────
-  struct AgentHandler : public IncrementalJsonTokenizer::Handler {
-    explicit AgentHandler(AgentBodyParser& p) : parser_(p) {}
-
-    std::string id_;
-    std::string method_;
-    bool        params_captured_{false};  // Tier 1: capture mode completed
-    std::string params_buf_;              // Tier 1: captured params JSON
-    bool        has_error_{false};
-    std::string error_;
-
-    int         depth_{0};
-    std::string current_key_;
-
-    // ── duplicate-key tracking (depth=1 extracted fields only) ──
-    bool seen_jsonrpc_{false};
-    bool seen_id_{false};
-    bool seen_method_{false};
-    bool seen_params_{false};
-
-    // ── Tier 1 params capture ──
-    bool        capturing_params_{false};
-    int         params_capture_depth_{0};
-    StringStreamWriter params_writer_;
-
-    // ── Tier 2 semantic params parsing ──
-    // Set when the "params" key/value is entered regardless of tier.
-    // In Tier 1 capture mode fires immediately; in Tier 2 we parse semantically.
-    bool        params_seen_{false};
-    bool        in_params_{false};    // true while inside the params container
-    int         params_depth_{0};     // handler depth_ when we entered params
-    std::string params_key_;          // current key inside params (when in_params_)
-
-    // Routing fields extracted from params in Tier 2 (and optionally Tier 1).
-    std::string params_name_;         // "name" field  (ToolsCall, PromptsGet)
-    std::string params_uri_;          // "uri"  field  (Resources*)
-    std::string params_ref_;          // "ref"  field  (CompletionComplete)
-
-    // Object/array fields captured inside params (Tier 1 only for Tier 2 bodies;
-    // captureEnabled() gates startCapture so these are empty when body is large).
-    PayloadRef  params_arguments_;
-    PayloadRef  params_capabilities_;
-
-    // Active capture for a single params sub-field (arguments / capabilities).
-    bool                          capturing_param_field_{false};
-    int                           param_field_depth_{0};
-    std::unique_ptr<StreamWriter> param_field_writer_;
-    enum class ParamField { None, Arguments, Capabilities } current_param_field_{ParamField::None};
-
-    // String streaming: str_target_ is set to the field to accumulate (null = discard).
-    std::string* str_target_{nullptr};
-    std::string  string_val_;  // scratch for short string fields
-
-    AgentBodyParser& parser_;
-
-    bool captureEnabled() const {
-      return parser_.total_bytes_ <= parser_.config_.max_element_capture_bytes;
+  // Decode one Wuffs STRING token's raw bytes into `out`.
+  static void appendStringToken(std::string& out, absl::string_view raw, uint64_t vbd) {
+    if (vbd & WUFFS_BASE__TOKEN__VBD__STRING__CONVERT_0_DST_1_SRC_DROP) return;
+    if (vbd & WUFFS_BASE__TOKEN__VBD__STRING__CONVERT_1_DST_1_SRC_COPY) {
+      out.append(raw.data(), raw.size());
+      return;
     }
-
-    bool onStartObject() override {
-      ++depth_;
-      if (depth_ == 2 && current_key_ == "params") {
-        params_seen_ = true;
-        if (captureEnabled()) {
-          // Tier 1: capture verbatim for params_raw + nlohmann extraction in finish().
-          capturing_params_     = true;
-          params_capture_depth_ = depth_;
-          parser_.tokenizer_.startCapture(params_writer_);
-          return true;
+    for (size_t i = 0; i < raw.size(); ++i) {
+      if (raw[i] != '\\' || i + 1 >= raw.size()) { out += raw[i]; continue; }
+      char esc = raw[++i];
+      switch (esc) {
+      case '"':  out += '"';  break;  case '\\': out += '\\'; break;
+      case '/':  out += '/';  break;  case 'b':  out += '\b'; break;
+      case 'f':  out += '\f'; break;  case 'n':  out += '\n'; break;
+      case 'r':  out += '\r'; break;  case 't':  out += '\t'; break;
+      case 'u': {
+        if (i + 4 >= raw.size()) break;
+        uint32_t cp = 0;
+        for (int j = 1; j <= 4; ++j) {
+          char c = raw[i + j]; cp <<= 4;
+          if      (c >= '0' && c <= '9') cp |= static_cast<uint32_t>(c - '0');
+          else if (c >= 'a' && c <= 'f') cp |= static_cast<uint32_t>(c - 'a' + 10);
+          else if (c >= 'A' && c <= 'F') cp |= static_cast<uint32_t>(c - 'A' + 10);
         }
-        // Tier 2: parse params semantically.
-        in_params_    = true;
-        params_depth_ = depth_;
-        parser_.params_byte_start_ = parser_.currentBodyPos();
-        return true;
+        i += 4;
+        if      (cp < 0x80)  { out += static_cast<char>(cp); }
+        else if (cp < 0x800) { out += static_cast<char>(0xC0|(cp>>6));
+                               out += static_cast<char>(0x80|(cp&0x3F)); }
+        else                 { out += static_cast<char>(0xE0|(cp>>12));
+                               out += static_cast<char>(0x80|((cp>>6)&0x3F));
+                               out += static_cast<char>(0x80|(cp&0x3F)); }
+        break;
       }
-      // Inside params in Tier 2: capture arguments/capabilities if small enough.
-      if (in_params_ && !capturing_param_field_ && depth_ == params_depth_ + 1) {
-        if (params_key_ == "arguments" || params_key_ == "capabilities") {
-          if (captureEnabled()) {
-            capturing_param_field_ = true;
-            param_field_depth_     = depth_;
-            current_param_field_   = (params_key_ == "arguments")
-                                         ? ParamField::Arguments
-                                         : ParamField::Capabilities;
-            param_field_writer_ = parser_.store_.beginStore(PayloadKind::JsonObject);
-            parser_.tokenizer_.startCapture(*param_field_writer_);
+      default: out += esc; break;
+      }
+    }
+  }
+
+  absl::Status feedChunk(absl::string_view chunk, bool closed) {
+    if (!dec_) return absl::InternalError("wuffs json: alloc failed");
+    if (wuffs_done_) return absl::OkStatus();
+
+    const size_t chunk_base = body_src_pos_;
+    wuffs_base__io_buffer src_buf = wuffs_base__ptr_u8__reader(
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(chunk.data())),
+        chunk.size(), closed);
+
+    while (true) {
+      wuffs_base__status status = wuffs_json__decoder__decode_tokens(
+          dec_.get(), &tok_buf_, &src_buf, wuffs_base__empty_slice_u8());
+
+      while (tok_buf_.meta.ri < tok_buf_.meta.wi) {
+        const wuffs_base__token* tok = &tok_buf_.data.ptr[tok_buf_.meta.ri++];
+        const int64_t  vbc       = wuffs_base__token__value_base_category(tok);
+        const uint64_t vbd       = wuffs_base__token__value_base_detail(tok);
+        const uint64_t tlen      = wuffs_base__token__length(tok);
+        const bool     cont      = wuffs_base__token__continued(tok);
+        const size_t   tok_start = body_src_pos_;
+        body_src_pos_ += tlen;
+
+        switch (vbc) {
+
+        case WUFFS_BASE__TOKEN__VBC__FILLER:
+          break;
+
+        case WUFFS_BASE__TOKEN__VBC__STRUCTURE: {
+          const bool is_push = (vbd & WUFFS_BASE__TOKEN__VBD__STRUCTURE__PUSH) != 0;
+          const bool to_dict = (vbd & WUFFS_BASE__TOKEN__VBD__STRUCTURE__TO_DICT) != 0;
+          if (is_push) {
+            ++depth_;
+            if (depth_ < kMaxDepth) {
+              is_dict_[depth_]       = to_dict;
+              expecting_key_[depth_] = to_dict;
+            }
+            // Entering the params container at depth 2.
+            if (depth_ == 2 && current_key_ == "params") {
+              in_params_         = true;
+              params_byte_start_ = tok_start;
+            }
+            // Entering a sub-container (arguments / capabilities) at depth 3.
+            if (depth_ == 3 && in_params_ && !in_sub_container_ &&
+                (params_key_ == "arguments" || params_key_ == "capabilities")) {
+              in_sub_container_    = true;
+              sub_is_arguments_    = (params_key_ == "arguments");
+              sub_container_start_ = tok_start;
+              if (sub_is_arguments_) {
+                arguments_kind_ = to_dict ? PayloadKind::JsonObject
+                                          : PayloadKind::JsonArray;
+              }
+            }
+          } else {
+            const int pop_depth = depth_;
+            --depth_;
+            if (pop_depth == 3 && in_sub_container_) {
+              in_sub_container_ = false;
+              if (captureEnabled()) {
+                if (sub_is_arguments_) {
+                  arguments_byte_start_ = sub_container_start_;
+                  arguments_byte_end_   = body_src_pos_;
+                } else {
+                  capabilities_byte_start_ = sub_container_start_;
+                  capabilities_byte_end_   = body_src_pos_;
+                }
+              }
+            }
+            if (pop_depth == 2 && in_params_) {
+              in_params_       = false;
+              params_byte_end_ = body_src_pos_;
+            }
+            // After closing a container value, the parent expects the next key.
+            if (depth_ >= 1 && depth_ < kMaxDepth && is_dict_[depth_]) {
+              expecting_key_[depth_] = true;
+            }
           }
+          break;
         }
-      }
-      return true;
-    }
 
-    bool onEndObject() override {
-      // Tier 1 params capture close.
-      if (capturing_params_ && depth_ == params_capture_depth_) {
-        capturing_params_ = false;
-        params_captured_  = true;
-        params_buf_       = std::move(params_writer_.buf);
-      }
-      // Tier 2 param sub-field capture close.
-      if (capturing_param_field_ && depth_ == param_field_depth_) {
-        capturing_param_field_ = false;
-        PayloadRef ref = param_field_writer_->finalize();
-        param_field_writer_.reset();
-        if (current_param_field_ == ParamField::Arguments)
-          params_arguments_ = std::move(ref);
-        else if (current_param_field_ == ParamField::Capabilities)
-          params_capabilities_ = std::move(ref);
-        current_param_field_ = ParamField::None;
-      }
-      --depth_;
-      if (in_params_ && depth_ < params_depth_) {
-        parser_.params_byte_end_ = parser_.currentBodyPos() + 1;
-        in_params_ = false;
-      }
-      return true;
-    }
-
-    bool onStartArray() override {
-      ++depth_;
-      // params may be an array per JSON-RPC spec (positional arguments).
-      if (depth_ == 2 && current_key_ == "params") {
-        params_seen_ = true;
-        if (captureEnabled()) {
-          capturing_params_     = true;
-          params_capture_depth_ = depth_;
-          parser_.tokenizer_.startCapture(params_writer_);
-          return true;
-        }
-        in_params_    = true;
-        params_depth_ = depth_;
-        parser_.params_byte_start_ = parser_.currentBodyPos();
-        return true;
-      }
-      // Array-valued "arguments" inside params in Tier 2.
-      if (in_params_ && !capturing_param_field_ && depth_ == params_depth_ + 1) {
-        if (params_key_ == "arguments" && captureEnabled()) {
-          capturing_param_field_ = true;
-          param_field_depth_     = depth_;
-          current_param_field_   = ParamField::Arguments;
-          param_field_writer_    = parser_.store_.beginStore(PayloadKind::JsonArray);
-          parser_.tokenizer_.startCapture(*param_field_writer_);
-        }
-      }
-      return true;
-    }
-
-    bool onEndArray() override {
-      if (capturing_params_ && depth_ == params_capture_depth_) {
-        capturing_params_ = false;
-        params_captured_  = true;
-        params_buf_       = std::move(params_writer_.buf);
-      }
-      if (capturing_param_field_ && depth_ == param_field_depth_) {
-        capturing_param_field_ = false;
-        PayloadRef ref = param_field_writer_->finalize();
-        param_field_writer_.reset();
-        if (current_param_field_ == ParamField::Arguments)
-          params_arguments_ = std::move(ref);
-        current_param_field_ = ParamField::None;
-      }
-      --depth_;
-      if (in_params_ && depth_ < params_depth_) {
-        parser_.params_byte_end_ = parser_.currentBodyPos() + 1;
-        in_params_ = false;
-      }
-      return true;
-    }
-
-    bool onKey(absl::string_view key) override {
-      if (depth_ == 1) {
-        bool* seen = nullptr;
-        if      (key == "jsonrpc") seen = &seen_jsonrpc_;
-        else if (key == "id")      seen = &seen_id_;
-        else if (key == "method")  seen = &seen_method_;
-        else if (key == "params")  seen = &seen_params_;
-
-        if (seen != nullptr) {
-          if (*seen) {
-            has_error_ = true;
-            error_     = absl::StrCat("duplicate key \"", key, "\" in agent request body");
-            return false;
+        case WUFFS_BASE__TOKEN__VBC__STRING: {
+          const absl::string_view raw = chunk.substr(tok_start - chunk_base, tlen);
+          const bool first_in_group = !in_chain_;
+          if (first_in_group) {
+            str_acc_.clear();
+            string_is_key_ = (depth_ < kMaxDepth && is_dict_[depth_] &&
+                               expecting_key_[depth_]);
+            if (string_is_key_) {
+              str_target_ = &str_acc_;
+            } else if (depth_ == 1) {
+              if      (current_key_ == "id")     { id_.clear();     str_target_ = &id_;     }
+              else if (current_key_ == "method") { method_.clear(); str_target_ = &method_; }
+              else                               { str_target_ = nullptr; }
+            } else if (depth_ == 2 && in_params_) {
+              if      (params_key_ == "name") { params_name_.clear(); str_target_ = &params_name_; }
+              else if (params_key_ == "uri")  { params_uri_.clear();  str_target_ = &params_uri_;  }
+              else if (params_key_ == "ref")  { params_ref_.clear();  str_target_ = &params_ref_;  }
+              else                            { str_target_ = nullptr; }
+            } else {
+              str_target_ = nullptr;
+            }
           }
-          *seen = true;
+
+          if (str_target_ && tlen > 0) {
+            appendStringToken(*str_target_, raw, vbd);
+          }
+          in_chain_ = cont;
+
+          if (!cont) {
+            if (string_is_key_) {
+              if (depth_ == 1) {
+                bool* seen = nullptr;
+                if      (str_acc_ == "jsonrpc") seen = &seen_jsonrpc_;
+                else if (str_acc_ == "id")      seen = &seen_id_;
+                else if (str_acc_ == "method")  seen = &seen_method_;
+                else if (str_acc_ == "params")  seen = &seen_params_;
+                if (seen) {
+                  if (*seen) {
+                    has_error_ = true;
+                    error_ = absl::StrCat("duplicate key \"", str_acc_,
+                                          "\" in agent request body");
+                    break;
+                  }
+                  *seen = true;
+                }
+                current_key_ = str_acc_;
+                if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
+              } else if (depth_ == 2 && in_params_) {
+                params_key_ = str_acc_;
+                if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
+              }
+            } else {
+              if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
+            }
+            str_target_ = nullptr;
+          }
+          break;
         }
 
-        current_key_ = key;
-      } else if (in_params_ && depth_ == params_depth_) {
-        // Keys inside the params object (Tier 2 semantic parsing).
-        params_key_ = key;
+        case WUFFS_BASE__TOKEN__VBC__NUMBER: {
+          if (depth_ == 1 && current_key_ == "id") {
+            const absl::string_view num = chunk.substr(tok_start - chunk_base, tlen);
+            int64_t i_val; double d_val;
+            if      (absl::SimpleAtoi(num, &i_val)) id_ = std::to_string(i_val);
+            else if (absl::SimpleAtod(num, &d_val)) id_ = std::to_string(static_cast<int64_t>(d_val));
+          }
+          if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
+          break;
+        }
+
+        case WUFFS_BASE__TOKEN__VBC__LITERAL:
+          if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
+          break;
+
+        default: break;
+        } // switch(vbc)
+
+        if (has_error_) break;
+      } // while tokens
+
+      if (has_error_) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("agent body JSON-RPC parse error: ", error_));
       }
-      return true;
-    }
 
-    bool onStringStart() override {
-      str_target_ = nullptr;
-      if (depth_ == 1) {
-        if      (current_key_ == "id")     { id_.clear();     str_target_ = &id_; }
-        else if (current_key_ == "method") { method_.clear(); str_target_ = &method_; }
-      } else if (in_params_ && depth_ == params_depth_) {
-        // Short string fields inside params — only set target for known routing fields.
-        if      (params_key_ == "name") { params_name_.clear(); str_target_ = &params_name_; }
-        else if (params_key_ == "uri")  { params_uri_.clear();  str_target_ = &params_uri_; }
-        else if (params_key_ == "ref")  { params_ref_.clear();  str_target_ = &params_ref_; }
+      if (status.repr == nullptr) { wuffs_done_ = true; break; } // OK
+      // Notes (prefixed '@') signal informational events; end_of_data is one.
+      if (wuffs_base__status__is_note(&status)) { wuffs_done_ = true; break; }
+      if (!wuffs_base__status__is_suspension(&status)) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("wuffs json: ", wuffs_base__status__message(&status)));
       }
-      return true;
+      if (status.repr == wuffs_base__suspension__short_read) break; // need more input
+      // short_write: token buffer full — reset and retry same source position.
+      tok_buf_.meta.ri = tok_buf_.meta.wi = 0;
     }
 
-    bool onStringChunk(absl::string_view chunk) override {
-      if (str_target_) str_target_->append(chunk);
-      return true;
-    }
+    return absl::OkStatus();
+  }
 
-    bool onStringEnd() override {
-      str_target_ = nullptr;
-      return true;
-    }
-
-    bool onInt(int64_t v) override {
-      if (depth_ == 1 && current_key_ == "id") id_ = std::to_string(v);
-      return true;
-    }
-
-    bool onFloat(double v) override {
-      if (depth_ == 1 && current_key_ == "id")
-        id_ = std::to_string(static_cast<int64_t>(v));
-      return true;
-    }
-
-    bool onBool(bool /*v*/) override { return true; }
-    bool onNull()           override { return true; }
-  };
-
-  // Populate payload routing fields from the semantically-parsed params fields
-  // extracted by AgentHandler in Tier 2 (no nlohmann, no params_raw).
-  static void populateParamsFromFields(AgentHandler& h, AgentPayload& payload) {
+  void populatePayload(AgentPayload& payload) const {
     switch (payload.invocation) {
     case AgentInvocation::ToolsCall:
-      payload.tool_name = std::move(h.params_name_);
-      if (!h.params_arguments_.empty())
-        payload.arguments = std::move(h.params_arguments_);
+      payload.tool_name = params_name_;
       break;
     case AgentInvocation::ResourcesRead:
     case AgentInvocation::ResourcesSubscribe:
     case AgentInvocation::ResourcesUnsubscribe:
-      payload.resource_uri = std::move(h.params_uri_);
+      payload.resource_uri = params_uri_;
       break;
     case AgentInvocation::PromptsGet:
-      payload.prompt_name = std::move(h.params_name_);
-      if (!h.params_arguments_.empty())
-        payload.arguments = std::move(h.params_arguments_);
+      payload.prompt_name = params_name_;
       break;
     case AgentInvocation::CompletionComplete:
-      payload.completion_ref = std::move(h.params_ref_);
-      break;
-    case AgentInvocation::Initialize:
-      if (!h.params_capabilities_.empty())
-        payload.capabilities = std::move(h.params_capabilities_);
+      payload.completion_ref = params_ref_;
       break;
     default:
       break;
     }
   }
 
-  static void populateParams(const json& params, AgentPayload& payload, PayloadStore& store) {
-    auto str = [&](const char* k) -> std::string {
-      return (params.contains(k) && params[k].is_string()) ? params[k].get<std::string>() : "";
-    };
-    auto field = [&](const char* k) -> PayloadRef {
-      return params.contains(k) ? store.store(params[k].dump(), PayloadKind::JsonObject)
-                                : PayloadRef{};
-    };
-    switch (payload.invocation) {
-    case AgentInvocation::ToolsCall:
-      payload.tool_name = str("name");
-      payload.arguments = field("arguments");
-      break;
-    case AgentInvocation::ResourcesRead:
-    case AgentInvocation::ResourcesSubscribe:
-    case AgentInvocation::ResourcesUnsubscribe:
-      payload.resource_uri = str("uri");
-      break;
-    case AgentInvocation::PromptsGet:
-      payload.prompt_name = str("name");
-      payload.arguments   = field("arguments");
-      break;
-    case AgentInvocation::CompletionComplete:
-      payload.completion_ref = str("ref");
-      break;
-    case AgentInvocation::Initialize:
-      payload.capabilities = field("capabilities");
-      break;
-    default:
-      break;
+  void makeSubRef(PayloadRef& ref, size_t start, size_t len,
+                  const PayloadRef& residual, PayloadKind kind) {
+    if (len == 0 || residual.empty()) return;
+    if (residual.storage() == PayloadRef::Storage::External) {
+      ref = PayloadRef::makeExternal(residual.externalOffset() + start, len);
+    } else {
+      std::string full = residual.toString();
+      if (start < full.size()) {
+        ref = store_.store(
+            full.substr(start, std::min(len, full.size() - start)), kind);
+      }
     }
   }
 
-  // currentBodyPos() returns the absolute byte offset within the full body of
-  // the byte currently being processed by the tokenizer.  Valid only while
-  // inside tokenizer_.feed() (i.e., during handler callbacks).
-  size_t currentBodyPos() const {
-    return chunk_base_ + tokenizer_.currentFeedPos();
-  }
-
+  // ── Config / infra ───────────────────────────────────────────────────────
   const Http::RequestHeaderMap& headers_;
   const std::string             http_method_;
   const std::string             path_;
   const DecoderConfig&          config_;
   PayloadStore&                 store_;
   size_t                        total_bytes_{0};
-  size_t                        chunk_base_{0};      // absolute offset of current chunk start
-  size_t                        params_byte_start_{0}; // body offset of params '{' or '['
-  size_t                        params_byte_end_{0};   // body offset one past params '}' or ']'
-  AgentHandler                  handler_;        // must be before tokenizer_
-  IncrementalJsonTokenizer      tokenizer_;
   std::unique_ptr<StreamWriter> residual_writer_;
+
+  // ── Wuffs streaming state (persists across feed() calls) ─────────────────
+  wuffs_json__decoder::unique_ptr dec_;
+  static constexpr size_t         kTokBufLen = 256;
+  wuffs_base__token               tok_data_[kTokBufLen];
+  wuffs_base__token_buffer        tok_buf_{};
+  size_t                          body_src_pos_{0};
+  bool                            wuffs_done_{false};
+
+  // ── Depth / structure tracking ────────────────────────────────────────────
+  static constexpr int kMaxDepth = 8;
+  int  depth_{0};
+  bool is_dict_[kMaxDepth]{};
+  bool expecting_key_[kMaxDepth]{};
+
+  // ── String accumulation ───────────────────────────────────────────────────
+  bool         in_chain_{false};
+  bool         string_is_key_{false};
+  std::string  str_acc_;
+  std::string* str_target_{nullptr};
+
+  // ── Top-level extracted fields ────────────────────────────────────────────
+  std::string current_key_;
+  std::string id_;
+  std::string method_;
+
+  // ── params byte-range tracking ────────────────────────────────────────────
+  bool   in_params_{false};
+  size_t params_byte_start_{0};
+  size_t params_byte_end_{0};
+
+  // ── params sub-field extraction ───────────────────────────────────────────
+  std::string params_key_;
+  std::string params_name_;
+  std::string params_uri_;
+  std::string params_ref_;
+
+  // ── sub-container (arguments / capabilities) byte-range tracking ──────────
+  bool        in_sub_container_{false};
+  bool        sub_is_arguments_{false};
+  size_t      sub_container_start_{0};
+  size_t      arguments_byte_start_{0};
+  size_t      arguments_byte_end_{0};
+  size_t      capabilities_byte_start_{0};
+  size_t      capabilities_byte_end_{0};
+  PayloadKind arguments_kind_{PayloadKind::JsonObject};
+
+  // ── Duplicate-key tracking ────────────────────────────────────────────────
+  bool seen_jsonrpc_{false};
+  bool seen_id_{false};
+  bool seen_method_{false};
+  bool seen_params_{false};
+
+  // ── Error state ───────────────────────────────────────────────────────────
+  bool        has_error_{false};
+  std::string error_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

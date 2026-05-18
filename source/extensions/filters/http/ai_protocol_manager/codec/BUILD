@@ -66,19 +66,37 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "wuffs_json_lib",
+    hdrs = ["wuffs_json.h"],
+    srcs = [
+        "wuffs_json.cc",
+        "wuffs_impl.c",
+    ],
+    deps = [
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:str_format",
+        "@wuffs//:wuffs",
+    ],
+    copts = ["-Wno-unused-function"],
+)
+
+envoy_cc_library(
     name = "request_decoder_lib",
     hdrs = ["request_decoder.h"],
     srcs = ["request_decoder.cc"],
     deps = [
         ":ai_request_lib",
         ":protocol_classifier_lib",
+        ":wuffs_json_lib",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/strings",
-        "@nlohmann_json//:json",
+        "@wuffs//:wuffs",
     ],
+    copts = ["-Wno-unused-function"],
 )
 
 envoy_cc_library(
