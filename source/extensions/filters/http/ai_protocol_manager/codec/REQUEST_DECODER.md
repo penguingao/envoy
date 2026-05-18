@@ -987,3 +987,493 @@ MmapPayloadStore payload_store_{"/tmp", config->decoderConfig().max_inline_bytes
 5. Auth ordering: no parsed field from `InferenceHandler` or `AgentHandler` is
    moved into the `AiRequest` until `finish()` is called from `onEndStream()`.
    `feed()` accumulates into handler members only.
+
+---
+
+## End-to-end flow — incremental parsing with both storage backends
+
+This section traces a single request from the first byte in `decodeHeaders` to
+the upstream write, showing exactly where each storage backend diverges.
+
+### Setup
+
+The filter constructs one `PayloadStore` for the lifetime of the request stream.
+Which implementation is used determines how large fields are backed:
+
+| Context | Implementation | Large field backing |
+|---|---|---|
+| Production filter | `MmapPayloadStore("/tmp", 4096)` | mmap-backed temp file (OS page-cache) |
+| Unit / integration tests | `InMemoryPayloadStore(4096)` | heap `Buffer::OwnedImpl` |
+
+Both satisfy the same `PayloadStore` interface. The parser and dispatch layers
+never inspect which backend is active.
+
+If `MmapPayloadStore` fails to create or map its backing file (e.g. no disk space),
+it transparently degrades: large fields fall back to `PayloadRef::Buffered` (heap)
+rather than `PayloadRef::External`, so the system stays functional.
+
+---
+
+### Phase 1 — Headers (`RequestDecoder::onHeaders`)
+
+The classifier inspects HTTP method, path, and headers. No body bytes have
+arrived. Based on the result it allocates the right body parser and sets decoder
+state:
+
+- Inference path → `InferenceBodyParser` created, state = `ParsingInferenceBody`
+- Agent path (MCP / A2A) → `AgentBodyParser` created, state = `ParsingAgentBody`
+
+No `PayloadStore` calls happen here.
+
+---
+
+### Phase 2 — Body chunks (`RequestDecoder::onData` → `parser.feed()`)
+
+Each chunk runs two paths in parallel before returning.
+
+#### Path A — Raw body streaming (full-body capture)
+
+On the first chunk the parser opens a streaming write session:
+
+```cpp
+residual_writer_ = store_.beginStore(PayloadKind::JsonObject);
+```
+
+Every subsequent chunk is appended verbatim before the tokenizer sees it:
+
+```cpp
+residual_writer_->append(chunk);
+```
+
+What this produces depends on the backend:
+
+| Backend | `beginStore` returns | `finalize()` returns |
+|---|---|---|
+| `MmapPayloadStore` | `MmapStreamWriter` — appends into the mmap arena at `write_offset_`, advances the cursor | `PayloadRef::External{start_offset, total}` for large; `PayloadRef::Inline` for small |
+| `InMemoryPayloadStore` | Writer accumulating into a heap `std::string` | `PayloadRef::Buffered(OwnedImpl)` for large; `PayloadRef::Inline` for small |
+
+The full raw body lands in storage incrementally, with no contiguous intermediate
+heap buffer.
+
+#### Path B — Incremental semantic parsing
+
+The same chunk bytes are fed to `IncrementalJsonTokenizer`. The 14-state machine
+processes one byte at a time through explicit data-member state. There is no
+recursion and no call-stack parse frame — parsing suspends at any byte and resumes
+on the next `feed()` call.
+
+The tokenizer operates in two modes:
+
+**Semantic mode** fires `Handler` callbacks as tokens complete. The handler
+extracts scalar fields (`model`, `stream`, `method`, `id`, sampling params, etc.)
+directly into plain struct members. The only allocation is `token_buf_`, which
+accumulates the bytes of whichever string or number token is currently in flight.
+
+**Capture mode** (`ParseState::InCapture`) activates when the handler calls
+`startCapture(writer)` from inside an `onStartObject` or `onStartArray` callback.
+The tokenizer stops firing semantic events and instead forwards every raw byte
+directly into the `StreamWriter`. It tracks only quote, escape, and nesting depth
+to detect the container's closing delimiter. No `token_buf_` growth, no per-byte
+heap allocation. When the matching `}` or `]` arrives, `onEndObject` /
+`onEndArray` fires once and the tokenizer returns to semantic mode.
+
+**Where capture activates:**
+
+| Parser | Trigger | `StreamWriter` opened on |
+|---|---|---|
+| `InferenceBodyParser` | Object or array at depth 3 inside `messages[]` or `tools[]` | `store_.beginStore()` — same backend as `residual_writer_` |
+| `AgentBodyParser` | `params` value at depth 2 | `StringStreamWriter` (inline heap `std::string`) |
+
+`AgentBodyParser` uses a `StringStreamWriter` (not the `PayloadStore`) for params
+because the captured bytes must be passed to `nlohmann::json::parse()` in
+`finish()` to extract sub-fields like `tool_name`. The heap cost is bounded by
+the size of the params object, not the full body.
+
+**Concurrent writer sessions during element capture (`MmapPayloadStore` only):**
+
+While an `InferenceBodyParser` element is being captured, two `MmapStreamWriter`
+sessions are active simultaneously — `residual_writer_` writing the full body and
+`elem_writer_` writing the captured element. Both advance the same `write_offset_`
+into the same mmap arena from different starting offsets. The arena's bump-allocator
+layout ensures no overlap:
+
+```
+mmap arena
+  [0 .................. residual_start]
+                          ↑
+                    residual_writer_ (full body, always open)
+                          
+  [....... elem_start .... elem_end ..]
+                ↑
+          elem_writer_ (open during InCapture only)
+```
+
+#### Duplicate-key detection (inline with semantic parsing)
+
+Inside `onKey()`, before any field extraction, the handler checks a `seen_*` bool
+for each known depth-1 key. On a second occurrence it sets `has_error_` with the
+specific key name and returns `false`. The tokenizer converts this into
+`InvalidArgument`. `feed()` surfaces the handler's error string. Back in
+`filter.cc::decodeData()`, `!status.ok()` triggers `sendLocalReply(400)` —
+the request is rejected before auth, routing, or the upstream sees it.
+
+---
+
+### Phase 3 — End of stream (`RequestDecoder::onEndStream` → `parser.finish()`)
+
+1. `tokenizer_.finish()` — flushes any trailing number token (numbers have no
+   terminator character; the end of input is their close signal).
+2. `residual_writer_->finalize()` — commits the full raw body and returns a
+   `PayloadRef` stored as `payload.residual_params`.
+3. **`AgentBodyParser` only** — passes the captured `params_buf_` to
+   `nlohmann::json::parse()`. Only the already-isolated params bytes are re-parsed,
+   not the full body. Extracted sub-fields (`tool_name`, `resource_uri`,
+   `prompt_name`) are stored via `store_.store()`.
+4. All accumulated scalars and `PayloadRef`s are moved into the `AiRequest` payload.
+   Nothing is copied: `std::move` transfers ownership of strings and refs.
+
+---
+
+### Phase 4 — Chain and dispatch
+
+The `AgenticChain` (including `McpAuthFilter`) runs against the `AiRequest`. Auth
+and routing decisions use plain strings (`rpc_method`, `tool_name`, `principal`) —
+no `PayloadStore` access is needed at this phase.
+
+When `AgenticDispatch` re-encodes the body to forward upstream, it materialises
+`External` refs back into bytes:
+
+```cpp
+PayloadStore::fetchAsync(ref, dispatcher, callback);
+```
+
+| Backend | `External` ref behaviour |
+|---|---|
+| `MmapPayloadStore` | Spawns a detached thread calling `pread(fd, offset, len)`. Page faults happen off the event loop thread. Callback is posted back to the dispatcher once the read completes. |
+| `InMemoryPayloadStore` | No `External` refs are ever produced. `fetch()` resolves `Inline` and `Buffered` refs synchronously via `ref.toString()`. |
+
+`Inline` and `Buffered` refs are always resolved synchronously on both backends.
+`prefetchExternalPayloadRefs` upgrades all `External` refs to `Buffered` before
+`doDispatch()` runs, so encoders call `ref.toString()` with no mmap access.
+
+---
+
+### `PayloadRef` storage variants — where each backend produces them
+
+```
+PayloadRef
+ ├── Inline   ≤ max_inline_bytes
+ │            both backends
+ │            data in std::string, on heap, synchronous fetch
+ │
+ ├── Buffered > max_inline_bytes
+ │            InMemoryPayloadStore (always)
+ │            MmapPayloadStore (fallback when mmap unavailable)
+ │            data in Buffer::OwnedImpl, on heap, synchronous fetch
+ │
+ └── External > max_inline_bytes
+              MmapPayloadStore only (when mmap healthy)
+              data in OS page-cache, not heap malloc
+              {offset, length} into the mmap arena
+              fetched via pread() on a background thread
+```
+
+---
+
+### Peak heap by tier and backend
+
+| Tier | Condition | `MmapPayloadStore` heap | `InMemoryPayloadStore` heap |
+|---|---|---|---|
+| 1 | Body ≤ `max_element_capture_bytes` (256 KB) | One chunk window + `MmapStreamWriter` metadata | One chunk window + all element strings accumulating in heap writers |
+| 2 | Body ≤ `max_body_bytes` (4 MB) | One chunk window + `token_buf_` (scales with largest string value) | Full body in `OwnedImpl` + `token_buf_` |
+| 3 | Body > `max_body_bytes` | Rejected in `feed()` before `finalize()` is reached | Same |
+
+The mmap arena is RSS (page-cache backed). It does not count against the process's
+malloc budget, and the kernel can evict pages under memory pressure as long as the
+file descriptor remains open.
+
+---
+
+## Deep Memory Analysis
+
+### Taxonomy: heap vs RSS
+
+Before counting allocations it is important to distinguish two memory concepts:
+
+**Heap** — memory returned by `malloc` / `new`. Non-evictable. Counted by RSS and
+by the allocator's own bookkeeping. A spike here directly competes with every other
+allocation in the process.
+
+**RSS (Resident Set Size)** — all physical pages currently mapped into the process,
+including heap, stack, code segments, and mmap regions. mmap pages are included in
+RSS but are backed by the page-cache: the kernel can silently evict them under
+memory pressure and reload them from the file descriptor on next access, without
+the process noticing. A spike in RSS from mmap does not starve the heap allocator.
+
+All figures below track **heap only** unless explicitly noted as RSS.
+
+---
+
+### The nlohmann eager-lexer problem (old design)
+
+Under the old design the full body was buffered first, then parsed with nlohmann's
+`sax_parse()`. Even in SAX mode, nlohmann's internal lexer is eager: it fully
+tokenizes each JSON value — allocating a `std::string` for every string it
+encounters — before firing any callback. The handler cannot intercept this.
+
+For a multimodal inference request with a 10 MB base64 image:
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [{"role": "user", "content": [{"type": "image_url",
+    "image_url": {"url": "data:image/jpeg;base64,<10 MB>"}}]}]
+}
+```
+
+The old peak heap had two simultaneous allocations:
+
+```
+body_buffer_  — body buffered before parse          ≈ 10 MB   (heap)
+nlohmann transient — std::string for the image URL  ≈ 10 MB   (heap, inside sax_parse)
+─────────────────────────────────────────────────────────────
+peak heap                                           ≈ 20 MB   for a 10 MB body
+```
+
+These two exist at the same time: `sax_parse()` runs against the already-buffered
+body, so `body_buffer_` has not been freed yet when the transient is allocated.
+After `sax_parse()` returns the transient is freed, and shortly after `body_buffer_`
+is freed too — but their simultaneous peak is approximately `2 × body`.
+
+---
+
+### New design: how the tokenizer eliminates the transient
+
+`IncrementalJsonTokenizer` never builds a string for content that is being captured.
+When the handler calls `startCapture(writer)` on the opening `{` of a messages
+element, the tokenizer enters `ParseState::InCapture`. From that point every byte is
+forwarded directly to the `StreamWriter` — the `InCapture` case in `processByte()`
+does not touch `token_buf_` at all:
+
+```cpp
+case ParseState::InCapture:
+    capture_writer_->append({reinterpret_cast<const char*>(&c), 1});
+    // track quote/escape/depth only — no token_buf_ involvement
+```
+
+So for the same 10 MB image, the tokenizer never enters `InStringValue` state for
+the image string. The `"data:image/jpeg;base64,<10 MB>"` bytes pass through
+`InCapture` one at a time, each going straight to the `StreamWriter`. No
+`std::string` of any size representing the image is ever allocated on the heap.
+
+The transient allocation problem is eliminated entirely, regardless of which
+`PayloadStore` backend is in use.
+
+---
+
+### `InMemoryStreamWriter` — heap behaviour in capture mode
+
+`InMemoryStreamWriter` is the `StreamWriter` returned by `InMemoryPayloadStore::beginStore()`.
+Its `append()` calls `buf_.add()` on a heap `Buffer::OwnedImpl`:
+
+```cpp
+void append(absl::string_view bytes) override {
+    buf_.add(bytes.data(), bytes.size());   // grows heap OwnedImpl
+}
+
+PayloadRef finalize() override {
+    return store_.store(buf_, kind_);       // → PayloadRef::Buffered
+}
+```
+
+For the 10 MB image in capture mode with `InMemoryPayloadStore`:
+
+```
+InCapture byte loop → append() → buf_.add() → OwnedImpl grows to 10 MB on heap
+finalize()          → PayloadRef::Buffered  → OwnedImpl transferred into ref
+```
+
+The 10 MB **does** end up on heap, but the critical difference from nlohmann is
+that it is the **only** 10 MB allocation. There is no separate body buffer because
+`residual_writer_` streams the full body into storage incrementally chunk-by-chunk
+rather than buffering it all before parsing. The nlohmann `body_buffer_ + transient`
+double-count is gone.
+
+| Allocation | nlohmann (old) | `InMemoryStreamWriter` (new) |
+|---|---|---|
+| Body buffer before parse | ≈ 10 MB (mandatory) | None — streamed chunk by chunk |
+| Tokenizer transient per string | ≈ 10 MB (mandatory, eager lexer) | None — `InCapture` bypasses `token_buf_` |
+| Element storage after capture | ≈ 10 MB (copy into `PayloadRef::Buffered`) | ≈ 10 MB (`OwnedImpl` in `PayloadRef::Buffered`) |
+| **Peak heap** | **≈ 20 MB** (body + transient simultaneous) | **≈ 10 MB** (element only) |
+
+`InMemoryStreamWriter` solves the transient problem but the captured element still
+lives on heap. This is acceptable for tests. Production uses `MmapStreamWriter`.
+
+---
+
+### `MmapStreamWriter` — heap behaviour in capture mode
+
+`MmapStreamWriter::append()` calls `store_.appendBytes()`, which does a `memcpy`
+into the mmap arena:
+
+```cpp
+void MmapStreamWriter::append(absl::string_view bytes) {
+    store_.appendBytes(bytes.data(), bytes.size());  // memcpy into mmap region
+    total_written_ += bytes.size();
+}
+```
+
+The mmap region is page-cache backed — it is RSS but not heap. For the 10 MB image:
+
+```
+InCapture byte loop → append() → memcpy into mmap arena  (RSS, not heap)
+finalize()          → PayloadRef::External{offset, len}  (8-byte struct on heap)
+```
+
+The only heap allocation for the entire 10 MB element is the 8-byte `PayloadRef`
+struct that records where in the arena it lives. The element bytes themselves are
+in the page-cache and can be evicted by the kernel at any time while the fd is open.
+
+| Allocation | `MmapStreamWriter` |
+|---|---|
+| Body buffer before parse | None |
+| Tokenizer transient per string | None |
+| Element storage after capture | None on heap — bytes in mmap page-cache (RSS only) |
+| `PayloadRef` handle | 8 bytes on heap |
+| **Peak heap** | **One chunk window + handler state** |
+
+---
+
+### `token_buf_` — the remaining heap cost in semantic mode
+
+`token_buf_` is the only field that grows on the heap during tokenization in
+semantic mode. It accumulates the bytes of whichever string or number token is
+currently in flight and is cleared after each callback fires.
+
+Its peak size at any point equals the length of the **longest single string token**
+the tokenizer has seen in semantic mode. In practice this means:
+
+- Short scalar fields (`"model"`, `"stream"`, small string values) → `token_buf_`
+  stays small (tens to hundreds of bytes)
+- A long `"stop"` sequence string or a verbose `"model"` name → `token_buf_`
+  grows to match, then is cleared
+
+Crucially, `token_buf_` is **not** involved when the tokenizer is in `InCapture`
+state. The image URL, the tool schema, the message content — none of those bytes
+touch `token_buf_`. Only the envelope scalars at depth 1 that the handler extracts
+(and which are intentionally small) pass through `token_buf_` in semantic mode.
+
+In Tier 2 (body > `max_element_capture_bytes`, capture disabled), the tokenizer
+stays in semantic mode throughout. Any large string value nested inside `messages`
+or `tools` — a base64 image, a long tool description — will grow `token_buf_` to
+match its length. This is the Tier 2 heap cost and it is unavoidable without
+capture mode.
+
+---
+
+### Concurrent writer sessions — heap accounting
+
+During element capture in `InferenceBodyParser`, two writers are active
+simultaneously. Their heap cost depends on the backend:
+
+```
+residual_writer_  (open from first chunk, always)
+elem_writer_      (open during InCapture only)
+```
+
+**`MmapPayloadStore`**: both writers are `MmapStreamWriter` instances. Each holds
+only a `size_t start_offset_` and a `size_t total_written_` — a handful of bytes
+on the heap. The bytes they write go into the mmap arena (RSS, not heap). Peak
+heap from both writers combined is negligible.
+
+**`InMemoryPayloadStore`**: both writers are `InMemoryStreamWriter` instances, each
+holding a `Buffer::OwnedImpl buf_`. At the moment a messages element finishes
+capturing, both `buf_`s are live simultaneously:
+
+```
+residual_writer_.buf_  — full body accumulated so far  ≈ body_so_far bytes (heap)
+elem_writer_.buf_      — just the element              ≈ element bytes (heap)
+```
+
+For a 10 MB body where the image element spans most of it, both could be large at
+the same time. This is the main reason `InMemoryPayloadStore` is not used in
+production.
+
+---
+
+### Multimodal worst-case — full heap walkthrough
+
+**Scenario**: 10 MB tools/call body, `params` contains a 9 MB base64 image
+argument. Body exceeds `max_element_capture_bytes` (256 KB) → **Tier 2**.
+
+Because capture is disabled in Tier 2, the `AgentBodyParser` tokenizer stays in
+semantic mode throughout. When it reaches the 9 MB base64 string inside `params`,
+it is in `InStringValue` state and accumulates every byte into `token_buf_`:
+
+```
+token_buf_  — 9 MB string value accumulating              9 MB  (heap)
+```
+
+Meanwhile `residual_writer_` is streaming the full body into the store. With
+`MmapPayloadStore` that is in the mmap arena (RSS). With `InMemoryPayloadStore`
+that is a growing `OwnedImpl` (heap).
+
+Peak heap by backend:
+
+```
+MmapPayloadStore:
+    token_buf_              ≈ 9 MB  (heap)
+    MmapStreamWriter state  < 1 KB  (heap)
+    mmap arena              ≈ 10 MB (RSS, not heap)
+    ─────────────────────────────────────────
+    peak heap               ≈ 9 MB
+
+InMemoryPayloadStore:
+    token_buf_              ≈ 9 MB  (heap)
+    residual OwnedImpl      ≈ 10 MB (heap)
+    ─────────────────────────────────────────
+    peak heap               ≈ 19 MB
+```
+
+The `token_buf_` cost in Tier 2 with `MmapPayloadStore` is therefore comparable to
+the old nlohmann transient — both scale with the largest string value. The
+difference is that the body buffer (`body_buffer_` in the old design, `OwnedImpl`
+in `InMemoryPayloadStore`) is eliminated.
+
+**Scenario**: same 10 MB body, `max_element_capture_bytes` = 256 KB is respected →
+body is ≤ threshold → **Tier 1**. Capture fires for `params`.
+
+```
+MmapPayloadStore:
+    token_buf_              < 1 KB  (heap — only depth-1 scalars: method, id)
+    MmapStreamWriter state  < 1 KB  (heap)
+    mmap arena              ≈ 10 MB (RSS, not heap)
+    ─────────────────────────────────────────
+    peak heap               < 2 KB
+
+InMemoryPayloadStore:
+    token_buf_              < 1 KB  (heap)
+    residual OwnedImpl      ≈ 10 MB (heap)
+    params OwnedImpl        ≈ 10 MB (heap, concurrent with residual during capture)
+    ─────────────────────────────────────────
+    peak heap               ≈ 20 MB  (both OwnedImpl live simultaneously)
+```
+
+Tier 1 with `MmapPayloadStore` is where the design fully delivers: the entire 10 MB
+body is in the page-cache and the process heap is essentially untouched regardless
+of body size.
+
+---
+
+### Summary — heap cost per component
+
+| Component | When active | `MmapPayloadStore` heap | `InMemoryPayloadStore` heap |
+|---|---|---|---|
+| `residual_writer_` session | Always, from first chunk | `MmapStreamWriter` metadata only (< 1 KB) | `OwnedImpl` growing to full body size |
+| `elem_writer_` session | During `InCapture` (Tier 1 only) | `MmapStreamWriter` metadata only (< 1 KB) | `OwnedImpl` growing to element size |
+| `token_buf_` | Semantic mode only | Largest depth-1 scalar (typically small) | Same |
+| `token_buf_` in Tier 2 | Semantic mode throughout (no capture) | Largest string value anywhere in body | Same |
+| `PayloadRef::External` handle | After `finalize()` | 8 bytes per ref | N/A (produces `Buffered` instead) |
+| `PayloadRef::Buffered` | After `finalize()` | N/A (produces `External` instead) | Full element size in `OwnedImpl` |
+| nlohmann transient (old design) | During `sax_parse()` | Eliminated | Eliminated |
+| Body buffer before parse (old design) | Before `sax_parse()` | Eliminated | Eliminated |
