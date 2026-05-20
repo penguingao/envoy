@@ -65,9 +65,185 @@ C++ call stack. This is exactly the property needed for streaming HTTP body pars
 - **No nlohmann**: routing fields are extracted inline during the streaming Wuffs
   scan. There is no second-pass DOM parse at `finish()` time.
 
+## 2. End-to-end pipeline overview
+
+```
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                          Envoy AI Protocol Manager — Request Pipeline                           ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  Downstream client                                                        Upstream provider
+       │                                                                          │
+       │  POST /mcp                              POST /v1/chat/completions        │
+       │  Content-Type: application/json         Content-Type: application/json   │
+       ▼                                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  decodeHeaders()                                                                                │
+│                                                                                                 │
+│   RequestDecoder::onHeaders()                                                                   │
+│     ProtocolClassifier::classify(method, path, headers)                                         │
+│              │                                       │                                          │
+│         AgenticMcp                              Inference                                       │
+│              │                                       │                                          │
+│     agent_parser_ = new                   inference_parser_ = new                              │
+│       AgentBodyParser(config, store)         InferenceBodyParser(config, store)                 │
+│              │                                       │                                          │
+│         state = ParsingAgentBody              state = ParsingInferenceBody                      │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+       │                                                   │
+       │  data chunk(s)                        data chunk(s)
+       ▼                                                   ▼
+┌───────────────────────────────┐           ┌─────────────────────────────────┐
+│  decodeData() × N             │           │  decodeData() × N               │
+│                               │           │                                 │
+│  AgentBodyParser::feed(chunk) │           │  InferenceBodyParser::feed(chunk)│
+│    total_bytes_ += chunk.size │           │    total_bytes_ += chunk.size   │
+│    if > max_body_bytes → 413  │           │    if > max_body_bytes → 413    │
+│                               │           │                                 │
+│    residual_writer_           │           │    residual_writer_             │
+│    ->append(chunk)            │           │    ->append(chunk)              │
+│    ┌────────────────────┐     │           │    ┌────────────────────┐       │
+│    │ MmapStreamWriter   │     │           │    │ MmapStreamWriter   │       │
+│    │ memcpy → mmap arena│     │           │    │ memcpy → mmap arena│       │
+│    └────────────────────┘     │           │    └────────────────────┘       │
+│                               │           │                                 │
+│    feedChunk(chunk, false)    │           │    feedChunk(chunk, false)      │
+│    ┌────────────────────────┐ │           │    ┌──────────────────────────┐ │
+│    │ Wuffs token loop       │ │           │    │ Wuffs token loop         │ │
+│    │                        │ │           │    │                          │ │
+│    │ depth 1:               │ │           │    │ depth 1:                 │ │
+│    │  "method" → method_    │ │           │    │  "model"  → model_       │ │
+│    │  "id"     → id_        │ │           │    │  "stream" → streaming_   │ │
+│    │                        │ │           │    │  numbers  → sampling_    │ │
+│    │ depth 2 (in_params_):  │ │           │    │  "stop"   → sampling_    │ │
+│    │  "name" → params_name_ │ │           │    │                          │ │
+│    │  "uri"  → params_uri_  │ │           │    │ depth 2:                 │ │
+│    │                        │ │           │    │  "messages"→in_messages_ │ │
+│    │ depth 3 (arguments/    │ │           │    │  "tools"  → in_tools_    │ │
+│    │  capabilities):        │ │           │    │                          │ │
+│    │  range start recorded  │ │           │    │ depth 3 (in_messages_ or │ │
+│    │  str_target_=nullptr   │ │           │    │  in_tools_):             │ │
+│    │  → 0 bytes heap        │ │           │    │  elem_start_ recorded    │ │
+│    │                        │ │           │    │  str_target_=nullptr     │ │
+│    │ dup key? → 400 inline  │ │           │    │  → 0 bytes heap          │ │
+│    └────────────────────────┘ │           │    │                          │ │
+│                               │           │    │ dup key? → 400 inline    │ │
+│    short_read → wait for next │           │    └──────────────────────────┘ │
+│    chunk (Wuffs coroutine     │           │                                 │
+│    preserves all parse state) │           │    short_read → wait for next   │
+└───────────────────────────────┘           │    chunk                        │
+                                            └─────────────────────────────────┘
+       │  end_stream                                    │  end_stream
+       ▼                                               ▼
+┌───────────────────────────────┐           ┌─────────────────────────────────┐
+│  AgentBodyParser::finish()    │           │  InferenceBodyParser::finish()  │
+│                               │           │                                 │
+│  feedChunk("", closed=true)   │           │  feedChunk("", closed=true)     │
+│  (flushes trailing number     │           │  (flushes trailing number token)│
+│   token; no-op if done)       │           │                                 │
+│                               │           │  residual_writer_->finalize()   │
+│  residual_writer_->finalize() │           │  → PayloadRef::External         │
+│  → PayloadRef::External       │           │    {offset=0, len=body_size}    │
+│    {offset=0, len=body_size}  │           │  (full body, zero-copy)         │
+│  (full body, zero-copy)       │           │                                 │
+│                               │           │  for each message_ranges_[i]:   │
+│  makeSubRef(params_raw,       │           │    makeSubRef(messages[i])      │
+│    params_start, params_len)  │           │    → External{base+start, len}  │
+│  → External{base+start, len}  │           │    (pointer arithmetic only)    │
+│  (pointer arithmetic only)    │           │                                 │
+│                               │           │  for each tool_ranges_[i]:      │
+│  if captureEnabled():         │           │    makeSubRef(tools[i])         │
+│    makeSubRef(arguments,      │           │    → External{base+start, len}  │
+│      arg_start, arg_len)      │           │                                 │
+│    → External{base+start,len} │           │  AiRequest {                    │
+│    makeSubRef(capabilities,…) │           │    InferencePayload {           │
+│                               │           │      target.name = model_       │
+│  AiRequest {                  │           │      sampling    = sampling_    │
+│    rpc_method = method_       │           │      streaming   = streaming_   │
+│    jsonrpc_id = id_           │           │      messages[]  = [External…]  │
+│    AgentPayload {             │           │      tools[]     = [External…]  │
+│      tool_name   = name_      │           │      residual    = External      │
+│      arguments   = External   │           │    }                            │
+│      params_raw  = External   │           │  }                              │
+│      residual    = External   │           │                                 │
+│    }                          │           │  state = BodyComplete           │
+│  }                            │           └─────────────────────────────────┘
+│  state = BodyComplete         │
+└───────────────────────────────┘
+       │                                               │
+       └────────────────────┬──────────────────────────┘
+                            │
+                            ▼
+           ┌─────────────────────────────────────────┐
+           │  prefetchExternalPayloadRefs()           │
+           │                                          │
+           │  collect all External PayloadRefs        │
+           │  atomic<int> pending = refs.size()       │
+           │                                          │
+           │  for each External ref:                  │
+           │    store.fetchAsync(ref, dispatcher, cb) │
+           │    ┌───────────────────────────────────┐ │
+           │    │ detached thread                   │ │
+           │    │   pread(fd, buf, len, offset)     │ │
+           │    │   ← may page-fault off event loop │ │
+           │    │   dispatcher.post(cb(buf))        │ │
+           │    └───────────────────────────────────┘ │
+           │                                          │
+           │  cb(): ref ← Buffered; --pending         │
+           │  pending==0 → on_done()                  │
+           │  (all refs now Inline or Buffered;        │
+           │   toString() safe, no mmap access)        │
+           └─────────────────────────────────────────┘
+                            │
+                            ▼
+       ┌───────────────────────────────────────────────────┐
+       │  Filter sub-chain (auth, rate-limit, routing…)    │
+       │                                                   │
+       │  MCP path:              Inference path:           │
+       │  read AgentPayload      read InferencePayload     │
+       │  tool_name → policy     target.name → provider   │
+       │  params_raw → audit log sampling → rate limit     │
+       │  arguments → transform  messages → content check  │
+       └───────────────────────────────────────────────────┘
+                            │
+                            ▼
+       ┌───────────────────────────────────────────────────┐
+       │  RequestEncoder                                   │
+       │                                                   │
+       │  MCP path:              Inference path:           │
+       │  AgentRequestEncoder    InferenceRequestEncoder   │
+       │                                                   │
+       │  rebuild JSON-RPC       rebuild REST JSON         │
+       │  envelope from          body from                 │
+       │  AiRequest fields:      AiRequest fields:         │
+       │    id, method,            model, stream,          │
+       │    params_raw             sampling, messages,     │
+       │    (Buffered → str)       tools                   │
+       │                          (Buffered → str)         │
+       │  set upstream headers   set upstream headers      │
+       │  Authorization: Bearer… Authorization: Bearer…    │
+       └───────────────────────────────────────────────────┘
+                            │
+                            ▼
+                     upstream provider
+                  (MCP server / OpenAI API)
+```
+
+**Key properties visible in the diagram:**
+
+| Property | Where it appears |
+|---|---|
+| Wuffs stackless coroutine | `feedChunk` preserves parse state across `decodeData` calls; `short_read` exits cleanly |
+| Zero heap for depth-3+ content | `str_target_=nullptr` in both token loops regardless of value size |
+| All body bytes land in mmap once | `residual_writer_->append(chunk)` runs before `feedChunk`; no second copy |
+| Sub-refs are pointer arithmetic | `makeSubRef` → `External{base+start, len}`, no data copied |
+| Async page-fault isolation | `pread` thread; event loop never blocks on read page-fault |
+| Encoders see only Buffered/Inline | `prefetchExternalPayloadRefs` completes before filter sub-chain runs |
+| Duplicate-key rejection is inline | `has_error_` set during the Wuffs token loop; 400 returned before `finish()` |
+
 ---
 
-## 2. Wuffs token model
+## 3. Wuffs token model
 
 Every call to `wuffs_json__decoder__decode_tokens()` fills `tok_buf_` with as
 many tokens as fit in the 256-slot ring, then returns a status. Tokens are consumed
@@ -136,7 +312,7 @@ left off in the source because source state is managed inside the coroutine.
 
 ---
 
-## 3. Shared infrastructure
+## 4. Shared infrastructure
 
 ### `appendStringToken` free function
 
@@ -226,7 +402,7 @@ stream that `residual_writer_` has captured. `makeSubRef` can safely index into
 
 ---
 
-## 4. InferenceBodyParser
+## 5. InferenceBodyParser
 
 `InferenceBodyParser` is a private inner class of `RequestDecoder`, defined in
 `request_decoder.cc` (lines 81–400). It is constructed when request headers
@@ -452,121 +628,98 @@ streaming — runs identically in both tiers.
 
 ### 4.7 E2E trace — chat/completions (Tier 1)
 
-**Request body:**
+**Request body** (≈90 bytes — Tier 1, `captureEnabled()` = true throughout):
 
 ```json
 {"model":"gpt-4o","stream":true,"max_tokens":512,"messages":[{"role":"user","content":"Hi"}]}
 ```
 
-Body size: approximately 90 bytes. Well under 256 KB → Tier 1.
-`captureEnabled()` returns `true` throughout.
-
-**Token-by-token trace** (`body_src_pos_` starts at 0, `chunk_base = 0`):
+**Token-by-token trace** (`body_src_pos_` starts at 0, `chunk_base = 0`).
+FILLER tokens (whitespace, colons, commas) advance `body_src_pos_` and are omitted.
 
 ```
-STRUCTURE PUSH to_dict=true  ← opening '{' of root object
-  depth_=1, is_dict_[1]=true, expecting_key_[1]=true
-
-STRING DROP '"', COPY "model", DROP '"'
-  first_in_group=true, string_is_key_=true (is_dict_[1] && expecting_key_[1])
-  str_target_=&str_acc_
-  DROP: no-op. COPY: str_acc_="model". DROP: chain complete.
-  !cont → depth_==1: seen_model_=true; current_key_="model"; expecting_key_[1]=false
-
-FILLER ":"
-
-STRING DROP '"', COPY "gpt-4o", DROP '"'
-  first_in_group=true, string_is_key_=false, depth_==1, current_key_=="model"
-    → model_.clear(); str_target_=&model_
-  COPY: model_="gpt-4o"
-  chain complete: is_dict_[1] → expecting_key_[1]=true
-
-STRING COPY "stream" (key)
-  current_key_="stream", seen_stream_=true; expecting_key_[1]=false
-
-LITERAL "true"
-  depth_==1, current_key_=="stream" → streaming_=true
-  is_dict_[1] → expecting_key_[1]=true
-
-STRING COPY "max_tokens" (key)
-  current_key_="max_tokens", seen_max_tokens_=true; expecting_key_[1]=false
-
-NUMBER "512"
-  depth_==1, current_key_=="max_tokens"
-  SimpleAtoi → sampling_.max_tokens=512
-  is_dict_[1] → expecting_key_[1]=true
-
-STRING COPY "messages" (key)
-  current_key_="messages", seen_messages_=true; expecting_key_[1]=false
-
-STRUCTURE PUSH to_dict=false  ← opening '[' of messages array
-  depth_=2, is_dict_[2]=false, expecting_key_[2]=false
-  current_key_=="messages": in_messages_=true, in_tools_=false
-
-STRUCTURE PUSH to_dict=true  ← opening '{' of messages[0]
-  depth_=3, is_dict_[3]=true, expecting_key_[3]=true
-  in_messages_=true && captureEnabled()=true:
-    in_elem_=true, elem_start_=tok_start (offset of '{'), elem_is_dict_=true
-
-STRING COPY "role" (key at depth 3)
-  string_is_key_=true → str_target_=&str_acc_
-  str_acc_="role"
-  chain complete: depth_==3 (not 1, not 2&&in_params_) → expecting_key_[3]=false
-
-STRING COPY "user" (value at depth 3)
-  string_is_key_=false, depth_==3
-    → str_target_=nullptr    ← depth 3 value: discarded, 0 heap
-  chain complete: is_dict_[3] → expecting_key_[3]=true
-
-STRING COPY "content" (key at depth 3)
-  str_acc_="content"; expecting_key_[3]=false
-
-STRING COPY "Hi" (value at depth 3)
-  str_target_=nullptr    ← discarded, 0 heap
-  expecting_key_[3]=true
-
-STRUCTURE POP  ← closing '}' of messages[0]
-  pop_depth=3, depth_=2
-  in_elem_=true:
-    in_elem_=false
-    in_messages_=true → message_ranges_.push_back({elem_start_, body_src_pos_})
-    message_kinds_.push_back(JsonObject)
-  is_dict_[2]=false → no expecting_key_ update
-
-STRUCTURE POP  ← closing ']' of messages array
-  pop_depth=2, depth_=1
-  in_messages_=false, in_tools_=false, in_stop_array_=false
-  is_dict_[1]=true → expecting_key_[1]=true
-
-STRUCTURE POP  ← closing '}' of root object
-  pop_depth=1, depth_=0
-
-decode_tokens returns status==nullptr (OK)
-  wuffs_done_=true, break outer
+Token                                  d      str_target_       State change
+───────────────────────────────────────────────────────────────────────────────────────────
+PUSH {  root object                    0→1    —                 is_dict_[1]=T
+                                                                expecting_key_[1]=T
+───────────────────────────────────────────────────────────────────────────────────────────
+KEY  "model"                           1      &str_acc_         current_key_="model"
+                                                                seen_model_=T
+                                                                expecting_key_[1]=F
+VAL  "gpt-4o"       key==model         1      &model_           model_="gpt-4o"
+                                                                expecting_key_[1]=T
+───────────────────────────────────────────────────────────────────────────────────────────
+KEY  "stream"                          1      &str_acc_         current_key_="stream"
+                                                                seen_stream_=T
+                                                                expecting_key_[1]=F
+LIT  true           key==stream        1      —                 streaming_=true
+                                                                expecting_key_[1]=T
+───────────────────────────────────────────────────────────────────────────────────────────
+KEY  "max_tokens"                      1      &str_acc_         current_key_="max_tokens"
+                                                                seen_max_tokens_=T
+                                                                expecting_key_[1]=F
+NUM  512            key==max_tokens    1      —                 SimpleAtoi →
+                                                                  sampling_.max_tokens=512
+                                                                expecting_key_[1]=T
+───────────────────────────────────────────────────────────────────────────────────────────
+KEY  "messages"                        1      &str_acc_         current_key_="messages"
+                                                                seen_messages_=T
+                                                                expecting_key_[1]=F
+PUSH [  messages array                 1→2    —                 is_dict_[2]=F
+                                                                in_messages_=T
+PUSH {  messages[0]                    2→3    —                 is_dict_[3]=T
+                                                                in_elem_=T
+                                                                elem_start_=offset('{')
+───────────────────────────────────────────────────────────────────────────────────────────
+KEY  "role"         depth 3            3      &str_acc_         str_acc_="role"
+                                                                (no current_key_ update at d=3)
+VAL  "user"         depth 3            3      nullptr  ◀━━━━━  0 bytes heap
+KEY  "content"      depth 3            3      &str_acc_         str_acc_="content"
+VAL  "Hi"           depth 3            3      nullptr  ◀━━━━━  0 bytes heap
+───────────────────────────────────────────────────────────────────────────────────────────
+POP }  messages[0]                     3→2    —                 in_elem_=F
+                                                                message_ranges_ ←
+                                                                  {elem_start_, body_src_pos_}
+                                                                message_kinds_ ← JsonObject
+POP ]  messages array                  2→1    —                 in_messages_=F
+                                                                expecting_key_[1]=T
+POP }  root object                     1→0    —                 —
+───────────────────────────────────────────────────────────────────────────────────────────
+STATUS OK                              —      —                 wuffs_done_=T  break outer
 ```
 
 **finish():**
 
 ```
 feedChunk("", closed=true)
-  wuffs_done_=true → return OK immediately
+  wuffs_done_=T → return OK immediately (no re-entry into Wuffs coroutine)
 
-payload.target.name = "gpt-4o"
+payload.target.name         = "gpt-4o"
 payload.sampling.max_tokens = 512
-request.streaming = true
-payload.residual_params = residual_writer_->finalize()
-  → PayloadRef::External{offset=0, len=90}  (full body in mmap arena)
+request.streaming           = true
 
-message_ranges_[0] = {elem_start, body_src_pos_at_pop}
-makeSubRef(payload.messages[0], elem_start, len, residual, JsonObject)
-  → PayloadRef::External{mmap_offset + elem_start, len}  (no copy)
+residual_params = residual_writer_->finalize()
+               = External{offset=0, len=90}            ← full body, no copy
 
-tool_ranges_ is empty → payload.tools is empty
+message_ranges_[0] = {elem_start, elem_end}
+makeSubRef → messages[0] = External{base+elem_start, elem_len}   pointer arithmetic only
+
+tool_ranges_ empty → payload.tools = []
 ```
 
+**Final `InferencePayload`:**
+
+| Field | Value | Note |
+|---|---|---|
+| `target.name` | `"gpt-4o"` | plain std::string |
+| `sampling.max_tokens` | `512` | int32_t |
+| `streaming` | `true` | bool |
+| `messages[0]` | `External{off_M, len_M}` | zero-copy mmap sub-range |
+| `tools` | `[]` | empty — no tools key in body |
+| `residual_params` | `External{0, 90}` | full body in mmap arena |
 ---
 
-## 5. AgentBodyParser
+## 6. AgentBodyParser
 
 `AgentBodyParser` is a private inner class of `RequestDecoder`, defined in
 `request_decoder.cc` (lines 416–769). It is constructed when request headers
@@ -780,7 +933,7 @@ and is a no-op for those fields. `params_byte_start_/end_` is recorded and
 
 ### 5.7 E2E trace — MCP `tools/call` (Tier 1)
 
-**Request body:**
+**Request body** (≈120 bytes — Tier 1, `captureEnabled()` = true throughout):
 
 ```json
 {
@@ -794,150 +947,118 @@ and is a no-op for those fields. `params_byte_start_/end_` is recorded and
 }
 ```
 
-Body size: approximately 120 bytes. Well under 256 KB → Tier 1. `captureEnabled()`
-returns `true` throughout.
-
-**Token-by-token trace** (`body_src_pos_` starts at 0, `chunk_base = 0`):
+**Token-by-token trace** (`body_src_pos_` starts at 0, `chunk_base = 0`).
+FILLER tokens (whitespace, colons, commas) advance `body_src_pos_` and are omitted.
 
 ```
-STRUCTURE PUSH to_dict=true  ← opening '{' of root object
-  depth_=1, is_dict_[1]=true, expecting_key_[1]=true
-
-STRING chain "jsonrpc" (key)
-  string_is_key_=true → str_target_=&str_acc_; str_acc_="jsonrpc"
-  !cont → depth_==1: seen_jsonrpc_=true; current_key_="jsonrpc"; expecting_key_[1]=false
-
-STRING chain "2.0" (value, depth 1, current_key_=="jsonrpc")
-  string_is_key_=false, depth_==1, current_key_!="id"/"method"
-    → str_target_=nullptr   ← "2.0" discarded, 0 heap
-  chain complete: is_dict_[1] → expecting_key_[1]=true
-
-STRING chain "id" (key)
-  current_key_="id", seen_id_=true
-
-STRING chain "req-1" (value, depth 1, current_key_=="id")
-  str_target_=&id_ → id_="req-1"
-
-STRING chain "method" (key)
-  current_key_="method", seen_method_=true
-
-STRING chain "tools/call" (value, depth 1, current_key_=="method")
-  str_target_=&method_ → method_="tools/call"
-
-STRING chain "params" (key)
-  current_key_="params", seen_params_=true
-
-STRUCTURE PUSH to_dict=true  ← opening '{' of params
-  depth_=2, is_dict_[2]=true, expecting_key_[2]=true
-  current_key_=="params":
-    in_params_=true
-    params_byte_start_=tok_start   ← absolute byte offset of '{' in body
-
-STRING chain "name" (key at depth 2, in_params_)
-  string_is_key_=true → str_acc_="name"
-  !cont → depth_==2 && in_params_: params_key_="name"; expecting_key_[2]=false
-
-STRING chain "read_file" (value, depth 2, in_params_, params_key_=="name")
-  string_is_key_=false, depth_==2, in_params_=true, params_key_=="name"
-    → params_name_.clear(); str_target_=&params_name_
-  str_target_=&params_name_ → params_name_="read_file"
-  chain complete: is_dict_[2] → expecting_key_[2]=true
-
-STRING chain "arguments" (key at depth 2, in_params_)
-  params_key_="arguments"; expecting_key_[2]=false
-
-STRUCTURE PUSH to_dict=true  ← opening '{' of arguments
-  depth_=3, is_dict_[3]=true, expecting_key_[3]=true
-  in_params_ && !in_sub_container_ && params_key_=="arguments":
-    in_sub_container_=true
-    sub_is_arguments_=true
-    sub_container_start_=tok_start   ← byte offset of opening '{' of arguments
-    arguments_kind_=JsonObject
-
-STRING chain "path" (key at depth 3)
-  string_is_key_=true → str_target_=&str_acc_; str_acc_="path"
-  chain complete: depth_==3 (not 1 or 2&&in_params_): expecting_key_[3]=false
-  (no current_key_ or params_key_ update at depth 3)
-
-STRING chain "/etc/config.json" (value at depth 3)
-  string_is_key_=false, depth_==3
-    → str_target_=nullptr   ← depth 3 value: 0 heap allocation
-  chain complete: is_dict_[3] → expecting_key_[3]=true
-
-STRUCTURE POP  ← closing '}' of arguments
-  pop_depth=3, depth_=2
-  in_sub_container_=true:
-    in_sub_container_=false
-    captureEnabled()=true (Tier 1):
-      arguments_byte_start_=sub_container_start_
-      arguments_byte_end_=body_src_pos_         ← one past closing '}'
-  is_dict_[2] → expecting_key_[2]=true
-
-STRUCTURE POP  ← closing '}' of params
-  pop_depth=2, depth_=1
-  in_params_=true:
-    in_params_=false
-    params_byte_end_=body_src_pos_              ← one past closing '}'
-  is_dict_[1] → expecting_key_[1]=true
-
-STRUCTURE POP  ← closing '}' of root object
-  pop_depth=1, depth_=0
-
-decode_tokens returns status==nullptr (OK)
-  wuffs_done_=true, break outer
+Token                                    d      str_target_       State change
+─────────────────────────────────────────────────────────────────────────────────────────────
+PUSH {  root object                      0→1    —                 is_dict_[1]=T
+                                                                  expecting_key_[1]=T
+─────────────────────────────────────────────────────────────────────────────────────────────
+KEY  "jsonrpc"                           1      &str_acc_         current_key_="jsonrpc"
+                                                                  seen_jsonrpc_=T
+                                                                  expecting_key_[1]=F
+VAL  "2.0"      key≠"id", key≠"method"  1      nullptr  ◀━━━━━  0 bytes heap
+                                                                  expecting_key_[1]=T
+─────────────────────────────────────────────────────────────────────────────────────────────
+KEY  "id"                                1      &str_acc_         current_key_="id"
+                                                                  seen_id_=T
+                                                                  expecting_key_[1]=F
+VAL  "req-1"    key==id                  1      &id_              id_="req-1"
+                                                                  expecting_key_[1]=T
+─────────────────────────────────────────────────────────────────────────────────────────────
+KEY  "method"                            1      &str_acc_         current_key_="method"
+                                                                  seen_method_=T
+                                                                  expecting_key_[1]=F
+VAL  "tools/call"  key==method           1      &method_          method_="tools/call"
+                                                                  expecting_key_[1]=T
+─────────────────────────────────────────────────────────────────────────────────────────────
+KEY  "params"                            1      &str_acc_         current_key_="params"
+                                                                  seen_params_=T
+                                                                  expecting_key_[1]=F
+PUSH {  params object                    1→2    —                 is_dict_[2]=T
+                                                                  in_params_=T
+                                                                  params_byte_start_=offset('{')
+─────────────────────────────────────────────────────────────────────────────────────────────
+KEY  "name"     depth 2, in_params_      2      &str_acc_         params_key_="name"
+                                                                  expecting_key_[2]=F
+VAL  "read_file"  params_key==name       2      &params_name_     params_name_="read_file"
+                                                                  expecting_key_[2]=T
+─────────────────────────────────────────────────────────────────────────────────────────────
+KEY  "arguments"  depth 2, in_params_    2      &str_acc_         params_key_="arguments"
+                                                                  expecting_key_[2]=F
+PUSH {  arguments object                 2→3    —                 is_dict_[3]=T
+                                                                  in_sub_container_=T
+                                                                  sub_is_arguments_=T
+                                                                  sub_container_start_=offset('{')
+                                                                  arguments_kind_=JsonObject
+─────────────────────────────────────────────────────────────────────────────────────────────
+KEY  "path"     depth 3                  3      &str_acc_         str_acc_="path"
+                                                                  (no params_key_ update at d=3)
+VAL  "/etc/config.json"  depth 3         3      nullptr  ◀━━━━━  0 bytes heap
+─────────────────────────────────────────────────────────────────────────────────────────────
+POP }  arguments object                  3→2    —                 in_sub_container_=F
+                                                                  captureEnabled()=T → record:
+                                                                    arguments_byte_start_=
+                                                                      sub_container_start_
+                                                                    arguments_byte_end_=
+                                                                      body_src_pos_
+                                                                  expecting_key_[2]=T
+POP }  params object                     2→1    —                 in_params_=F
+                                                                  params_byte_end_=body_src_pos_
+                                                                  expecting_key_[1]=T
+POP }  root object                       1→0    —                 —
+─────────────────────────────────────────────────────────────────────────────────────────────
+STATUS OK                                —      —                 wuffs_done_=T  break outer
 ```
 
 **finish():**
 
 ```
 feedChunk("", closed=true)
-  wuffs_done_=true → return OK immediately
+  wuffs_done_=T → return OK immediately (no re-entry into Wuffs coroutine)
 
 request.jsonrpc_id = "req-1"
 request.rpc_method = "tools/call"
 
-classify({POST, /mcp, headers, "tools/call"})
-  → protocol=AgenticMcp, invocation=AgentInvocation::ToolsCall
-  → payload.dialect=AgentDialect::Mcp
+classify(POST, /mcp, "tools/call")
+  → protocol=AgenticMcp  invocation=ToolsCall  dialect=Mcp
 
-populatePayload(payload):
-  case ToolsCall: payload.tool_name = params_name_ = "read_file"
+populatePayload: payload.tool_name = params_name_ = "read_file"
 
-payload.residual_params = residual_writer_->finalize()
-  → PayloadRef::External{offset=0, len=120}  (full body in mmap arena, no copy)
+residual_params = residual_writer_->finalize()
+               = External{offset=0, len=120}           ← full body, no copy
 
 params_byte_end_ > params_byte_start_:  ✓
-  makeSubRef(payload.params_raw, params_byte_start_, plen, residual, JsonObject)
-  → PayloadRef::External{mmap_offset + params_byte_start_, plen}  (no copy)
-
-arguments_byte_end_ > arguments_byte_start_:  ✓ (Tier 1)
-  makeSubRef(payload.arguments, arguments_byte_start_, alen, residual, JsonObject)
-  → PayloadRef::External{mmap_offset + arguments_byte_start_, alen}  (no copy)
-
+  makeSubRef → params_raw  = External{base+params_start, params_len}   pointer arithmetic
+arguments_byte_end_ > arguments_byte_start_:  ✓  (Tier 1)
+  makeSubRef → arguments   = External{base+arg_start, arg_len}          pointer arithmetic
 capabilities: end==start → makeSubRef is a no-op
 ```
 
-**Final `AgentPayload` state:**
+**Final `AgentPayload`:**
+
+| Field | Value | Note |
+|---|---|---|
+| `invocation` | `AgentInvocation::ToolsCall` | classified from method |
+| `dialect` | `AgentDialect::Mcp` | classified from path |
+| `tool_name` | `"read_file"` | plain std::string |
+| `arguments` | `External{off_A, len_A}` | zero-copy mmap sub-range |
+| `params_raw` | `External{off_P, len_P}` | zero-copy mmap sub-range |
+| `residual_params` | `External{0, 120}` | full body in mmap arena |
 
 ```
-payload.invocation      = AgentInvocation::ToolsCall
-payload.dialect         = AgentDialect::Mcp
-payload.tool_name       = "read_file"                         (plain std::string)
-payload.arguments       = PayloadRef::External{off_A, len_A}  (zero-copy mmap sub-range)
-payload.params_raw      = PayloadRef::External{off_P, len_P}  (zero-copy mmap sub-range)
-payload.residual_params = PayloadRef::External{0, 120}        (full body in mmap arena)
-
-request.jsonrpc_id  = "req-1"
-request.rpc_method  = "tools/call"
+request.jsonrpc_id = "req-1"
+request.rpc_method = "tools/call"
 ```
 
-No intermediate `params_buf_`, no `StringStreamWriter`, no `nlohmann` DOM. All
-three sub-refs point into the same mmap region as `residual_params`, created with
-pointer arithmetic only.
+All three `External` refs point into the same mmap region as `residual_params`.
+No intermediate copy, no `nlohmann` DOM, no `StringStreamWriter`.
 
 ---
 
-## 6. Memory analysis
+## 7. Memory analysis
 
 ### 6.1 Old vs new: the `token_buf_` vulnerability
 
@@ -1035,7 +1156,7 @@ difference is which `PayloadRef`s are populated in `finish()`.
 
 ---
 
-## 7. Invariants and security guarantees
+## 8. Invariants and security guarantees
 
 The following six invariants hold for both `InferenceBodyParser` and
 `AgentBodyParser` identically. They are consequences of the shared `feedChunk`
@@ -1123,7 +1244,7 @@ operation allocates more than 65535 bytes per token.
 
 ---
 
-## 8. Configuration
+## 9. Configuration
 
 `DecoderConfig` is defined in `request_decoder.h` and is the single
 configuration knob for both parsers:
@@ -1147,7 +1268,7 @@ owned by the outer filter and outlives the decoder.
 
 ---
 
-## 9. PayloadRef storage model
+## 10. PayloadRef storage model
 
 `PayloadRef` (defined in `ai_payload.h`) is a lightweight discriminated-union
 handle to a field value. All large field values in `InferencePayload` and
@@ -1224,7 +1345,7 @@ Each sub-ref (messages[i], tools[i], arguments, params_raw):
 
 ---
 
-## 10. StreamWriter and PayloadStore interfaces
+## 11. StreamWriter and PayloadStore interfaces
 
 Both parsers call `store_.beginStore(PayloadKind::JsonObject)` on the first
 `feed()` call to open a streaming write session, then call
@@ -1275,7 +1396,7 @@ this pointer.
 
 ---
 
-## 11. MmapPayloadStore
+## 12. MmapPayloadStore
 
 `MmapPayloadStore` (in `mmap_payload_store.h/.cc`) offloads large payloads to
 an anonymous temp file via `mmap`, keeping only fields at or below
@@ -1356,7 +1477,7 @@ it never touches the store object.
 
 ---
 
-## 12. MmapStreamWriter
+## 13. MmapStreamWriter
 
 `MmapStreamWriter` is a nested class inside `MmapPayloadStore`. It opens a
 streaming session at the current `write_offset_` of its parent store.
@@ -1406,7 +1527,7 @@ Key properties:
 
 ---
 
-## 13. External payload fetch pipeline
+## 14. External payload fetch pipeline
 
 `External` refs cannot be materialized by `PayloadRef::toString()`. Three layers
 handle materialization, from fine-grained to coarse-grained:
@@ -1496,7 +1617,7 @@ relative to the `memcpy` itself.
 
 ---
 
-## 14. Build
+## 15. Build
 
 The Wuffs JSON decoder is vendored as an amalgamated single file:
 
@@ -1520,7 +1641,7 @@ allocation Wuffs makes; all other operations are purely computational.
 
 ---
 
-## 15. Related documentation
+## 16. Related documentation
 
 - `request_decoder.cc` lines 27–63 — `appendStringToken` free function
   (anonymous namespace, shared by both parsers).
