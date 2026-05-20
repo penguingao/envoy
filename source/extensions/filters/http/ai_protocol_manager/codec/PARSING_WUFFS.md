@@ -1123,7 +1123,380 @@ operation allocates more than 65535 bytes per token.
 
 ---
 
-## 8. Build
+## 8. Configuration
+
+`DecoderConfig` is defined in `request_decoder.h` and is the single
+configuration knob for both parsers:
+
+```cpp
+struct DecoderConfig {
+  size_t max_inline_bytes{4096};
+  size_t max_body_bytes{4 * 1024 * 1024};
+  size_t max_element_capture_bytes{256 * 1024};
+};
+```
+
+| Field | Default | Role |
+|---|---|---|
+| `max_inline_bytes` | 4 KB | Fields at or below this size are stored as `PayloadRef::Inline` (inside the ref itself). Larger fields become `Buffered` (InMemoryPayloadStore) or `External` (MmapPayloadStore). |
+| `max_body_bytes` | 4 MB | Hard limit. `feed()` returns `ResourceExhausted` the moment accumulated bytes exceed this ceiling, before any JSON parsing runs for that chunk. Attacker-controlled heap growth is bounded by this value regardless of body content. |
+| `max_element_capture_bytes` | 256 KB | Soft limit controlling Tier 1 vs Tier 2. Bodies at or below this size have per-element byte ranges recorded — `messages[]`/`tools[]` for inference, `arguments`/`capabilities` for agent. Bodies above this limit still extract all scalar fields (Tier 2) but individual element `PayloadRef`s are not populated. |
+
+Both parsers hold a `const DecoderConfig&` reference (not a copy). The config is
+owned by the outer filter and outlives the decoder.
+
+---
+
+## 9. PayloadRef storage model
+
+`PayloadRef` (defined in `ai_payload.h`) is a lightweight discriminated-union
+handle to a field value. All large field values in `InferencePayload` and
+`AgentPayload` are typed as `PayloadRef` rather than `std::string` or
+`Buffer::Instance` to avoid copying large content out of the store.
+
+### 9.1 Storage variants
+
+```
+PayloadRef::Storage
+├── Inline    — value lives in std::string inline_data_ inside the ref (≤ max_inline_bytes)
+├── Buffered  — value lives in Buffer::OwnedImpl on the heap (> max_inline_bytes, mmap unavailable)
+└── External  — value lives in MmapPayloadStore's mmap region; ref holds {uint64_t offset, size_t length}
+```
+
+| Variant | Contents | `toString()` | `size()` | Typical origin |
+|---|---|---|---|---|
+| `Inline` | `std::string inline_data_` | Direct return | `inline_data_.size()` | Small fields ≤ `max_inline_bytes` |
+| `Buffered` | `Buffer::InstancePtr buffered_data_` | `buffered_data_->toString()` | `buffered_data_->length()` | Heap fallback when mmap unavailable |
+| `External` | `uint64_t external_offset_`, `size_t external_length_` | **PANIC** | `external_length_` | MmapPayloadStore normal path |
+
+**Critical**: calling `toString()` on an `External` ref panics at runtime:
+
+```cpp
+case Storage::External:
+  PANIC("External PayloadRef must be materialized through PayloadStore::fetch()");
+```
+
+Encoders must call `convertPayloadRefToString(ref, request)` instead, which
+routes through `request.payload_store->fetch()`. The panic surfaces at test time
+any encoder that fails to handle the External variant.
+
+### 9.2 Sub-refs and `makeSubRef`
+
+Both parsers create sub-refs of `residual_params` for nested fields
+(`messages[]`, `tools[]`, `arguments`, `capabilities`, `params_raw`).
+`makeSubRef` in `request_decoder.cc` produces the correct variant depending on
+the storage of the parent:
+
+```
+parent is External:
+  PayloadRef::makeExternal(parent.externalOffset() + field_start, field_length)
+  → shares the same mmap region; zero additional copy
+
+parent is Inline:
+  store_.store(parent.inlineView().substr(field_start, field_length), kind)
+  → always Inline (sub-range is also small)
+
+parent is Buffered:
+  store_.store(extracted bytes, kind)
+  → Inline or Buffered depending on field_length vs max_inline_bytes
+```
+
+`makeSubRef` is a no-op when `field_length == 0` or the parent ref is empty.
+
+### 9.3 PayloadRef storage variant decision tree
+
+```
+body arrives ──► residual_writer_->append(chunk)   (each HTTP chunk)
+                      │
+                      │ finalize()
+                      ▼
+             total_written_ ≤ max_inline_bytes?
+                  ├── Yes → PayloadRef::Inline   (copy back from mmap region)
+                  └── No  → mmap available (fd_ != -1)?
+                                ├── Yes → PayloadRef::External{start_offset, total_written_}
+                                └── No  → PayloadRef::Buffered (heap fallback)
+
+Each sub-ref (messages[i], tools[i], arguments, params_raw):
+    parent External? → makeExternal(parent.offset + field_start, len)  [zero-copy]
+    parent Inline?   → store_.store(sub-string, kind)                   [small copy]
+    parent Buffered? → store_.store(extracted bytes, kind)              [heap copy]
+```
+
+---
+
+## 10. StreamWriter and PayloadStore interfaces
+
+Both parsers call `store_.beginStore(PayloadKind::JsonObject)` on the first
+`feed()` call to open a streaming write session, then call
+`residual_writer_->append(chunk)` for every subsequent chunk. This captures the
+raw body bytes into the store without any intermediate copy beyond what the
+backend requires.
+
+### 10.1 `StreamWriter` interface
+
+```cpp
+class StreamWriter {
+public:
+  virtual ~StreamWriter() = default;
+  virtual void append(absl::string_view bytes) = 0;
+  virtual PayloadRef finalize() = 0;
+};
+```
+
+`append` is called once per HTTP data chunk. `finalize` is called exactly once
+in `finish()` after all chunks have been fed. The returned `PayloadRef` is stored
+as `payload.residual_params` and represents the full request body.
+
+### 10.2 `PayloadStore` interface
+
+```cpp
+class PayloadStore {
+public:
+  virtual PayloadRef store(std::string data, PayloadKind kind) = 0;
+  virtual PayloadRef store(Buffer::Instance& data, PayloadKind kind) = 0;
+  virtual std::unique_ptr<StreamWriter> beginStore(PayloadKind kind) = 0;
+  virtual void fetch(const PayloadRef& ref, FetchCallback cb) = 0;
+  virtual void fetchAsync(const PayloadRef& ref,
+                          Event::Dispatcher& dispatcher,
+                          FetchCallback cb);
+};
+```
+
+Two implementations are provided:
+
+| Implementation | File | Large fields | `fetchAsync` |
+|---|---|---|---|
+| `InMemoryPayloadStore` | `ai_payload.h/.cc` | `Buffer::OwnedImpl` (Buffered) | Synchronous (calls `fetch` inline) |
+| `MmapPayloadStore` | `mmap_payload_store.h/.cc` | Mmap arena (External) | Async `pread` on detached thread |
+
+`AiRequest::payload_store` holds a non-owning pointer to the store. The outer
+filter creates and owns the store; the decoder and encoders access it through
+this pointer.
+
+---
+
+## 11. MmapPayloadStore
+
+`MmapPayloadStore` (in `mmap_payload_store.h/.cc`) offloads large payloads to
+an anonymous temp file via `mmap`, keeping only fields at or below
+`max_inline_bytes` in process heap memory.
+
+### 11.1 Backing file
+
+```cpp
+std::string tmpl = absl::StrCat(tmp_dir, "/envoy_payload_XXXXXX");
+fd_ = ::mkstemp(tmpl.data());
+::unlink(tmpl.c_str());
+ensureSpace(kInitialCapacity);
+```
+
+The file is created with `mkstemp` and immediately unlinked. It has no
+directory entry after `unlink` but remains accessible via `fd_` until the
+store is destroyed. `~MmapPayloadStore` calls `munmap` then `close(fd_)`. When
+the fd is closed the OS reclaims all pages — including on abnormal process exit,
+since the file has no path.
+
+### 11.2 Bump-allocated arena layout
+
+The mmap region is a flat byte array. Each write advances `write_offset_`:
+
+```
+mmap region:
+  [  residual_body_1  |  residual_body_2  | ... |  unused  ]
+   ↑                   ↑
+   off_1               off_2
+   ←── len_1 ────────→←── len_2 ──→              ↑
+   0                                         write_offset_
+                                                           ↑
+                                                       capacity_
+```
+
+`PayloadRef::External` stores `{offset, length}` into this flat region. All
+sub-refs point into the same region as their parent.
+
+### 11.3 Capacity growth
+
+Initial capacity: `kInitialCapacity = 64 KB`. On overflow:
+
+1. `ftruncate(fd_, new_cap)` extends the backing file.
+2. Linux: `mremap(MREMAP_MAYMOVE)` extends in place or relocates.
+3. macOS: `munmap` + `mmap` at the new size (no `mremap` available).
+4. Doubles `new_cap` until `write_offset_ + needed ≤ new_cap`.
+
+### 11.4 Fallback
+
+If `mkstemp` fails, `fd_ = -1` and every `store()` call falls back to
+`PayloadRef::Buffered` (`Buffer::OwnedImpl`). `MmapStreamWriter` sets
+`failed_=true` on any subsequent `ensureSpace` failure and `finalize()` produces
+a `Buffered` ref in that case. The store is always functional; failure degrades
+from External to Buffered, not to an error.
+
+### 11.5 Zero-copy `Buffer::Instance` ingestion
+
+The `store(Buffer::Instance& data, ...)` overload walks the slab chain directly:
+
+```cpp
+const Buffer::RawSliceVector slices = data.getRawSlices();
+for (const auto& s : slices) {
+    std::memcpy(map_ + write_offset_, s.mem_, s.len_);
+    write_offset_ += s.len_;
+}
+```
+
+No intermediate contiguous copy is required. Each slab is `memcpy`'d once,
+sequentially, into the mmap region.
+
+### 11.6 Thread safety
+
+`MmapPayloadStore` is not thread-safe. One store per request stream is the
+intended usage pattern, matching Envoy's single-threaded filter chain.
+`fetchAsync` spawns a detached thread to perform the `pread`, but that thread
+captures `fd_` by value (an `int`) and uses only the POSIX `pread` system call —
+it never touches the store object.
+
+---
+
+## 12. MmapStreamWriter
+
+`MmapStreamWriter` is a nested class inside `MmapPayloadStore`. It opens a
+streaming session at the current `write_offset_` of its parent store.
+
+```cpp
+MmapStreamWriter(MmapPayloadStore& store, PayloadKind /*kind*/)
+    : store_(store), start_offset_(store.write_offset_) {}
+
+void append(absl::string_view bytes) {
+    if (failed_ || bytes.empty()) return;
+    if (store_.fd_ == -1 || !store_.ensureSpace(bytes.size())) {
+        failed_ = true; return;
+    }
+    store_.appendBytes(bytes.data(), bytes.size());
+    total_written_ += bytes.size();
+}
+
+PayloadRef finalize() {
+    if (failed_ || store_.fd_ == -1) {
+        // Heap fallback: copy whatever was written from the mmap region.
+        auto buf = std::make_unique<Buffer::OwnedImpl>();
+        if (!failed_ && total_written_ > 0)
+            buf->add(store_.map_ + start_offset_, total_written_);
+        return PayloadRef::makeBuffered(std::move(buf));
+    }
+    if (total_written_ <= store_.max_inline_bytes_) {
+        // Small session: copy back from mmap to inline.
+        // The mmap space is left allocated — waste ≤ max_inline_bytes_.
+        return PayloadRef::makeInline(std::string(
+            reinterpret_cast<char*>(store_.map_ + start_offset_), total_written_));
+    }
+    return PayloadRef::makeExternal(
+        static_cast<uint64_t>(start_offset_), total_written_);
+}
+```
+
+Key properties:
+
+- `start_offset_` is captured at construction and is the byte offset of the
+  first byte this writer owns. All bytes in
+  `[start_offset_, start_offset_ + total_written_)` belong to this writer.
+- Multiple `StreamWriter` sessions in the same store are sequential — their byte
+  ranges are non-overlapping and contiguous.
+- `finalize()` returns External for large sessions, Inline for small ones.
+  Small sessions write to the mmap region and then copy back (one copy, bounded
+  by `max_inline_bytes_`). The arena space for small sessions is not reclaimed.
+
+---
+
+## 13. External payload fetch pipeline
+
+`External` refs cannot be materialized by `PayloadRef::toString()`. Three layers
+handle materialization, from fine-grained to coarse-grained:
+
+### Layer 1 — `PayloadStore::fetch` (synchronous, single ref)
+
+```cpp
+void MmapPayloadStore::fetch(const PayloadRef& ref, FetchCallback cb) {
+    if (ref.storage() == PayloadRef::Storage::External) {
+        auto buf = std::make_unique<Buffer::OwnedImpl>();
+        buf->add(map_ + ref.externalOffset(), ref.externalLength());
+        cb(std::move(buf));
+        return;
+    }
+    cb(std::make_unique<Buffer::OwnedImpl>(ref.toString()));
+}
+```
+
+Reads from the mmap region on the calling thread. If the page is not in the
+page cache, this causes a read page fault on the event loop thread. Used only in
+tests and for Inline/Buffered refs (which have no page-fault risk).
+
+### Layer 2 — `MmapPayloadStore::fetchAsync` (async pread, single ref)
+
+```cpp
+void MmapPayloadStore::fetchAsync(const PayloadRef& ref,
+                                  Event::Dispatcher& dispatcher,
+                                  FetchCallback cb) {
+    if (ref.storage() != PayloadRef::Storage::External || fd_ == -1) {
+        fetch(ref, std::move(cb));  // synchronous fallback for non-External
+        return;
+    }
+    const int fd = fd_;                          // captured by value
+    const uint64_t off = ref.externalOffset();
+    const size_t   len = ref.externalLength();
+    std::thread([fd, off, len, &dispatcher, cb = std::move(cb)]() mutable {
+        std::vector<char> tmp(len);
+        auto buf = std::make_unique<Buffer::OwnedImpl>();
+        if (len > 0 && ::pread(fd, tmp.data(), len, (off_t)off) == (ssize_t)len)
+            buf->add(tmp.data(), len);
+        dispatcher.post([buf = std::move(buf), cb = std::move(cb)]() mutable {
+            cb(std::move(buf));
+        });
+    }).detach();
+}
+```
+
+- The detached thread captures `fd` by value. If the store is destroyed and `fd`
+  is closed before `pread` runs, `pread` returns -1 and the callback posts an
+  empty buffer — no crash.
+- The `pread` (which may page-fault) runs off the event loop. The callback is
+  posted back to the dispatcher thread when the read completes.
+
+### Layer 3 — `prefetchExternalPayloadRefs` (fan-out, all refs in a request)
+
+```cpp
+void prefetchExternalPayloadRefs(AiRequest& request,
+                                 Event::Dispatcher& dispatcher,
+                                 std::function<void()> on_done);
+```
+
+Called in the dispatch pipeline after `RequestDecoder::onEndStream()` succeeds
+and before any encoder runs. The sequence:
+
+1. Collect all `External` `PayloadRef`s from the request's payload into a flat list.
+2. Create an `std::atomic<int>` countdown initialized to the list size.
+3. For each `External` ref, call `payload_store->fetchAsync(ref, dispatcher, cb)`.
+4. Each callback: upgrade the ref in place (External → Buffered), decrement the counter.
+5. When the counter reaches zero: call `on_done()` on the dispatcher thread.
+6. If there are no External refs: call `on_done()` immediately, no threads spawned.
+
+After `on_done()` fires, every `PayloadRef` in the request is Inline or Buffered.
+Encoders can call `ref.toString()` and `convertPayloadRefToString(ref, request)`
+without any mmap access.
+
+### Why writes are synchronous
+
+HTTP body chunks arrive sequentially on the event-loop thread.
+`MmapStreamWriter::append()` calls `memcpy` into the mmap region — this triggers
+**write page faults**, not read page faults. On Linux, write page faults for
+MAP_SHARED pages backed by a temp file are handled by the kernel's page allocator
+in microseconds and do not block the event loop for meaningful durations. Read
+page faults — when the OS evicts a page and a subsequent access faults it back —
+are the expensive case. Those are offloaded to the `pread` thread by `fetchAsync`.
+Write page faults on freshly-allocated pages are effectively zero additional cost
+relative to the `memcpy` itself.
+
+---
+
+## 14. Build
 
 The Wuffs JSON decoder is vendored as an amalgamated single file:
 
@@ -1136,7 +1509,7 @@ It is compiled as a single-file library (the standard Wuffs distribution method)
 
 | File | Role |
 |---|---|
-| A dedicated `.c` compilation unit | Defines `WUFFS_IMPLEMENTATION`, compiled as C to avoid C++-only warnings in the generated code |
+| `wuffs_impl.c` | Defines `WUFFS_IMPLEMENTATION`, compiled as C to avoid C++-only warnings in the generated code |
 | Other consumers | Include `wuffs-v0.4.c` without `WUFFS_IMPLEMENTATION` (declarations only) |
 
 Both `InferenceBodyParser` and `AgentBodyParser` are implemented in
@@ -1147,22 +1520,22 @@ allocation Wuffs makes; all other operations are purely computational.
 
 ---
 
-## 9. Related documentation
+## 15. Related documentation
 
-- **PARSING.md** — full description of `PayloadStore`, `MmapPayloadStore`,
-  `MmapStreamWriter`, async prefetch (`prefetchExternalPayloadRefs`), the
-  body-size tiering system, `PayloadRef` storage variants, and the configuration
-  thresholds (`max_body_bytes`, `max_element_capture_bytes`, `max_inline_bytes`).
-  Components shared by both parsers — `residual_writer_`, `PayloadRef`,
-  `makeSubRef`, and the dispatch pipeline — are documented in full there.
-
-- `request_decoder.cc` lines 27–63 — `appendStringToken` free function (anonymous
-  namespace, shared by both parsers).
+- `request_decoder.cc` lines 27–63 — `appendStringToken` free function
+  (anonymous namespace, shared by both parsers).
 
 - `request_decoder.cc` lines 81–400 — complete `InferenceBodyParser`
   implementation.
 
 - `request_decoder.cc` lines 416–769 — complete `AgentBodyParser` implementation.
 
-- `request_decoder.h` — `DecoderConfig` field definitions (`max_body_bytes`,
-  `max_element_capture_bytes`, `max_inline_bytes`).
+- `request_decoder.h` — `DecoderConfig` field definitions and `RequestDecoder`
+  class declaration.
+
+- `ai_payload.h` / `ai_payload.cc` — `PayloadRef`, `StreamWriter`,
+  `PayloadStore`, `InMemoryPayloadStore`, `convertPayloadRefToString`,
+  `prefetchExternalPayloadRefs`.
+
+- `mmap_payload_store.h` / `mmap_payload_store.cc` — `MmapPayloadStore`,
+  `MmapStreamWriter`.
