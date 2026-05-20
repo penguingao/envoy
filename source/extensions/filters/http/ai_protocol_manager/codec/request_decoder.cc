@@ -22,515 +22,70 @@ namespace Codec {
 
 namespace {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// IncrementalJsonTokenizer
-//
-// Incremental-input SAX-output JSON tokenizer. feed() can be called repeatedly
-// with arbitrary byte chunks; all parse state lives in explicit data members
-// (not the call stack) so parsing can suspend and resume at any chunk boundary.
-//
-// Two modes:
-//
-//   Semantic mode  — fires Handler callbacks as tokens complete.  The handler
-//   may call startCapture(writer) from within onStartObject() or onStartArray()
-//   to switch the current container into capture mode.
-//
-//   Capture mode   — all raw bytes are forwarded verbatim to the StreamWriter
-//   until the captured container's matching close delimiter is seen.
-//   onEndObject() or onEndArray() fires once for that close; no semantic events
-//   fire for nested content inside the captured container.
-// ─────────────────────────────────────────────────────────────────────────────
-class IncrementalJsonTokenizer {
-public:
-  struct Handler {
-    virtual ~Handler() = default;
-    // depth_ is already incremented inside the handler before these return.
-    // String values use three-phase streaming: onStringStart fires on the
-    // opening quote, onStringChunk fires for each batch of decoded bytes
-    // (plain bytes in bulk, escape sequences one char at a time), and
-    // onStringEnd fires on the closing quote.  No accumulation in token_buf_.
-    virtual bool onKey(absl::string_view key)           = 0;
-    virtual bool onStringStart()                         = 0;
-    virtual bool onStringChunk(absl::string_view chunk)  = 0;
-    virtual bool onStringEnd()                           = 0;
-    virtual bool onInt(int64_t v)                        = 0;
-    virtual bool onFloat(double v)                       = 0;
-    virtual bool onBool(bool v)                          = 0;
-    virtual bool onNull()                                = 0;
-    virtual bool onStartObject()                         = 0;
-    virtual bool onEndObject()                           = 0;
-    virtual bool onStartArray()                          = 0;
-    virtual bool onEndArray()                            = 0;
-  };
-
-  explicit IncrementalJsonTokenizer(Handler& h) : handler_(h) {}
-
-  // Switch the current container into capture mode.  Must be called from
-  // within an onStartObject() or onStartArray() callback.  The opening
-  // delimiter is written to writer immediately; all subsequent bytes are
-  // forwarded until the container closes, at which point onEndObject() or
-  // onEndArray() fires and the tokenizer returns to semantic mode.
-  void startCapture(StreamWriter& writer) {
-    ASSERT(pending_capture_);
-    pending_capture_   = false;
-    capture_writer_    = &writer;
-    cap_depth_counter_ = 1;
-    cap_in_string_     = false;
-    cap_in_escape_     = false;
-    writer.append({&capture_open_char_, 1});
-    state_ = ParseState::InCapture;
+// Decode one Wuffs STRING token's raw bytes into `out`.
+// Shared by InferenceBodyParser and AgentBodyParser.
+void appendStringToken(std::string& out, absl::string_view raw, uint64_t vbd) {
+  if (vbd & WUFFS_BASE__TOKEN__VBD__STRING__CONVERT_0_DST_1_SRC_DROP) return;
+  if (vbd & WUFFS_BASE__TOKEN__VBD__STRING__CONVERT_1_DST_1_SRC_COPY) {
+    out.append(raw.data(), raw.size());
+    return;
   }
-
-  absl::Status feed(absl::string_view chunk);
-  absl::Status finish(); // error if parse is incomplete at end of input
-
-  int    depth()          const { return depth_; }
-  size_t currentFeedPos() const { return current_feed_pos_; }
-
-private:
-  enum class ParseState {
-    ExpectValue,        // start of document / after '[' / after ':'
-    ExpectKeyOrClose,   // after '{' or ',' inside an object
-    ExpectColon,        // after a key string
-    ExpectCommaOrClose, // after any value
-    InKey,              // inside a key string
-    InKeyEscape,        // after '\' inside a key string
-    InKeyUnicode,       // consuming 4 hex digits of \u in a key
-    InStringValue,      // inside a value string
-    InStringEscape,     // after '\' inside a value string
-    InStringUnicode,    // consuming 4 hex digits of \u in a value
-    InNumber,           // inside a number token
-    InKeyword,          // inside true / false / null
-    InCapture,          // forwarding raw bytes to capture_writer_
-    Done,
-  };
-
-  absl::Status processByte(unsigned char c, bool& reprocess);
-  absl::Status fireNumber();
-  absl::Status fireKeyword();
-
-  Handler&   handler_;
-  ParseState state_{ParseState::ExpectValue};
-
-  static constexpr int kMaxDepth = 64;
-  int  depth_{0};
-  bool is_object_[kMaxDepth]{}; // true = object at that depth, false = array
-
-  std::string token_buf_;
-  int         unicode_count_{0};
-
-  bool  pending_capture_{false};
-  char  capture_open_char_{0};
-  StreamWriter* capture_writer_{nullptr};
-  int   cap_depth_counter_{0};
-  bool  cap_in_string_{false};
-  bool  cap_in_escape_{false};
-
-  // Index of the byte currently being processed within the active feed() chunk.
-  // Updated at the top of every feed() loop iteration so handler callbacks can
-  // read it to compute the byte's absolute position in the body stream.
-  size_t current_feed_pos_{0};
-};
-
-// ─── feed / finish ───────────────────────────────────────────────────────────
-
-absl::Status IncrementalJsonTokenizer::feed(absl::string_view chunk) {
-  for (size_t i = 0; i < chunk.size(); ) {
-    current_feed_pos_ = i;
-    // Batch-scan plain string bytes to avoid per-byte virtual dispatch.
-    if (state_ == ParseState::InStringValue) {
-      size_t j = i;
-      while (j < chunk.size() &&
-             static_cast<unsigned char>(chunk[j]) >= 0x20 &&
-             chunk[j] != '"' && chunk[j] != '\\') {
-        ++j;
-      }
-      if (j > i) {
-        if (!handler_.onStringChunk(chunk.substr(i, j - i)))
-          return absl::InvalidArgumentError("handler error in onStringChunk");
-        i = j;
-        continue;
-      }
-    }
-    bool reprocess = false;
-    auto s = processByte(static_cast<unsigned char>(chunk[i]), reprocess);
-    if (!s.ok()) return s;
-    if (!reprocess) ++i;
-  }
-  return absl::OkStatus();
-}
-
-absl::Status IncrementalJsonTokenizer::finish() {
-  // Numbers have no terminator; flush whatever is accumulated.
-  if (state_ == ParseState::InNumber) {
-    auto s = fireNumber();
-    if (!s.ok()) return s;
-    state_ = ParseState::Done;
-  }
-  if (state_ == ParseState::Done || state_ == ParseState::ExpectValue) {
-    return absl::OkStatus();
-  }
-  return absl::InvalidArgumentError(
-      absl::StrCat("incomplete JSON at end of input (state=",
-                   static_cast<int>(state_), ")"));
-}
-
-// ─── scalar helpers ──────────────────────────────────────────────────────────
-
-absl::Status IncrementalJsonTokenizer::fireNumber() {
-  const std::string& s = token_buf_;
-  bool is_float = s.find('.') != std::string::npos ||
-                  s.find('e') != std::string::npos ||
-                  s.find('E') != std::string::npos;
-  if (!is_float) {
-    char* end;
-    long long iv = std::strtoll(s.c_str(), &end, 10);
-    if (end == s.c_str() + s.size()) {
-      token_buf_.clear();
-      if (!handler_.onInt(static_cast<int64_t>(iv)))
-        return absl::InvalidArgumentError("handler rejected integer value");
-      return absl::OkStatus();
-    }
-  }
-  char* end;
-  double fv = std::strtod(s.c_str(), &end);
-  if (end == s.c_str() + s.size()) {
-    token_buf_.clear();
-    if (!handler_.onFloat(fv))
-      return absl::InvalidArgumentError("handler rejected float value");
-    return absl::OkStatus();
-  }
-  return absl::InvalidArgumentError(absl::StrCat("invalid number token: ", s));
-}
-
-absl::Status IncrementalJsonTokenizer::fireKeyword() {
-  bool ok;
-  if      (token_buf_ == "true")  { ok = handler_.onBool(true);  }
-  else if (token_buf_ == "false") { ok = handler_.onBool(false); }
-  else if (token_buf_ == "null")  { ok = handler_.onNull();      }
-  else {
-    return absl::InvalidArgumentError(
-        absl::StrCat("invalid JSON keyword: ", token_buf_));
-  }
-  token_buf_.clear();
-  if (!ok) return absl::InvalidArgumentError("handler rejected keyword");
-  return absl::OkStatus();
-}
-
-// ─── main state machine ──────────────────────────────────────────────────────
-
-absl::Status IncrementalJsonTokenizer::processByte(unsigned char c, bool& reprocess) {
-  reprocess = false;
-
-  switch (state_) {
-
-  // ── Expect start of a JSON value ──────────────────────────────────────────
-  case ParseState::ExpectValue:
-    if (std::isspace(c)) break;
-    if (c == '{') {
-      if (depth_ >= kMaxDepth)
-        return absl::ResourceExhaustedError("JSON nesting exceeds limit");
-      ++depth_;
-      is_object_[depth_] = true;
-      capture_open_char_ = static_cast<char>(c);
-      pending_capture_   = true;
-      if (!handler_.onStartObject())
-        return absl::InvalidArgumentError("handler error in onStartObject");
-      if (state_ != ParseState::InCapture) {
-        pending_capture_ = false;
-        state_ = ParseState::ExpectKeyOrClose;
-      }
-    } else if (c == '[') {
-      if (depth_ >= kMaxDepth)
-        return absl::ResourceExhaustedError("JSON nesting exceeds limit");
-      ++depth_;
-      is_object_[depth_] = false;
-      capture_open_char_ = static_cast<char>(c);
-      pending_capture_   = true;
-      if (!handler_.onStartArray())
-        return absl::InvalidArgumentError("handler error in onStartArray");
-      if (state_ != ParseState::InCapture) {
-        pending_capture_ = false;
-        state_ = ParseState::ExpectValue;
-      }
-    } else if (c == ']') {
-      // Empty array: ']' immediately after '['.
-      --depth_;
-      if (!handler_.onEndArray())
-        return absl::InvalidArgumentError("handler error in onEndArray");
-      state_ = (depth_ == 0) ? ParseState::Done : ParseState::ExpectCommaOrClose;
-    } else if (c == '"') {
-      if (!handler_.onStringStart())
-        return absl::InvalidArgumentError("handler error in onStringStart");
-      state_ = ParseState::InStringValue;
-    } else if (c == '-' || std::isdigit(c)) {
-      token_buf_.clear();
-      token_buf_.push_back(static_cast<char>(c));
-      state_ = ParseState::InNumber;
-    } else if (c == 't' || c == 'f' || c == 'n') {
-      token_buf_.clear();
-      token_buf_.push_back(static_cast<char>(c));
-      state_ = ParseState::InKeyword;
-    } else {
-      return absl::InvalidArgumentError(
-          absl::StrCat("unexpected byte 0x",
-                       absl::Hex(c), " in value position"));
-    }
-    break;
-
-  // ── Inside an object: expect a key string or closing '}' ─────────────────
-  case ParseState::ExpectKeyOrClose:
-    if (std::isspace(c)) break;
-    if (c == '}') {
-      --depth_;
-      if (!handler_.onEndObject())
-        return absl::InvalidArgumentError("handler error in onEndObject");
-      state_ = (depth_ == 0) ? ParseState::Done : ParseState::ExpectCommaOrClose;
-    } else if (c == '"') {
-      token_buf_.clear();
-      state_ = ParseState::InKey;
-    } else {
-      return absl::InvalidArgumentError("expected key string or '}'");
-    }
-    break;
-
-  // ── Expect ':' after a key ────────────────────────────────────────────────
-  case ParseState::ExpectColon:
-    if (std::isspace(c)) break;
-    if (c == ':') {
-      state_ = ParseState::ExpectValue;
-    } else {
-      return absl::InvalidArgumentError("expected ':' after key");
-    }
-    break;
-
-  // ── Expect ',' or closing delimiter after a value ─────────────────────────
-  case ParseState::ExpectCommaOrClose:
-    if (std::isspace(c)) break;
-    if (c == ',') {
-      state_ = (depth_ > 0 && is_object_[depth_])
-                   ? ParseState::ExpectKeyOrClose
-                   : ParseState::ExpectValue;
-    } else if (c == '}') {
-      --depth_;
-      if (!handler_.onEndObject())
-        return absl::InvalidArgumentError("handler error in onEndObject");
-      state_ = (depth_ == 0) ? ParseState::Done : ParseState::ExpectCommaOrClose;
-    } else if (c == ']') {
-      --depth_;
-      if (!handler_.onEndArray())
-        return absl::InvalidArgumentError("handler error in onEndArray");
-      state_ = (depth_ == 0) ? ParseState::Done : ParseState::ExpectCommaOrClose;
-    } else {
-      return absl::InvalidArgumentError(
-          absl::StrCat("expected ',', '}', or ']' but got 0x", absl::Hex(c)));
-    }
-    break;
-
-  // ── Key string ────────────────────────────────────────────────────────────
-  case ParseState::InKey:
-    if (c == '"') {
-      if (!handler_.onKey(token_buf_))
-        return absl::InvalidArgumentError("handler error in onKey");
-      token_buf_.clear();
-      state_ = ParseState::ExpectColon;
-    } else if (c == '\\') {
-      state_ = ParseState::InKeyEscape;
-    } else if (c >= 0x20) {
-      token_buf_.push_back(static_cast<char>(c));
-    } else {
-      return absl::InvalidArgumentError("control character inside key string");
-    }
-    break;
-
-  case ParseState::InKeyEscape:
-    switch (c) {
-    case '"':  token_buf_.push_back('"');  break;
-    case '\\': token_buf_.push_back('\\'); break;
-    case '/':  token_buf_.push_back('/');  break;
-    case 'b':  token_buf_.push_back('\b'); break;
-    case 'f':  token_buf_.push_back('\f'); break;
-    case 'n':  token_buf_.push_back('\n'); break;
-    case 'r':  token_buf_.push_back('\r'); break;
-    case 't':  token_buf_.push_back('\t'); break;
-    case 'u':
-      unicode_count_ = 0;
-      state_ = ParseState::InKeyUnicode;
-      return absl::OkStatus();
-    default:
-      return absl::InvalidArgumentError("invalid escape in key string");
-    }
-    state_ = ParseState::InKey;
-    break;
-
-  case ParseState::InKeyUnicode:
-    // Field names we match are plain ASCII; just consume the 4 hex digits
-    // and append a placeholder so the key won't match any known field name.
-    if (++unicode_count_ == 4) {
-      token_buf_.push_back('?');
-      state_ = ParseState::InKey;
-    }
-    break;
-
-  // ── Value string ─────────────────────────────────────────────────────────
-  case ParseState::InStringValue:
-    if (c == '"') {
-      if (!handler_.onStringEnd())
-        return absl::InvalidArgumentError("handler error in onStringEnd");
-      state_ = ParseState::ExpectCommaOrClose;
-    } else if (c == '\\') {
-      state_ = ParseState::InStringEscape;
-    } else if (c >= 0x20) {
-      // Single byte (the batch path in feed() handles runs; this handles
-      // the final byte before a special character).
-      const char ch = static_cast<char>(c);
-      if (!handler_.onStringChunk({&ch, 1}))
-        return absl::InvalidArgumentError("handler error in onStringChunk");
-    } else {
-      return absl::InvalidArgumentError("control character inside string value");
-    }
-    break;
-
-  case ParseState::InStringEscape: {
-    // Resolve escape and fire the decoded byte(s) as a chunk.  For \uXXXX
-    // the escape prefix is fired here and each hex digit in InStringUnicode,
-    // preserving the sequence verbatim so callers get byte-identical output.
-    char out;
-    switch (c) {
-    case '"':  out = '"';  break;
-    case '\\': out = '\\'; break;
-    case '/':  out = '/';  break;
-    case 'b':  out = '\b'; break;
-    case 'f':  out = '\f'; break;
-    case 'n':  out = '\n'; break;
-    case 'r':  out = '\r'; break;
-    case 't':  out = '\t'; break;
+  for (size_t i = 0; i < raw.size(); ++i) {
+    if (raw[i] != '\\' || i + 1 >= raw.size()) { out += raw[i]; continue; }
+    char esc = raw[++i];
+    switch (esc) {
+    case '"':  out += '"';  break;  case '\\': out += '\\'; break;
+    case '/':  out += '/';  break;  case 'b':  out += '\b'; break;
+    case 'f':  out += '\f'; break;  case 'n':  out += '\n'; break;
+    case 'r':  out += '\r'; break;  case 't':  out += '\t'; break;
     case 'u': {
-      const char seq[2] = {'\\', 'u'};
-      if (!handler_.onStringChunk({seq, 2}))
-        return absl::InvalidArgumentError("handler error in onStringChunk");
-      unicode_count_ = 0;
-      state_ = ParseState::InStringUnicode;
-      return absl::OkStatus();
-    }
-    default:
-      return absl::InvalidArgumentError("invalid escape in string value");
-    }
-    if (!handler_.onStringChunk({&out, 1}))
-      return absl::InvalidArgumentError("handler error in onStringChunk");
-    state_ = ParseState::InStringValue;
-    break;
-  }
-
-  case ParseState::InStringUnicode:
-    if (!std::isxdigit(c))
-      return absl::InvalidArgumentError("non-hex digit in \\uXXXX escape");
-    {
-      const char ch = static_cast<char>(c);
-      if (!handler_.onStringChunk({&ch, 1}))
-        return absl::InvalidArgumentError("handler error in onStringChunk");
-    }
-    if (++unicode_count_ == 4) {
-      unicode_count_ = 0;
-      state_ = ParseState::InStringValue;
-    }
-    break;
-
-  // ── Number ────────────────────────────────────────────────────────────────
-  case ParseState::InNumber:
-    if (std::isdigit(c) || c == '.' || c == 'e' || c == 'E' ||
-        c == '+' || c == '-') {
-      token_buf_.push_back(static_cast<char>(c));
-    } else {
-      auto s = fireNumber();
-      if (!s.ok()) return s;
-      state_    = ParseState::ExpectCommaOrClose;
-      reprocess = true; // re-examine c in ExpectCommaOrClose
-    }
-    break;
-
-  // ── Keyword: true / false / null ─────────────────────────────────────────
-  case ParseState::InKeyword:
-    if (std::isalpha(c) && token_buf_.size() < 5) {
-      token_buf_.push_back(static_cast<char>(c));
-      if (token_buf_ == "true" || token_buf_ == "false" ||
-          token_buf_ == "null") {
-        auto s = fireKeyword();
-        if (!s.ok()) return s;
-        state_ = ParseState::ExpectCommaOrClose;
+      if (i + 4 >= raw.size()) break;
+      uint32_t cp = 0;
+      for (int j = 1; j <= 4; ++j) {
+        char c = raw[i + j]; cp <<= 4;
+        if      (c >= '0' && c <= '9') cp |= static_cast<uint32_t>(c - '0');
+        else if (c >= 'a' && c <= 'f') cp |= static_cast<uint32_t>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') cp |= static_cast<uint32_t>(c - 'A' + 10);
       }
-    } else {
-      return absl::InvalidArgumentError(
-          absl::StrCat("invalid keyword token: '", token_buf_, "'"));
+      i += 4;
+      if      (cp < 0x80)  { out += static_cast<char>(cp); }
+      else if (cp < 0x800) { out += static_cast<char>(0xC0|(cp>>6));
+                             out += static_cast<char>(0x80|(cp&0x3F)); }
+      else                 { out += static_cast<char>(0xE0|(cp>>12));
+                             out += static_cast<char>(0x80|((cp>>6)&0x3F));
+                             out += static_cast<char>(0x80|(cp&0x3F)); }
+      break;
     }
-    break;
-
-  // ── Capture mode: forward raw bytes, track depth for container close ──────
-  case ParseState::InCapture:
-    capture_writer_->append({reinterpret_cast<const char*>(&c), 1});
-    if (cap_in_escape_) {
-      cap_in_escape_ = false;
-    } else if (cap_in_string_) {
-      if      (c == '\\') cap_in_escape_ = true;
-      else if (c == '"')  cap_in_string_ = false;
-    } else {
-      if      (c == '"')             { cap_in_string_ = true; }
-      else if (c == '{' || c == '[') { ++cap_depth_counter_; }
-      else if (c == '}' || c == ']') {
-        if (--cap_depth_counter_ == 0) {
-          capture_writer_ = nullptr;
-          --depth_;
-          bool ok = (c == '}') ? handler_.onEndObject()
-                               : handler_.onEndArray();
-          if (!ok)
-            return absl::InvalidArgumentError("handler error at capture end");
-          state_ = (depth_ == 0) ? ParseState::Done
-                                  : ParseState::ExpectCommaOrClose;
-        }
-      }
+    default: out += esc; break;
     }
-    break;
-
-  // ── Done ─────────────────────────────────────────────────────────────────
-  case ParseState::Done:
-    if (!std::isspace(c))
-      return absl::InvalidArgumentError("trailing content after JSON document");
-    break;
   }
-
-  return absl::OkStatus();
 }
 
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
-// InferenceBodyParser
+// InferenceBodyParser  (Wuffs streaming)
 //
-// Replaces the old buffer-then-SAX approach with incremental streaming:
+// Replaces the old IncrementalJsonTokenizer + InferenceHandler approach with a
+// Wuffs stackless coroutine.  The decoder preserves all parse state in dec_
+// across feed() calls; no token_buf_ accumulation occurs.
 //
-//   feed(chunk):
-//     1. Enforce hard body-size limit (Tier 3).
-//     2. Stream chunk bytes to the residual_params StreamWriter (opened lazily
-//        on the first call) — so the full body lands in the store without ever
-//        being assembled in a contiguous heap buffer.
-//     3. Feed the same bytes to IncrementalJsonTokenizer.  The tokenizer fires
-//        scalar callbacks immediately; for messages[]/tools[] elements it calls
-//        startCapture() to stream element bytes into a per-element StreamWriter.
+// Element byte ranges for messages[]/tools[] elements are recorded during the
+// streaming parse and converted to PayloadRef sub-ranges of residual_params in
+// finish() — zero-copy for MmapPayloadStore, substring copy for tests.
 //
-//   finish():
-//     Flush any in-progress number token, finalise the residual_params writer,
-//     and move scalar extractions into the payload.
-//
-// Peak memory per tier (body size B, element sizes Eᵢ):
-//   Tier 1 (B ≤ max_element_capture): chunk window + Σ active writer buffers
-//   Tier 2 (B ≤ max_body):            chunk window only  (no element capture)
-//   Tier 3 (B >  max_body):           ≤ max_body_bytes (hard reject)
+// Tier 1 and Tier 2 share one feedChunk path; the only branch is captureEnabled()
+// gating the byte-range recording for elements.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class RequestDecoder::InferenceBodyParser {
 public:
   InferenceBodyParser(const DecoderConfig& config, PayloadStore& store)
-      : config_(config), store_(store), handler_(*this), tokenizer_(handler_) {}
+      : config_(config), store_(store) {
+    dec_     = wuffs_json__decoder::alloc();
+    tok_buf_ = wuffs_base__slice_token__writer(
+        wuffs_base__make_slice_token(tok_data_, kTokBufLen));
+  }
 
   absl::Status feed(absl::string_view chunk) {
     total_bytes_ += chunk.size();
@@ -538,247 +93,310 @@ public:
       return absl::ResourceExhaustedError(absl::StrCat(
           "inference request body exceeds limit of ", config_.max_body_bytes, " bytes"));
     }
-    // Open the residual_params writer on the first chunk.
     if (!residual_writer_) {
       residual_writer_ = store_.beginStore(PayloadKind::JsonObject);
     }
     residual_writer_->append(chunk);
-    auto s = tokenizer_.feed(chunk);
-    if (!s.ok() && handler_.has_error_) {
-      return absl::InvalidArgumentError(handler_.error_);
-    }
-    return s;
+    return feedChunk(chunk, /*closed=*/false);
   }
 
   absl::Status finish(InferencePayload& payload, AiRequest& request) {
-    auto s = tokenizer_.finish();
-    if (!s.ok()) return absl::InvalidArgumentError(
-        absl::StrCat("inference body parse error: ", s.message()));
-
-    if (handler_.has_error_) {
+    auto s = feedChunk("", /*closed=*/true);
+    if (!s.ok()) return s;
+    if (has_error_) {
       return absl::InvalidArgumentError(
-          absl::StrCat("inference body parse error: ", handler_.error_));
+          absl::StrCat("inference body parse error: ", error_));
     }
 
-    // Move accumulated scalars into the payload.
-    payload.target.name       = std::move(handler_.model_);
-    payload.sampling          = std::move(handler_.sampling_);
-    payload.messages          = std::move(handler_.messages_);
-    payload.tools             = std::move(handler_.tools_);
-    request.streaming         = handler_.streaming_;
+    payload.target.name = std::move(model_);
+    payload.sampling    = std::move(sampling_);
+    request.streaming   = streaming_;
 
     if (residual_writer_) {
       payload.residual_params = residual_writer_->finalize();
     }
+
+    // Convert recorded byte ranges to PayloadRef sub-ranges of residual_params.
+    for (size_t i = 0; i < message_ranges_.size(); ++i) {
+      auto [start, end] = message_ranges_[i];
+      PayloadRef ref;
+      makeSubRef(ref, start, end - start, payload.residual_params, message_kinds_[i]);
+      payload.messages.push_back(std::move(ref));
+    }
+    for (size_t i = 0; i < tool_ranges_.size(); ++i) {
+      auto [start, end] = tool_ranges_[i];
+      PayloadRef ref;
+      makeSubRef(ref, start, end - start, payload.residual_params, tool_kinds_[i]);
+      payload.tools.push_back(std::move(ref));
+    }
+
     return absl::OkStatus();
   }
 
 private:
-  // ── InferenceHandler ────────────────────────────────────────────────────
-  struct InferenceHandler : public IncrementalJsonTokenizer::Handler {
-    explicit InferenceHandler(InferenceBodyParser& p) : parser_(p) {}
+  bool captureEnabled() const {
+    return total_bytes_ <= config_.max_element_capture_bytes;
+  }
 
-    // ── accumulated scalars ──
-    std::string              model_;
-    bool                     streaming_{false};
-    SamplingParams           sampling_;
-    std::vector<PayloadRef>  messages_;
-    std::vector<PayloadRef>  tools_;
-    bool                     has_error_{false};
-    std::string              error_;
+  absl::Status feedChunk(absl::string_view chunk, bool closed) {
+    if (!dec_) return absl::InternalError("wuffs json: alloc failed");
+    if (wuffs_done_) return absl::OkStatus();
 
-    // ── per-parse state ──
-    int         depth_{0};
-    std::string current_key_;
-    bool        in_messages_{false};
-    bool        in_tools_{false};
-    bool        in_stop_array_{false};
+    const size_t chunk_base = body_src_pos_;
+    wuffs_base__io_buffer src_buf = wuffs_base__ptr_u8__reader(
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(chunk.data())),
+        chunk.size(), closed);
 
-    // ── duplicate-key tracking (depth=1 extracted fields only) ──
-    bool seen_model_{false};
-    bool seen_stream_{false};
-    bool seen_messages_{false};
-    bool seen_tools_{false};
-    bool seen_temperature_{false};
-    bool seen_top_p_{false};
-    bool seen_max_tokens_{false};
-    bool seen_n_{false};
-    bool seen_seed_{false};
-    bool seen_stop_{false};
+    while (true) {
+      wuffs_base__status status = wuffs_json__decoder__decode_tokens(
+          dec_.get(), &tok_buf_, &src_buf, wuffs_base__empty_slice_u8());
 
-    // ── string streaming state ──
-    // str_target_ points to the field being accumulated (null = discard).
-    // string_val_ is a scratch buffer reused for stop strings; model_ is
-    // accumulated directly since it has its own field.
-    std::string* str_target_{nullptr};
-    std::string  string_val_;
+      while (tok_buf_.meta.ri < tok_buf_.meta.wi) {
+        const wuffs_base__token* tok = &tok_buf_.data.ptr[tok_buf_.meta.ri++];
+        const int64_t  vbc       = wuffs_base__token__value_base_category(tok);
+        const uint64_t vbd       = wuffs_base__token__value_base_detail(tok);
+        const uint64_t tlen      = wuffs_base__token__length(tok);
+        const bool     cont      = wuffs_base__token__continued(tok);
+        const size_t   tok_start = body_src_pos_;
+        body_src_pos_ += tlen;
 
-    // ── element capture state ──
-    bool                         is_capturing_{false};
-    int                          capture_depth_{0};
-    std::unique_ptr<StreamWriter> elem_writer_;
+        switch (vbc) {
 
-    InferenceBodyParser& parser_;
+        case WUFFS_BASE__TOKEN__VBC__FILLER:
+          break;
 
-    bool captureEnabled() const {
-      return parser_.total_bytes_ <= parser_.config_.max_element_capture_bytes;
-    }
-
-    bool onStartObject() override {
-      ++depth_;
-      if (!is_capturing_ && captureEnabled() &&
-          depth_ == 3 && (in_messages_ || in_tools_)) {
-        is_capturing_ = true;
-        capture_depth_ = depth_;
-        elem_writer_   = parser_.store_.beginStore(PayloadKind::JsonObject);
-        parser_.tokenizer_.startCapture(*elem_writer_);
-      }
-      return true;
-    }
-
-    bool onEndObject() override {
-      if (is_capturing_ && depth_ == capture_depth_) {
-        is_capturing_ = false;
-        PayloadRef ref = elem_writer_->finalize();
-        elem_writer_.reset();
-        if (in_messages_) messages_.push_back(std::move(ref));
-        else              tools_.push_back(std::move(ref));
-      }
-      --depth_;
-      if (depth_ == 1) {
-        in_messages_   = false;
-        in_tools_      = false;
-        in_stop_array_ = false;
-      }
-      return true;
-    }
-
-    bool onStartArray() override {
-      ++depth_;
-      if (depth_ == 2) {
-        if      (current_key_ == "messages") { in_messages_ = true; in_tools_ = false; }
-        else if (current_key_ == "tools")    { in_tools_    = true; in_messages_ = false; }
-        else if (current_key_ == "stop")     { in_stop_array_ = true; }
-      }
-      // Array-typed element inside messages/tools (unusual but valid JSON).
-      if (!is_capturing_ && captureEnabled() &&
-          depth_ == 3 && (in_messages_ || in_tools_)) {
-        is_capturing_  = true;
-        capture_depth_ = depth_;
-        elem_writer_   = parser_.store_.beginStore(PayloadKind::JsonArray);
-        parser_.tokenizer_.startCapture(*elem_writer_);
-      }
-      return true;
-    }
-
-    bool onEndArray() override {
-      if (is_capturing_ && depth_ == capture_depth_) {
-        is_capturing_ = false;
-        PayloadRef ref = elem_writer_->finalize();
-        elem_writer_.reset();
-        if (in_messages_) messages_.push_back(std::move(ref));
-        else              tools_.push_back(std::move(ref));
-      }
-      --depth_;
-      if (depth_ == 1) {
-        in_messages_   = false;
-        in_tools_      = false;
-        in_stop_array_ = false;
-      }
-      return true;
-    }
-
-    bool onKey(absl::string_view key) override {
-      if (depth_ == 1) {
-        // Reject duplicate top-level keys for all extracted fields.
-        // Returning false aborts the parse immediately with an error.
-        bool* seen = nullptr;
-        if      (key == "model")       seen = &seen_model_;
-        else if (key == "stream")      seen = &seen_stream_;
-        else if (key == "messages")    seen = &seen_messages_;
-        else if (key == "tools")       seen = &seen_tools_;
-        else if (key == "temperature") seen = &seen_temperature_;
-        else if (key == "top_p")       seen = &seen_top_p_;
-        else if (key == "max_tokens")  seen = &seen_max_tokens_;
-        else if (key == "n")           seen = &seen_n_;
-        else if (key == "seed")        seen = &seen_seed_;
-        else if (key == "stop")        seen = &seen_stop_;
-
-        if (seen != nullptr) {
-          if (*seen) {
-            has_error_ = true;
-            error_     = absl::StrCat("duplicate key \"", key, "\" in inference request body");
-            return false;
+        case WUFFS_BASE__TOKEN__VBC__STRUCTURE: {
+          const bool is_push = (vbd & WUFFS_BASE__TOKEN__VBD__STRUCTURE__PUSH) != 0;
+          const bool to_dict = (vbd & WUFFS_BASE__TOKEN__VBD__STRUCTURE__TO_DICT) != 0;
+          if (is_push) {
+            ++depth_;
+            if (depth_ < kMaxDepth) {
+              is_dict_[depth_]       = to_dict;
+              expecting_key_[depth_] = to_dict;
+            }
+            if (depth_ == 2) {
+              if      (current_key_ == "messages") { in_messages_ = true;  in_tools_    = false; }
+              else if (current_key_ == "tools")    { in_tools_    = true;   in_messages_ = false; }
+              else if (current_key_ == "stop")     { in_stop_array_ = true; }
+            }
+            // Tier 1: begin tracking byte range for a messages/tools element.
+            if (depth_ == 3 && (in_messages_ || in_tools_) && captureEnabled()) {
+              in_elem_      = true;
+              elem_start_   = tok_start;
+              elem_is_dict_ = to_dict;
+            }
+          } else {
+            const int pop_depth = depth_;
+            --depth_;
+            // Close a messages/tools element at depth 3.
+            if (pop_depth == 3 && in_elem_) {
+              in_elem_ = false;
+              auto kind = elem_is_dict_ ? PayloadKind::JsonObject : PayloadKind::JsonArray;
+              if (in_messages_) {
+                message_ranges_.push_back({elem_start_, body_src_pos_});
+                message_kinds_.push_back(kind);
+              } else if (in_tools_) {
+                tool_ranges_.push_back({elem_start_, body_src_pos_});
+                tool_kinds_.push_back(kind);
+              }
+            }
+            if (pop_depth == 2) {
+              in_messages_   = false;
+              in_tools_      = false;
+              in_stop_array_ = false;
+            }
+            if (depth_ >= 1 && depth_ < kMaxDepth && is_dict_[depth_]) {
+              expecting_key_[depth_] = true;
+            }
           }
-          *seen = true;
+          break;
         }
 
-        current_key_   = key;
-        in_stop_array_ = false;
+        case WUFFS_BASE__TOKEN__VBC__STRING: {
+          const absl::string_view raw = chunk.substr(tok_start - chunk_base, tlen);
+          const bool first_in_group   = !in_chain_;
+          if (first_in_group) {
+            str_acc_.clear();
+            string_is_key_ = (depth_ < kMaxDepth && is_dict_[depth_] && expecting_key_[depth_]);
+            if (string_is_key_) {
+              str_target_ = &str_acc_;
+            } else if (depth_ == 1) {
+              if      (current_key_ == "model") { model_.clear();      str_target_ = &model_;      }
+              else if (current_key_ == "stop")  { string_val_.clear(); str_target_ = &string_val_; }
+              else                              { str_target_ = nullptr; }
+            } else if (depth_ == 2 && in_stop_array_) {
+              string_val_.clear(); str_target_ = &string_val_;
+            } else {
+              str_target_ = nullptr;
+            }
+          }
+          if (str_target_ && tlen > 0) {
+            appendStringToken(*str_target_, raw, vbd);
+          }
+          in_chain_ = cont;
+          if (!cont) {
+            if (string_is_key_) {
+              if (depth_ == 1) {
+                bool* seen = nullptr;
+                if      (str_acc_ == "model")       seen = &seen_model_;
+                else if (str_acc_ == "stream")      seen = &seen_stream_;
+                else if (str_acc_ == "messages")    seen = &seen_messages_;
+                else if (str_acc_ == "tools")       seen = &seen_tools_;
+                else if (str_acc_ == "temperature") seen = &seen_temperature_;
+                else if (str_acc_ == "top_p")       seen = &seen_top_p_;
+                else if (str_acc_ == "max_tokens")  seen = &seen_max_tokens_;
+                else if (str_acc_ == "n")           seen = &seen_n_;
+                else if (str_acc_ == "seed")        seen = &seen_seed_;
+                else if (str_acc_ == "stop")        seen = &seen_stop_;
+                if (seen) {
+                  if (*seen) {
+                    has_error_ = true;
+                    error_ = absl::StrCat("duplicate key \"", str_acc_,
+                                          "\" in inference request body");
+                    break;
+                  }
+                  *seen = true;
+                }
+                current_key_ = str_acc_;
+                if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
+              } else {
+                if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
+              }
+            } else {
+              if (str_target_ == &string_val_) {
+                sampling_.stop.push_back(std::move(string_val_));
+                string_val_.clear();
+              }
+              if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
+            }
+            str_target_ = nullptr;
+          }
+          break;
+        }
+
+        case WUFFS_BASE__TOKEN__VBC__NUMBER: {
+          if (depth_ == 1) {
+            const absl::string_view num = chunk.substr(tok_start - chunk_base, tlen);
+            int64_t i_val; double d_val;
+            if      (current_key_ == "max_tokens"  && absl::SimpleAtoi(num, &i_val)) sampling_.max_tokens  = static_cast<int32_t>(i_val);
+            else if (current_key_ == "n"           && absl::SimpleAtoi(num, &i_val)) sampling_.n           = static_cast<int32_t>(i_val);
+            else if (current_key_ == "seed"        && absl::SimpleAtoi(num, &i_val)) sampling_.seed        = i_val;
+            else if (current_key_ == "temperature" && absl::SimpleAtod(num, &d_val)) sampling_.temperature = d_val;
+            else if (current_key_ == "top_p"       && absl::SimpleAtod(num, &d_val)) sampling_.top_p       = d_val;
+          }
+          if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
+          break;
+        }
+
+        case WUFFS_BASE__TOKEN__VBC__LITERAL: {
+          if (depth_ == 1 && current_key_ == "stream") {
+            const absl::string_view lit = chunk.substr(tok_start - chunk_base, tlen);
+            if      (lit == "true")  streaming_ = true;
+            else if (lit == "false") streaming_ = false;
+          }
+          if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
+          break;
+        }
+
+        default: break;
+        } // switch(vbc)
+
+        if (has_error_) break;
+      } // while tokens
+
+      if (has_error_) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("inference body parse error: ", error_));
       }
-      return true;
-    }
 
-    bool onStringStart() override {
-      str_target_ = nullptr;
-      if (depth_ == 1 && current_key_ == "model") {
-        model_.clear();
-        str_target_ = &model_;
-      } else if ((depth_ == 1 && current_key_ == "stop") ||
-                 (depth_ == 2 && in_stop_array_)) {
-        string_val_.clear();
-        str_target_ = &string_val_;
+      if (status.repr == nullptr) { wuffs_done_ = true; break; } // OK
+      if (wuffs_base__status__is_note(&status)) { wuffs_done_ = true; break; }
+      if (!wuffs_base__status__is_suspension(&status)) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("wuffs json: ", wuffs_base__status__message(&status)));
       }
-      return true;
+      if (status.repr == wuffs_base__suspension__short_read) break;
+      tok_buf_.meta.ri = tok_buf_.meta.wi = 0; // short_write: reset and retry
     }
 
-    bool onStringChunk(absl::string_view chunk) override {
-      if (str_target_) str_target_->append(chunk);
-      return true;
-    }
+    return absl::OkStatus();
+  }
 
-    bool onStringEnd() override {
-      if (str_target_ == &string_val_) {
-        sampling_.stop.push_back(std::move(string_val_));
-        string_val_.clear();
+  void makeSubRef(PayloadRef& ref, size_t start, size_t len,
+                  const PayloadRef& residual, PayloadKind kind) {
+    if (len == 0 || residual.empty()) return;
+    if (residual.storage() == PayloadRef::Storage::External) {
+      ref = PayloadRef::makeExternal(residual.externalOffset() + start, len);
+    } else {
+      std::string full = residual.toString();
+      if (start < full.size()) {
+        ref = store_.store(
+            full.substr(start, std::min(len, full.size() - start)), kind);
       }
-      str_target_ = nullptr;
-      return true;
     }
+  }
 
-    bool onInt(int64_t v) override {
-      if (depth_ == 1) {
-        if      (current_key_ == "max_tokens") sampling_.max_tokens = static_cast<int32_t>(v);
-        else if (current_key_ == "n")          sampling_.n          = static_cast<int32_t>(v);
-        else if (current_key_ == "seed")       sampling_.seed       = v;
-      }
-      return true;
-    }
-
-    bool onFloat(double v) override {
-      if (depth_ == 1) {
-        if      (current_key_ == "temperature") sampling_.temperature = v;
-        else if (current_key_ == "top_p")       sampling_.top_p       = v;
-      }
-      return true;
-    }
-
-    bool onBool(bool v) override {
-      if (depth_ == 1 && current_key_ == "stream") {
-        streaming_ = v;
-      }
-      return true;
-    }
-
-    bool onNull() override { return true; }
-  };
-
+  // ── Config / infra ─────────────────────────────────────────────────────────
   const DecoderConfig&          config_;
   PayloadStore&                 store_;
   size_t                        total_bytes_{0};
-  InferenceHandler              handler_;        // must be before tokenizer_
-  IncrementalJsonTokenizer      tokenizer_;
   std::unique_ptr<StreamWriter> residual_writer_;
+
+  // ── Wuffs streaming state (persists across feed() calls) ───────────────────
+  wuffs_json__decoder::unique_ptr dec_;
+  static constexpr size_t         kTokBufLen = 256;
+  wuffs_base__token               tok_data_[kTokBufLen];
+  wuffs_base__token_buffer        tok_buf_{};
+  size_t                          body_src_pos_{0};
+  bool                            wuffs_done_{false};
+
+  // ── Depth / structure tracking ─────────────────────────────────────────────
+  static constexpr int kMaxDepth = 8;
+  int  depth_{0};
+  bool is_dict_[kMaxDepth]{};
+  bool expecting_key_[kMaxDepth]{};
+
+  // ── String accumulation ────────────────────────────────────────────────────
+  bool         in_chain_{false};
+  bool         string_is_key_{false};
+  std::string  str_acc_;
+  std::string* str_target_{nullptr};
+  std::string  string_val_; // scratch for stop strings
+
+  // ── Depth-1 extracted fields ───────────────────────────────────────────────
+  std::string    current_key_;
+  std::string    model_;
+  bool           streaming_{false};
+  SamplingParams sampling_;
+
+  // ── Container / element tracking ──────────────────────────────────────────
+  bool   in_messages_{false};
+  bool   in_tools_{false};
+  bool   in_stop_array_{false};
+  bool   in_elem_{false};
+  bool   elem_is_dict_{false};
+  size_t elem_start_{0};
+
+  std::vector<std::pair<size_t, size_t>> message_ranges_;
+  std::vector<PayloadKind>               message_kinds_;
+  std::vector<std::pair<size_t, size_t>> tool_ranges_;
+  std::vector<PayloadKind>               tool_kinds_;
+
+  // ── Duplicate-key tracking ─────────────────────────────────────────────────
+  bool seen_model_{false};
+  bool seen_stream_{false};
+  bool seen_messages_{false};
+  bool seen_tools_{false};
+  bool seen_temperature_{false};
+  bool seen_top_p_{false};
+  bool seen_max_tokens_{false};
+  bool seen_n_{false};
+  bool seen_seed_{false};
+  bool seen_stop_{false};
+
+  // ── Error state ────────────────────────────────────────────────────────────
+  bool        has_error_{false};
+  std::string error_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -868,44 +486,6 @@ public:
 private:
   bool captureEnabled() const {
     return total_bytes_ <= config_.max_element_capture_bytes;
-  }
-
-  // Decode one Wuffs STRING token's raw bytes into `out`.
-  static void appendStringToken(std::string& out, absl::string_view raw, uint64_t vbd) {
-    if (vbd & WUFFS_BASE__TOKEN__VBD__STRING__CONVERT_0_DST_1_SRC_DROP) return;
-    if (vbd & WUFFS_BASE__TOKEN__VBD__STRING__CONVERT_1_DST_1_SRC_COPY) {
-      out.append(raw.data(), raw.size());
-      return;
-    }
-    for (size_t i = 0; i < raw.size(); ++i) {
-      if (raw[i] != '\\' || i + 1 >= raw.size()) { out += raw[i]; continue; }
-      char esc = raw[++i];
-      switch (esc) {
-      case '"':  out += '"';  break;  case '\\': out += '\\'; break;
-      case '/':  out += '/';  break;  case 'b':  out += '\b'; break;
-      case 'f':  out += '\f'; break;  case 'n':  out += '\n'; break;
-      case 'r':  out += '\r'; break;  case 't':  out += '\t'; break;
-      case 'u': {
-        if (i + 4 >= raw.size()) break;
-        uint32_t cp = 0;
-        for (int j = 1; j <= 4; ++j) {
-          char c = raw[i + j]; cp <<= 4;
-          if      (c >= '0' && c <= '9') cp |= static_cast<uint32_t>(c - '0');
-          else if (c >= 'a' && c <= 'f') cp |= static_cast<uint32_t>(c - 'a' + 10);
-          else if (c >= 'A' && c <= 'F') cp |= static_cast<uint32_t>(c - 'A' + 10);
-        }
-        i += 4;
-        if      (cp < 0x80)  { out += static_cast<char>(cp); }
-        else if (cp < 0x800) { out += static_cast<char>(0xC0|(cp>>6));
-                               out += static_cast<char>(0x80|(cp&0x3F)); }
-        else                 { out += static_cast<char>(0xE0|(cp>>12));
-                               out += static_cast<char>(0x80|((cp>>6)&0x3F));
-                               out += static_cast<char>(0x80|(cp&0x3F)); }
-        break;
-      }
-      default: out += esc; break;
-      }
-    }
   }
 
   absl::Status feedChunk(absl::string_view chunk, bool closed) {
