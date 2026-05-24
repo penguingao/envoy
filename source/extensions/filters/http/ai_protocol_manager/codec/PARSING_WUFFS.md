@@ -1,4 +1,4 @@
-# Wuffs Streaming Parsers
+# AI Protocol Parsing
 
 ## 1. Motivation
 

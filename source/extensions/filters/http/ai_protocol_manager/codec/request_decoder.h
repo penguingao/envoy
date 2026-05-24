@@ -20,8 +20,10 @@ namespace AiProtocolManager {
 namespace Codec {
 
 struct DecoderConfig {
-  // JSON-body fields whose serialized size is at or below this threshold are
-  // stored as Inline PayloadRefs; larger fields are stored as Buffered refs.
+  // Fields whose serialized size is at or below this threshold are stored as
+  // Inline PayloadRefs (value held in the ref itself). Larger fields are stored
+  // as External refs by MmapPayloadStore, or Buffered refs by
+  // InMemoryPayloadStore.
   size_t max_inline_bytes{4096};
 
   // Hard limit: requests whose body exceeds this size are rejected with
@@ -30,10 +32,11 @@ struct DecoderConfig {
   size_t max_body_bytes{4 * 1024 * 1024};
 
   // Soft limit: bodies at or below this size get full per-element byte-range
-  // capture (messages[], tools[]). Bodies above this limit still have their
-  // scalar fields extracted (model, stream, sampling params) but individual
-  // element PayloadRefs are not populated — avoids the 2× memory cost of
-  // copying large element bytes out of the slab chain. Default: 256 KB.
+  // capture — messages[]/tools[] for inference, arguments/capabilities for
+  // agent — exposed as zero-copy PayloadRef sub-refs of residual_params.
+  // Bodies above this limit still have scalar routing fields extracted (model,
+  // stream, sampling params, method, id) but individual element PayloadRefs
+  // are not populated. Default: 256 KB.
   size_t max_element_capture_bytes{256 * 1024};
 };
 
@@ -65,14 +68,14 @@ public:
   RequestDecoder(const RequestDecoder&) = delete;
   RequestDecoder& operator=(const RequestDecoder&) = delete;
 
-  // Called once when all request headers have arrived. Populates verb, path,
-  // path_params, query_params, and headers on the internal AiRequest; runs the
-  // classifier; and selects (or skips) the body parser. Returns an error if
-  // the request cannot be classified.
+  // Called once when all request headers have arrived. Populates http_method,
+  // path, path_params, query_params, and headers on the internal AiRequest;
+  // runs the classifier; and selects (or skips) the body parser. Returns an
+  // error if the request cannot be classified.
   absl::Status onHeaders(const Http::RequestHeaderMap& headers);
 
   // Called for each body data chunk. No-op when no body is expected (bodiless
-  // verbs) or when the state is not ParsingBody.
+  // verbs) or when the state is not ParsingInferenceBody / ParsingAgentBody.
   absl::Status onData(absl::string_view chunk);
 
   // Called when request trailers arrive. AI protocols do not use request
@@ -103,8 +106,8 @@ private:
   enum class DecodeState {
     AwaitingHeaders,
     BodilessComplete,     // no body expected; AiRequest fully populated by onHeaders
-    ParsingInferenceBody, // streaming REST-JSON body through incremental tokenizer
-    ParsingAgentBody,     // streaming JSON-RPC body through incremental tokenizer
+    ParsingInferenceBody, // streaming REST-JSON body through Wuffs tokenizer
+    ParsingAgentBody,     // streaming JSON-RPC body through Wuffs tokenizer
     BodyComplete,         // onEndStream done; take() is valid
     Error,
   };
@@ -112,13 +115,15 @@ private:
   // ── Inner body parsers (defined in request_decoder.cc) ────────────────────
 
   // Incrementally parses the inference JSON body as chunks arrive using a
-  // custom streaming tokenizer. Extracts scalar sampling params per chunk;
-  // streams messages[]/tools[] elements directly into the PayloadStore.
+  // Wuffs streaming tokenizer. Extracts scalar fields (model, stream, sampling
+  // params) inline; records byte ranges for messages[]/tools[] elements and
+  // converts them to zero-copy PayloadRef sub-refs in finish().
   class InferenceBodyParser;
 
-  // Incrementally parses the JSON-RPC body as chunks arrive. Extracts the
-  // envelope (id, method) and captures the params object via streaming capture
-  // for later json::parse() in finish().
+  // Incrementally parses the JSON-RPC body as chunks arrive using a Wuffs
+  // streaming tokenizer. Extracts the envelope (id, method), routing fields
+  // (params.name, params.uri), and byte ranges for params, arguments, and
+  // capabilities. No second-pass JSON parse occurs in finish().
   class AgentBodyParser;
 
   // ── Helpers ────────────────────────────────────────────────────────────────
