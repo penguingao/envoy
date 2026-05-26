@@ -48,6 +48,10 @@ void appendStringToken(std::string& out, absl::string_view raw, uint64_t vbd) {
         else if (c >= 'A' && c <= 'F') cp |= static_cast<uint32_t>(c - 'A' + 10);
       }
       i += 4;
+      // Surrogate halves (0xD800–0xDFFF) are not stitched into supplementary
+      // code points. Each half is emitted as its own 3-byte CESU-8 sequence,
+      // producing invalid UTF-8. This is acceptable because routing fields
+      // (model, method, params.name) never contain surrogate pairs in practice.
       if      (cp < 0x80)  { out += static_cast<char>(cp); }
       else if (cp < 0x800) { out += static_cast<char>(0xC0|(cp>>6));
                              out += static_cast<char>(0x80|(cp&0x3F)); }
@@ -57,6 +61,21 @@ void appendStringToken(std::string& out, absl::string_view raw, uint64_t vbd) {
       break;
     }
     default: out += esc; break;
+    }
+  }
+}
+
+// Create a sub-ref of `residual` covering [start, start+len).
+// Shared by InferenceBodyParser and AgentBodyParser.
+void makeSubRef(PayloadRef& ref, size_t start, size_t len,
+                const PayloadRef& residual, PayloadKind kind, PayloadStore& store) {
+  if (len == 0 || residual.empty()) return;
+  if (residual.storage() == PayloadRef::Storage::External) {
+    ref = PayloadRef::makeExternal(residual.externalOffset() + start, len);
+  } else {
+    std::string full = residual.toString();
+    if (start < full.size()) {
+      ref = store.store(full.substr(start, std::min(len, full.size() - start)), kind);
     }
   }
 }
@@ -120,13 +139,13 @@ public:
     for (size_t i = 0; i < message_ranges_.size(); ++i) {
       auto [start, end] = message_ranges_[i];
       PayloadRef ref;
-      makeSubRef(ref, start, end - start, payload.residual_params, message_kinds_[i]);
+      makeSubRef(ref, start, end - start, payload.residual_params, message_kinds_[i], store_);
       payload.messages.push_back(std::move(ref));
     }
     for (size_t i = 0; i < tool_ranges_.size(); ++i) {
       auto [start, end] = tool_ranges_[i];
       PayloadRef ref;
-      makeSubRef(ref, start, end - start, payload.residual_params, tool_kinds_[i]);
+      makeSubRef(ref, start, end - start, payload.residual_params, tool_kinds_[i], store_);
       payload.tools.push_back(std::move(ref));
     }
 
@@ -322,20 +341,6 @@ private:
     return absl::OkStatus();
   }
 
-  void makeSubRef(PayloadRef& ref, size_t start, size_t len,
-                  const PayloadRef& residual, PayloadKind kind) {
-    if (len == 0 || residual.empty()) return;
-    if (residual.storage() == PayloadRef::Storage::External) {
-      ref = PayloadRef::makeExternal(residual.externalOffset() + start, len);
-    } else {
-      std::string full = residual.toString();
-      if (start < full.size()) {
-        ref = store_.store(
-            full.substr(start, std::min(len, full.size() - start)), kind);
-      }
-    }
-  }
-
   // ── Config / infra ─────────────────────────────────────────────────────────
   const DecoderConfig&          config_;
   PayloadStore&                 store_;
@@ -467,17 +472,17 @@ public:
     if (params_byte_end_ > params_byte_start_) {
       makeSubRef(payload.params_raw, params_byte_start_,
                  params_byte_end_ - params_byte_start_,
-                 payload.residual_params, PayloadKind::JsonObject);
+                 payload.residual_params, PayloadKind::JsonObject, store_);
     }
     if (arguments_byte_end_ > arguments_byte_start_) {
       makeSubRef(payload.arguments, arguments_byte_start_,
                  arguments_byte_end_ - arguments_byte_start_,
-                 payload.residual_params, arguments_kind_);
+                 payload.residual_params, arguments_kind_, store_);
     }
     if (capabilities_byte_end_ > capabilities_byte_start_) {
       makeSubRef(payload.capabilities, capabilities_byte_start_,
                  capabilities_byte_end_ - capabilities_byte_start_,
-                 payload.residual_params, PayloadKind::JsonObject);
+                 payload.residual_params, PayloadKind::JsonObject, store_);
     }
 
     return absl::OkStatus();
@@ -685,20 +690,6 @@ private:
       break;
     default:
       break;
-    }
-  }
-
-  void makeSubRef(PayloadRef& ref, size_t start, size_t len,
-                  const PayloadRef& residual, PayloadKind kind) {
-    if (len == 0 || residual.empty()) return;
-    if (residual.storage() == PayloadRef::Storage::External) {
-      ref = PayloadRef::makeExternal(residual.externalOffset() + start, len);
-    } else {
-      std::string full = residual.toString();
-      if (start < full.size()) {
-        ref = store_.store(
-            full.substr(start, std::min(len, full.size() - start)), kind);
-      }
     }
   }
 

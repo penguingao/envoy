@@ -235,7 +235,7 @@ C++ call stack. This is exactly the property needed for streaming HTTP body pars
 |---|---|
 | Wuffs stackless coroutine | `feedChunk` preserves parse state across `decodeData` calls; `short_read` exits cleanly |
 | Zero heap for depth-3+ content | `str_target_=nullptr` in both token loops regardless of value size |
-| All body bytes land in mmap once | `residual_writer_->append(chunk)` runs before `feedChunk`; no second copy |
+| All body bytes land in mmap once | `decodeData` feeds each `Buffer::RawSlice` directly to `onData` — no intermediate `toString()` allocation; `residual_writer_->append(chunk)` is the only copy, from the network buffer into the mmap arena |
 | Sub-refs are pointer arithmetic | `makeSubRef` → `External{base+start, len}`, no data copied |
 | Async page-fault isolation | `pread` thread; event loop never blocks on read page-fault |
 | Encoders see only Buffered/Inline | `prefetchExternalPayloadRefs` completes before filter sub-chain runs |
@@ -409,7 +409,7 @@ stream that `residual_writer_` has captured. `makeSubRef` can safely index into
 classify the incoming request as an OpenAI inference body
 (`POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, etc.).
 
-### 4.1 Class overview
+### 5.1 Class overview
 
 ```
 RequestDecoder
@@ -464,7 +464,7 @@ RequestDecoder
             bool  has_error_; std::string  error_
 ```
 
-### 4.2 Lifecycle
+### 5.2 Lifecycle
 
 ```
 InferenceBodyParser constructed:
@@ -489,7 +489,7 @@ finish(payload, request):
   for each tool_ranges_[i]:    makeSubRef → payload.tools.push_back(ref)
 ```
 
-### 4.3 STRUCTURE token handling
+### 5.3 STRUCTURE token handling
 
 The STRUCTURE case manages depth state and records byte ranges for element
 extraction.
@@ -518,7 +518,7 @@ Note that the byte-range recording at depth 3 happens unconditionally for all
 containers when `captureEnabled()` is true — whether `in_messages_` or `in_tools_`.
 Only the target vector (`message_ranges_` vs `tool_ranges_`) differs.
 
-### 4.4 `str_target_` gating rules
+### 5.4 `str_target_` gating rules
 
 The central memory-safety mechanism is `str_target_`: a pointer to the `std::string`
 that should receive the decoded bytes of the current string token chain, or `nullptr`
@@ -555,7 +555,7 @@ The key property of depth 3+ values: `str_target_` is `nullptr`, so
 buffer (a `string_view` into Envoy's existing data frame); no heap allocation
 occurs for that content regardless of its length.
 
-### 4.5 Scalar extraction
+### 5.5 Scalar extraction
 
 **NUMBER tokens at depth 1**: the raw token bytes are read in place from the chunk
 and parsed with `absl::SimpleAtoi` or `absl::SimpleAtod`:
@@ -572,7 +572,7 @@ and parsed with `absl::SimpleAtoi` or `absl::SimpleAtod`:
 `"false"`. When `current_key_ == "stream"`, the result is stored in `streaming_`.
 No heap allocation occurs.
 
-### 4.6 Body-size tiering
+### 5.6 Body-size tiering
 
 `DecoderConfig` exposes two thresholds that divide the body-size space into three
 tiers.
@@ -626,7 +626,7 @@ POP case, `if (pop_depth == 3 && in_elem_)` is false, so no range is recorded.
 All other behavior — scalar extraction, `body_src_pos_` tracking, residual
 streaming — runs identically in both tiers.
 
-### 4.7 E2E trace — chat/completions (Tier 1)
+### 5.7 E2E trace — chat/completions (Tier 1)
 
 **Request body** (≈90 bytes — Tier 1, `captureEnabled()` = true throughout):
 
@@ -725,7 +725,7 @@ tool_ranges_ empty → payload.tools = []
 `request_decoder.cc` (lines 416–769). It is constructed when request headers
 classify an incoming request as an agent (MCP or A2A) JSON-RPC body.
 
-### 5.1 Class overview
+### 6.1 Class overview
 
 ```
 RequestDecoder
@@ -781,7 +781,7 @@ RequestDecoder
             bool  has_error_; std::string  error_
 ```
 
-### 5.2 Lifecycle
+### 6.2 Lifecycle
 
 ```
 AgentBodyParser constructed:
@@ -808,7 +808,7 @@ finish(payload, request):
   makeSubRef(payload.capabilities, ...)          ← sub-range of residual_params (Tier 1)
 ```
 
-### 5.3 STRUCTURE token handling
+### 6.3 STRUCTURE token handling
 
 **PUSH** (entering a container):
 
@@ -837,7 +837,7 @@ The `params_byte_end_` and both sub-container end values are set to
 `body_src_pos_` after it has already been advanced past the closing delimiter —
 so the ranges are inclusive of the closing `}` or `]` character.
 
-### 5.4 `str_target_` gating rules
+### 6.4 `str_target_` gating rules
 
 ```
 if string_is_key_:
@@ -862,7 +862,7 @@ For a 4 MB value at depth 3 (e.g. a large base64 blob inside `arguments`):
 `str_target_=nullptr`, `appendStringToken` is not called, and no heap allocation
 occurs. The bytes exist only in the HTTP chunk buffer that the caller already owns.
 
-### 5.5 Scalar extraction
+### 6.5 Scalar extraction
 
 **NUMBER at depth 1, `current_key_ == "id"`**: the raw token bytes are parsed as
 integer or float and stored as a string:
@@ -879,7 +879,7 @@ extracts.
 **LITERAL tokens**: no literals are extracted for agent bodies. The LITERAL case
 advances `expecting_key_` for the parent dict and breaks.
 
-### 5.6 Body-size tiering
+### 6.6 Body-size tiering
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -931,7 +931,7 @@ and `capabilities` are never written. In `finish()`, `makeSubRef` sees `end <= s
 and is a no-op for those fields. `params_byte_start_/end_` is recorded and
 `params_raw` is always populated in both tiers.
 
-### 5.7 E2E trace — MCP `tools/call` (Tier 1)
+### 6.7 E2E trace — MCP `tools/call` (Tier 1)
 
 **Request body** (≈120 bytes — Tier 1, `captureEnabled()` = true throughout):
 
@@ -1060,7 +1060,7 @@ No intermediate copy, no `nlohmann` DOM, no `StringStreamWriter`.
 
 ## 7. Memory analysis
 
-### 6.1 Old vs new: the `token_buf_` vulnerability
+### 7.1 Old vs new: the `token_buf_` vulnerability
 
 Both parsers' predecessors used `IncrementalJsonTokenizer`, which maintained a
 single `std::string token_buf_` that accumulated every JSON key at every depth
@@ -1074,7 +1074,7 @@ before firing any callback.
 | Token size bound | Unbounded (whole string per token event) | 65535 bytes per Wuffs token (16-bit `tlen`) |
 | Correctness guarantee | Bespoke state machine, no formal proof | Wuffs toolchain verifies memory safety |
 
-### 6.2 Depth 3+ value attack
+### 7.2 Depth 3+ value attack
 
 ```
 InferenceBodyParser attack body:
@@ -1106,7 +1106,7 @@ New Wuffs-based AgentBodyParser:
   depth_==3 → str_target_=nullptr → 0 bytes heap allocated
 ```
 
-### 6.3 Depth-2 key accumulation bound
+### 7.3 Depth-2 key accumulation bound
 
 An attacker controlling a **key** at depth 2 (inside `params` for agent bodies, or
 inside `messages[i]` elements for inference) receives `str_target_ = &str_acc_`
@@ -1121,7 +1121,7 @@ because all keys are accumulated for routing. However:
 4. For inference bodies: depth-2 keys (inside `messages[i]` elements) go into
    `str_acc_`, which is cleared at the start of the next key string chain.
 
-### 6.4 Peak heap by tier — both parsers
+### 7.4 Peak heap by tier — both parsers
 
 **InferenceBodyParser:**
 
@@ -1275,7 +1275,7 @@ handle to a field value. All large field values in `InferencePayload` and
 `AgentPayload` are typed as `PayloadRef` rather than `std::string` or
 `Buffer::Instance` to avoid copying large content out of the store.
 
-### 9.1 Storage variants
+### 10.1 Storage variants
 
 ```
 PayloadRef::Storage
@@ -1301,7 +1301,7 @@ Encoders must call `convertPayloadRefToString(ref, request)` instead, which
 routes through `request.payload_store->fetch()`. The panic surfaces at test time
 any encoder that fails to handle the External variant.
 
-### 9.2 Sub-refs and `makeSubRef`
+### 10.2 Sub-refs and `makeSubRef`
 
 Both parsers create sub-refs of `residual_params` for nested fields
 (`messages[]`, `tools[]`, `arguments`, `capabilities`, `params_raw`).
@@ -1324,7 +1324,7 @@ parent is Buffered:
 
 `makeSubRef` is a no-op when `field_length == 0` or the parent ref is empty.
 
-### 9.3 PayloadRef storage variant decision tree
+### 10.3 PayloadRef storage variant decision tree
 
 ```
 body arrives ──► residual_writer_->append(chunk)   (each HTTP chunk)
@@ -1353,7 +1353,7 @@ Both parsers call `store_.beginStore(PayloadKind::JsonObject)` on the first
 raw body bytes into the store without any intermediate copy beyond what the
 backend requires.
 
-### 10.1 `StreamWriter` interface
+### 11.1 `StreamWriter` interface
 
 ```cpp
 class StreamWriter {
@@ -1368,7 +1368,7 @@ public:
 in `finish()` after all chunks have been fed. The returned `PayloadRef` is stored
 as `payload.residual_params` and represents the full request body.
 
-### 10.2 `PayloadStore` interface
+### 11.2 `PayloadStore` interface
 
 ```cpp
 class PayloadStore {
@@ -1402,7 +1402,7 @@ this pointer.
 an anonymous temp file via `mmap`, keeping only fields at or below
 `max_inline_bytes` in process heap memory.
 
-### 11.1 Backing file
+### 12.1 Backing file
 
 ```cpp
 std::string tmpl = absl::StrCat(tmp_dir, "/envoy_payload_XXXXXX");
@@ -1417,7 +1417,7 @@ store is destroyed. `~MmapPayloadStore` calls `munmap` then `close(fd_)`. When
 the fd is closed the OS reclaims all pages — including on abnormal process exit,
 since the file has no path.
 
-### 11.2 Bump-allocated arena layout
+### 12.2 Bump-allocated arena layout
 
 The mmap region is a flat byte array. Each write advances `write_offset_`:
 
@@ -1435,7 +1435,7 @@ mmap region:
 `PayloadRef::External` stores `{offset, length}` into this flat region. All
 sub-refs point into the same region as their parent.
 
-### 11.3 Capacity growth
+### 12.3 Capacity growth
 
 Initial capacity: `kInitialCapacity = 64 KB`. On overflow:
 
@@ -1444,7 +1444,7 @@ Initial capacity: `kInitialCapacity = 64 KB`. On overflow:
 3. macOS: `munmap` + `mmap` at the new size (no `mremap` available).
 4. Doubles `new_cap` until `write_offset_ + needed ≤ new_cap`.
 
-### 11.4 Fallback
+### 12.4 Fallback
 
 If `mkstemp` fails, `fd_ = -1` and every `store()` call falls back to
 `PayloadRef::Buffered` (`Buffer::OwnedImpl`). `MmapStreamWriter` sets
@@ -1452,7 +1452,7 @@ If `mkstemp` fails, `fd_ = -1` and every `store()` call falls back to
 a `Buffered` ref in that case. The store is always functional; failure degrades
 from External to Buffered, not to an error.
 
-### 11.5 Zero-copy `Buffer::Instance` ingestion
+### 12.5 Zero-copy `Buffer::Instance` ingestion
 
 The `store(Buffer::Instance& data, ...)` overload walks the slab chain directly:
 
@@ -1467,7 +1467,7 @@ for (const auto& s : slices) {
 No intermediate contiguous copy is required. Each slab is `memcpy`'d once,
 sequentially, into the mmap region.
 
-### 11.6 Thread safety
+### 12.6 Thread safety
 
 `MmapPayloadStore` is not thread-safe. One store per request stream is the
 intended usage pattern, matching Envoy's single-threaded filter chain.
@@ -1641,7 +1641,145 @@ allocation Wuffs makes; all other operations are purely computational.
 
 ---
 
-## 16. Related documentation
+## 16. Parser library comparison
+
+### 16.1 The three requirements that determine the choice
+
+This use case is unusual. Most JSON parsing is "parse this complete document and
+give me a tree." The proxy needs something different:
+
+1. **True resumable streaming** — HTTP body arrives in N chunks of arbitrary size;
+   the parser must resume across chunk boundaries without blocking the event loop.
+2. **Pre-accumulation discard** — routing fields are extracted; everything else
+   (4 MB `content` values, `arguments` blobs) must be discardable *before* any
+   heap allocation occurs for that content. SAX-style libraries (RapidJSON, YAJL)
+   accumulate the full string into an internal buffer before firing a callback;
+   by the time application code runs, the 4 MB allocation has already happened.
+   The discard decision must be possible at the *first byte* of a token, not after
+   the last.
+3. **Raw byte positions in the source** — given the zero-copy `PayloadRef::External`
+   design, `makeSubRef` needs exact byte offsets of `params`, `arguments`, and
+   `messages[i]` inside the original body to produce sub-ranges without copying.
+   (If fields were copied into owned storage instead, this requirement would not
+   exist and YAJL would be a viable streaming option.)
+
+Almost every mainstream library fails at least one of these.
+
+### 16.2 Library-by-library analysis
+
+#### nlohmann/json (prior incumbent for `finish()`)
+
+| Property | Result |
+|---|---|
+| Streaming | None — requires complete document |
+| Heap per large value | O(document size) — full DOM tree |
+| Raw byte positions | No |
+| Formal safety | No |
+
+A DOM parser. A 4 MB body allocates proportional heap for every node and every
+string. It was used for the second-pass parse in the original `AgentBodyParser::finish()`.
+No path to streaming, no ability to discard content cheaply.
+
+#### RapidJSON (SAX mode)
+
+RapidJSON has a SAX `Reader` that fires callbacks (`StartObject`, `Key`, `String`,
+`EndObject`). It looks promising but has three gaps:
+
+**Gap 1 — Not a resumable coroutine.** `Reader` reads from an `IStream` until
+exhausted; there is no way to feed a partial chunk and resume on the next one
+without blocking. Envoy's filter chain requires returning from `decodeData()`
+immediately — blocking inside a callback to wait for more data is not possible.
+
+**Gap 2 — String callbacks receive decoded strings, not raw bytes.** When the SAX
+fires `String(const char* str, SizeType len, bool copy)`, the string has already
+been fully decoded into an internal buffer. For a 4 MB `content` value, RapidJSON
+allocates 4 MB before calling the handler. The `str_target_=nullptr` discard
+optimization is impossible — you cannot instruct RapidJSON to skip a string before
+it has already accumulated it.
+
+**Gap 3 — No raw byte positions.** SAX callbacks hand decoded text with no source
+offset. `makeSubRef` would be impossible.
+
+#### simdjson
+
+The fastest JSON parser available (~3 GB/s on modern hardware via SIMD). Has both
+a DOM API and an "On Demand" lazy API that skips fields never accessed.
+
+**Fatal constraint: requires the full document in a contiguous buffer.** This is
+architectural. simdjson's SIMD approach processes 64 bytes at a time across the
+whole document and requires padding bytes after the last byte. HTTP chunks arrive
+un-padded and non-contiguous. There is no streaming mode. The On Demand API still
+requires the complete body in memory before any traversal begins.
+
+#### YAJL (Yet Another JSON Library)
+
+A C streaming callback parser. Genuinely streaming — partial input can be fed
+incrementally. The closest alternative to Wuffs for the streaming requirement.
+
+**Gap: string callbacks receive fully accumulated strings.** YAJL's
+`yajl_callbacks` fires `yajl_string(ctx, val, len)` with a `const unsigned char*`
+that YAJL has fully decoded and buffered internally. For a 4 MB string, YAJL
+allocates 4 MB before the callback fires. This is structurally identical to the
+`token_buf_` vulnerability in the old `IncrementalJsonTokenizer` — just in a C
+library instead of a bespoke state machine.
+
+**Gap: no byte positions.** Callbacks receive decoded text, not source offsets.
+
+#### jsmn
+
+Minimal C tokenizer. Returns an array of `jsmntok_t` with `.start`/`.end` byte
+offsets into the source buffer. Does not copy or decode strings — you index back
+into the source yourself.
+
+Interesting properties: raw byte positions, no string allocation. But it requires
+the **full document** before tokenizing. Not a streaming parser. No chunk-by-chunk
+feeding.
+
+#### Custom IncrementalJsonTokenizer (predecessor)
+
+A bespoke 14-state machine. Truly streaming but had the vulnerability described in
+§1: `token_buf_` accumulated every JSON key at every nesting depth before firing
+any callback. No per-token size bound, no formal proof, ongoing maintenance burden.
+
+### 16.3 Why Wuffs satisfies all three requirements uniquely
+
+| Requirement | Wuffs mechanism |
+|---|---|
+| Resumable streaming | Stackless coroutine in `dec_` (~2 KB fixed struct). `decode_tokens` returns `short_read` suspension; resumes from the exact source byte on the next `feed()` call. No C++ call-stack state to preserve. |
+| Per-token discard | `str_target_=nullptr` means `appendStringToken` is never called. A 4 MB value produces ~62 tokens of ≤65535 bytes each; all 62 are discarded in O(1) with zero heap. The discard is structural, not flag-dependent. |
+| Raw byte positions | Every token carries `tlen`. `body_src_pos_` advances by `tlen` for every token including FILLER and DROP tokens. This gives exact byte offsets for `makeSubRef` → `PayloadRef::External{base + start, len}` without any intermediate copy. |
+| Formal safety | The Wuffs toolchain proves memory safety at compile time. The 65535-byte `tlen` ceiling is a property of the 16-bit field type, not a runtime check. |
+
+The formal verification is the tie-breaker over a hypothetical YAJL variant with a
+"peek-and-discard" callback. A proxy handling attacker-controlled traffic benefits
+from a verifiable safety guarantee that no bespoke or community C++ library provides.
+
+### 16.4 Wuffs costs
+
+| Cost | Impact |
+|---|---|
+| Manual escape decoding | `appendStringToken` was written by hand. The `\uXXXX` surrogate pair limitation (documented in `request_decoder.cc`) is a direct consequence. |
+| Continued-token handling | Multi-token strings (>65535 bytes or containing escape sequences) require `in_chain_` state across `feed()` boundaries — ~6 lines of state and logic that no SAX library requires. |
+| VBC/VBD flag reading | Token category/detail bitfield decoding is lower-level than SAX callbacks. The `switch(vbc)` block is harder to read at a glance than `OnString(...)`. |
+| Community | Wuffs is a single-author research project. RapidJSON and simdjson have orders of magnitude more users and issue history. |
+| Build complexity | The `WUFFS_IMPLEMENTATION` single-TU constraint requires `wuffs_impl.c` as a separate compilation unit. Non-obvious to newcomers. |
+
+### 16.5 Verdict
+
+For a security-sensitive streaming proxy, Wuffs is the only off-the-shelf library
+that satisfies all three constraints simultaneously. The cost is API complexity —
+manual escape decoding and continued-token state — which is why `appendStringToken`
+and `in_chain_` require careful documentation.
+
+If the zero-copy sub-ref requirement were dropped (i.e. field bytes were copied
+into owned strings), YAJL with a depth-gated discard patch would be a viable
+alternative. With the sub-ref requirement in place, no other mainstream library
+provides resumable streaming, per-token discardability, and raw byte positions
+together.
+
+---
+
+## 17. Related documentation
 
 - `request_decoder.cc` lines 27–63 — `appendStringToken` free function
   (anonymous namespace, shared by both parsers).

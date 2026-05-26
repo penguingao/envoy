@@ -52,9 +52,10 @@ struct DecoderConfig {
 //     return StopIteration;   // wait for body
 //   }
 //   FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) {
-//     decoder_.onData(data.toString());
+//     for (const Buffer::RawSlice& s : data.getRawSlices())
+//       decoder_.onData(absl::string_view(static_cast<const char*>(s.mem_), s.len_));
 //     if (end_stream) { decoder_.onEndStream(); dispatch(); }
-//     return StopIterationAndBuffer;
+//     return StopIterationNoBuffer;
 //   }
 //   void dispatch() {
 //     auto req = decoder_.take();  // moves AiRequest out

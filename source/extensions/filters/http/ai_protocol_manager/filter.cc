@@ -101,7 +101,12 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
   if (non_ai_traffic_) {
     return Http::FilterDataStatus::Continue;
   }
-  auto status = decoder_.onData(data.toString());
+  absl::Status status;
+  for (const Buffer::RawSlice& slice : data.getRawSlices()) {
+    status = decoder_.onData(
+        absl::string_view(static_cast<const char*>(slice.mem_), slice.len_));
+    if (!status.ok()) break;
+  }
   if (!status.ok()) {
     ENVOY_STREAM_LOG(debug, "ai_protocol_manager: body decode error, rejecting: {}",
                      *decoder_callbacks_, status.message());
