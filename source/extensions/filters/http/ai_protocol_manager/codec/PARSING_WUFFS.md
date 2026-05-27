@@ -3024,3 +3024,266 @@ and avoids the load-factor overhead of the hash table entirely.
 The only remaining proportional allocation when `extract_fields` is configured is
 `std::string(raw)` in `onScalar` for matched numeric/literal values — this is
 unavoidable since `raw` is a `string_view` into a transient chunk buffer.
+
+---
+
+## 22. Architecture diagrams
+
+### 22.1 Full request pipeline
+
+```mermaid
+flowchart TD
+    A[Downstream client\nPOST /mcp or /v1/chat/completions] --> B
+
+    subgraph decode ["RequestDecoder — per HTTP stream"]
+        B["decodeHeaders()\nProtocolClassifier::classify()\n→ AgentBodyParser or InferenceBodyParser"]
+        B --> C["decodeData() × N\nfor each chunk"]
+        C --> D["residual_writer_->append(chunk)\n→ MmapStreamWriter: memcpy into mmap arena"]
+        C --> E["feedChunk(chunk, false)\n→ WuffsJsonCursor token loop"]
+        E --> F{Token VBC class}
+        F -->|FILLER| G[skip — no allocation]
+        F -->|STRUCTURE| H["depth tracking\nonPush / onPop\nkey_stack update if track_paths_"]
+        F -->|STRING| I{str_target_?}
+        I -->|nullptr| J[discard — zero bytes heap]
+        I -->|&field| K["str_target_->append(raw)\nonStringComplete"]
+        F -->|NUMBER / LITERAL| L["onScalar\ntype conversion inline\nSimpleAtoi / SimpleAtod / bool compare"]
+        C --> M["decodeData() short_read exit\nWuffs coroutine state preserved\n→ wait for next chunk"]
+    end
+
+    E --> N["onEndStream → finish()\nmakeSubRef for each recorded range\n→ External{base+start, len}\npointer arithmetic only"]
+    N --> O["AiRequest\n typed fields: model, method, id, sampling…\n External PayloadRefs: messages[], params_raw, arguments\n attributes: extracted_attrs_ moved in"]
+
+    subgraph prefetch ["prefetchExternalPayloadRefs — off event loop"]
+        O --> P["collect External refs\natomic pending = refs.size()"]
+        P --> Q["per ref: store.fetchAsync()\n→ detached thread: pread(fd, buf, offset)"]
+        Q --> R["page-fault off event loop\ndispatcher.post(cb)"]
+        R --> S["ref → Buffered\n--pending\npending==0 → on_done()"]
+    end
+
+    S --> T
+
+    subgraph chain ["Filter sub-chain"]
+        T["McpAuthFilter\ntool_name / resource_uri / prompt_name\nattributes[key] → ParamCondition::Attribute\n→ allow / 403"]
+        T --> U["Rate-limit / routing filters\ntarget.name → provider\nsampling → quota"]
+    end
+
+    U --> V["RequestEncoder\nrebuild JSON body from AiRequest\nall refs now Buffered → toString() safe"]
+    V --> W[Upstream provider\nMCP server / OpenAI API]
+
+    subgraph ecds ["Control plane — ECDS"]
+        X["DecoderConfig\nextract_fields: json_path list\nrecompute() → pattern_set + min_depth"]
+        X -.->|shared_ptr per listener| decode
+        X -.->|same config| chain
+    end
+```
+
+### 22.2 WuffsJsonCursor token dispatch and extract_fields path
+
+```mermaid
+flowchart TD
+    A["WuffsJsonCursor::feed(chunk)"] --> B["wuffs decode_tokens()\nfill tok_buf_"]
+    B --> C{tok_buf_ empty?}
+    C -->|yes| D["short_read — return\nWuffs coroutine state frozen"]
+    C -->|no| E["next token\nvbc = token.value_base_category()"]
+
+    E --> F{VBC class}
+
+    F -->|FILLER| G["skip\n— comment, whitespace, BOM\nno allocation"]
+    F -->|STRUCTURE| H{open or close?}
+    H -->|open brace/bracket| I["onPush(depth)\n++depth_\nif track_paths_:\n  push_key_[depth_] = (prev key or '[')"]
+    H -->|close brace/bracket| J["onPop(depth)\n--depth_\nif track_paths_:\n  key_stack_[depth_] = empty"]
+
+    F -->|STRING, cont=true| K["in-key or in-value segment\ncont=true: more segments follow"]
+    F -->|STRING, cont=false| L["final or only segment"]
+
+    K --> M{str_target_?}
+    L --> M
+    M -->|nullptr| N["discard token bytes\nzero allocation"]
+    M -->|&field| O["str_target_->append(raw)\nif cont=false → onStringComplete(depth)"]
+
+    O --> P["onStringComplete:\nif config_field_scratch_ active\n  extracted_attrs_.emplace_back(\n    move(config_field_indexed_path_),\n    move(config_field_scratch_))"]
+
+    F -->|NUMBER or LITERAL| Q["onScalar(depth, raw, vbc)"]
+    Q --> R{"extract_fields\nconfigured?\ndepth >= min_extract_depth_?"}
+    R -->|no| S["type-convert into typed target\nSimpleAtoi / SimpleAtod / bool"]
+    R -->|yes| T["buildPaths(depth, indexed, pattern)\nreuse path_scratch_ strings\nno heap alloc after warmup"]
+    T --> U{pattern_set\ncontains pattern?}
+    U -->|no| S
+    U -->|yes| V["extracted_attrs_.emplace_back(\n  move(indexed_path), string(raw))"]
+
+    subgraph key_dispatch ["Key dispatch — STRING at depth N (final segment)"]
+        W["onKey(depth, key_text)"]
+        W --> X{depth == 1?}
+        X -->|yes| Y["switch key → set str/bool/int/double target_\nor set in_messages_ / in_params_"]
+        X -->|no + in_params_| Z["switch key → params_name_ / params_uri_"]
+        X -->|no + in_messages_| AA["elem_start_ = body_src_pos_\nstr_target_ = nullptr"]
+        W --> AB{"track_paths_?"}
+        AB -->|yes| AC["key_stack_[depth_] = key_text"]
+    end
+
+    G --> C
+    N --> C
+    S --> C
+    V --> C
+    P --> C
+    AC --> C
+    I --> C
+    J --> C
+```
+
+### 22.3 Three-tier memory model
+
+```mermaid
+flowchart TD
+    A["HTTP body chunk arrives\ntotal_bytes_ += chunk.size"] --> B{total_bytes_\nvs thresholds}
+
+    B -->|"> max_body_bytes\n(default 4 MB)"| C["return ResourceExhausted\n→ 413 Request Entity Too Large\nno further parsing"]
+
+    B -->|"≤ capture_threshold\n(default 256 KB)"| D
+
+    B -->|"> capture_threshold\n≤ max_body_bytes"| E
+
+    subgraph tier1 ["Tier 1 — full capture (≤ 256 KB)"]
+        D["captureEnabled() = true\nAll depths parsed:\n  depth-1 scalars → typed fields\n  depth-2 arrays → elem_start_ recorded\n  depth-3+ content → str_target_=nullptr\n    (zero heap, byte range only)\nfinish(): makeSubRef for each element\n  → External{offset, len} per message/tool"]
+    end
+
+    subgraph tier2 ["Tier 2 — scalars only (256 KB – 4 MB)"]
+        E["captureEnabled() = false\nDepth-1 scalars only:\n  model, method, id, stream, sampling…\n  → typed fields populated\nDepth-2 arrays: NOT entered\n  → messages[], tools[], params_raw EMPTY\nfinish(): residual = External{0, body_size}\n  (full body as single ref for passthrough)"]
+    end
+
+    subgraph mmap ["MmapPayloadStore — all tiers"]
+        F["residual_writer_->append(chunk)\nmemcpy → mmap arena\n(OS page cache, not malloc heap)\nAll body bytes land here once\n— Tier 1 and Tier 2 identical\n— Sub-refs are pointer arithmetic\n  into the same arena"]
+    end
+
+    D --> G
+    E --> G
+    C --> X[reject]
+
+    subgraph prefetch ["prefetchExternalPayloadRefs"]
+        G["collect External refs\nfor each ref: pread on detached thread\npage-fault off event loop\nref → Buffered on completion"]
+    end
+
+    G --> H["Filter chain sees only\nBuffered or Inline PayloadRefs\ntoString() safe, no mmap access\nTier 2: messages[].empty()\n  filter must check before iterating"]
+
+    D -. "body bytes" .-> F
+    E -. "body bytes" .-> F
+```
+
+### 22.4 extract_fields ECDS flow
+
+```mermaid
+flowchart LR
+    subgraph cp ["Control plane"]
+        A["AiProtocolManager proto\ndecoder_config.extract_fields:\n  - json_path: 'params.arguments.database'\n  - json_path: 'params.arguments.env'"]
+    end
+
+    subgraph bootstrap ["Listener bootstrap — once per config push"]
+        B["AiProtocolManagerFilterConfigFactory\n::buildConfig()"]
+        A -->|ECDS delivery| B
+        B --> C["DecoderConfig\nextract_fields: [{json_path}…]\nrecompute():\n  pattern_set = flat_hash_set\n  min_depth = min over patterns"]
+        C --> D["shared_ptr<AiProtocolManagerConfig>\n— one instance per listener worker\n— DecoderConfig immutable after buildConfig"]
+    end
+
+    subgraph stream ["Per-request — zero config overhead"]
+        D -->|shared ref| E["InferenceBodyParser / AgentBodyParser\nconstructor: track_paths_ = !pattern_set.empty()\nmin_extract_depth_ = config.min_extract_depth"]
+        E --> F["WuffsJsonCursor token loop\nselectStringTarget(depth):\n  depth < min_extract_depth → skip\n  buildPaths(depth, indexed, pattern)\n  pattern_set.contains(pattern) → capture"]
+        F --> G["extracted_attrs_\nvector<pair<string,string>>\nkey=indexed_path e.g. params.arguments.database\nvalue=matched string value"]
+        G --> H["finish():\nfor k,v in extracted_attrs_:\n  request.attributes.emplace(move k, move v)"]
+    end
+
+    subgraph filter ["McpAuthFilter — reads attributes"]
+        H --> I["AiRequest::attributes\nflat_hash_map<string,string>"]
+        I --> J["ParamCondition::Attribute\nfield = ATTRIBUTE\nattribute_key = 'params.arguments.database'\nevaluate():\n  it = attributes.find(key)\n  matcher.matches(it->second)"]
+        J --> K{match?}
+        K -->|yes| L["policy action\nallow / deny / rate-limit"]
+        K -->|no| M["next condition\nor catch-all"]
+    end
+```
+
+---
+
+## 23. Total heap and memory usage per request
+
+### 23.1 Config-time allocations — once per listener worker, shared across all requests
+
+| Object | Allocs | Bytes |
+|---|---|---|
+| `DecoderConfig::extract_fields` vector entries | N | N × (`sizeof(ExtractFieldSpec)` + heap if `json_path` > 15 chars SSO) |
+| `DecoderConfig::extract_field_pattern_set` entries | N | same key strings as above |
+
+Zero if `extract_fields` is empty — the common case.
+
+### 23.2 Per-request fixed overhead — always paid
+
+| Object | Where created | Allocs | Bytes |
+|---|---|---|---|
+| `InferenceBodyParser` / `AgentBodyParser` heap object | `make_unique<>` in `onHeaders` | 1 | ~900 B (see §23.3) |
+| Wuffs decoder `dec_` inside `WuffsJsonCursor` | `wuffs_json__decoder::alloc()` in cursor constructor | 1 | ~2 KB |
+| `residual_writer_` (`StreamWriter`) | `store_.beginStore()` on first `feed()` | 1 | ~64 B |
+| `request_.path` (e.g. `/v1/chat/completions`, 22 chars > SSO) | `onHeaders` | 1 | ~24 B |
+| `request_.http_method` (≤ 6 chars, fits SSO) | — | 0 | 0 |
+| `model_` / `method_` strings (if > 15 chars) | `onStringComplete` | 0–1 | 0–50 B |
+
+### 23.3 Parser object inline layout
+
+The `InferenceBodyParser` / `AgentBodyParser` struct lives in a **single heap alloc** (`make_unique`). Its inline content (not counting `dec_` which is a separate alloc):
+
+| Member | Inline bytes |
+|---|---|
+| `WuffsJsonCursor::tok_data_[256]` (token ring buffer) | 4096 B |
+| `WuffsJsonCursor::key_stack_[8]` + `push_key_[9]` + `str_acc_` — 18 SSO strings | 18 × 24 B = 432 B |
+| `WuffsJsonCursor` bools/ints (`depth_`, `is_dict_[]`, etc.) | ~80 B |
+| Parser string members (`model_`, `current_key_`, `string_val_`, path_scratch ×2, config_field ×2) | 7 × 24 B = 168 B |
+| `SamplingParams` (6 `absl::optional` scalars + `stop` vector shell) | ~100 B |
+| Range vector shells (`message_ranges_`, `message_kinds_`, `tool_ranges_`, `tool_kinds_`) | 4 × 24 B = 96 B |
+| Booleans and `size_t` tracking fields | ~80 B |
+
+All SSO strings and the token ring buffer are part of the single alloc. No extra heap allocs for string fields whose content is ≤ 15 bytes.
+
+### 23.4 Body bytes — where they land
+
+| Store | Body bytes path | Malloc heap? |
+|---|---|---|
+| `MmapPayloadStore` (production) | `residual_writer_->append(chunk)` → `memcpy` into mmap arena (OS page cache) | **No** — zero malloc for body content |
+| `InMemoryPayloadStore` (tests) | Copies into `Buffer::OwnedImpl` | **Yes** — one alloc proportional to body size |
+
+Body bytes never hit the malloc heap in production. The entire body is written once into the mmap file; the OS page cache manages it from there.
+
+### 23.5 Per-element allocations — proportional to element count, not element size
+
+Only paid when `captureEnabled()` (body ≤ 256 KB, Tier 1). Each `messages[i]` / `tools[i]` element:
+
+| Object | Alloc | Bytes |
+|---|---|---|
+| `message_ranges_` vector growth | amortized 1 per doubling | N_msg × 16 B |
+| `message_kinds_` vector growth | amortized 1 per doubling | N_msg × 4 B |
+| `payload.messages` vector growth (in `finish()`) | amortized 1 per doubling | N_msg × 40 B |
+| Each `PayloadRef::External` value | 0 — two integers, no data | — |
+
+For 10 messages: ~600 B total across the three vectors. The message JSON content is in the mmap arena, not in these vectors.
+
+Tier 2 (body > 256 KB): none of the above vectors are populated. The only body output is `payload.residual_params = External{0, body_size}`.
+
+### 23.6 Per-matched-extract_field — only when `extract_fields` is configured
+
+| Object | Alloc | Bytes |
+|---|---|---|
+| `path_scratch_indexed_` / `path_scratch_pattern_` warm-up | 1 per string on first call, reused after | key_len each |
+| `extracted_attrs_.emplace_back` (value string) | 0 if value ≤ 15 chars (SSO), 1 otherwise | value_len |
+| `request.attributes.emplace(move k, move v)` in `finish()` | 0 — both key and value are moved from `extracted_attrs_` | — |
+| `attributes` flat_hash_map bucket array growth | amortized 1 per doubling | ~N_fields × 48 B |
+
+### 23.7 Total per-request malloc budget summary (MmapPayloadStore, production)
+
+| Scenario | Heap allocs | Malloc bytes |
+|---|---|---|
+| Bodiless GET | ~2 | ~100 B |
+| Tier 2 inference (body > 256 KB) | ~5 fixed | ~3.5 KB |
+| Tier 1 inference, 10 messages | ~5 fixed + 3 amortized vector growths | ~4.2 KB |
+| Tier 1 inference, 10 messages + 1 extract_field match | above + 0–2 string allocs | ~4.5 KB |
+
+**Body content: zero malloc bytes in all scenarios.** The body lives entirely in the mmap arena.
+
+### 23.8 Key invariant
+
+The malloc heap budget is **O(1) with respect to body size**. The only O(N) component is element count (`messages[]` / `tools[]`), and each element costs ~60 B in index vectors — not its content bytes. A 4 MB body with 100 messages costs ~7 KB malloc; the same 4 MB body with 1 message costs ~4 KB malloc. Content length has no effect on malloc.
