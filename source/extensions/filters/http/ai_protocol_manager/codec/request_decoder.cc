@@ -80,84 +80,87 @@ void makeSubRef(PayloadRef& ref, size_t start, size_t len,
   }
 }
 
-} // namespace
-
-// ─────────────────────────────────────────────────────────────────────────────
-// InferenceBodyParser  (Wuffs streaming)
-//
-// Replaces the old IncrementalJsonTokenizer + InferenceHandler approach with a
-// Wuffs stackless coroutine.  The decoder preserves all parse state in dec_
-// across feed() calls; no token_buf_ accumulation occurs.
-//
-// Element byte ranges for messages[]/tools[] elements are recorded during the
-// streaming parse and converted to PayloadRef sub-ranges of residual_params in
-// finish() — zero-copy for MmapPayloadStore, substring copy for tests.
-//
-// Tier 1 and Tier 2 share one feedChunk path; the only branch is captureEnabled()
-// gating the byte-range recording for elements.
-// ─────────────────────────────────────────────────────────────────────────────
-
-class RequestDecoder::InferenceBodyParser {
+// WuffsJsonCursor wraps the Wuffs JSON tokenizer loop, depth tracking, and
+// string accumulation. Callers implement Handler to receive semantic events;
+// all Wuffs token mechanics live here and are invisible to the parsers.
+class WuffsJsonCursor {
 public:
-  InferenceBodyParser(const DecoderConfig& config, PayloadStore& store)
-      : config_(config), store_(store) {
+  class Handler {
+  public:
+    virtual ~Handler() = default;
+    // Called at the start of a non-key string chain.
+    // Returns the target to accumulate into, or nullptr to discard.
+    virtual std::string* selectStringTarget(int depth) = 0;
+    // Called when a key chain completes. Return error to abort (e.g. duplicate key).
+    virtual absl::Status onKey(absl::string_view key, int depth) = 0;
+    // Called when a non-key string chain completes (target is the same pointer
+    // returned by selectStringTarget, always non-null).
+    virtual void onStringComplete(std::string* target, int depth) = 0;
+    // Called for NUMBER and LITERAL tokens. vbc distinguishes them.
+    virtual void onScalar(absl::string_view raw, int64_t vbc, int depth) = 0;
+    // Called after depth has been incremented for a STRUCTURE push.
+    virtual void onPush(bool is_dict, int depth, size_t tok_start) = 0;
+    // Called with the closing container's depth (before decrement) and the
+    // body position after the closing delimiter.
+    virtual void onPop(int depth, size_t tok_end) = 0;
+  };
+
+  explicit WuffsJsonCursor(Handler& handler) : handler_(handler) {
     dec_     = wuffs_json__decoder::alloc();
     tok_buf_ = wuffs_base__slice_token__writer(
         wuffs_base__make_slice_token(tok_data_, kTokBufLen));
   }
 
-  absl::Status feed(absl::string_view chunk) {
-    total_bytes_ += chunk.size();
-    if (total_bytes_ > config_.max_body_bytes) {
-      return absl::ResourceExhaustedError(absl::StrCat(
-          "inference request body exceeds limit of ", config_.max_body_bytes, " bytes"));
-    }
-    if (!residual_writer_) {
-      residual_writer_ = store_.beginStore(PayloadKind::JsonObject);
-    }
-    residual_writer_->append(chunk);
-    return feedChunk(chunk, /*closed=*/false);
-  }
-
-  absl::Status finish(InferencePayload& payload, AiRequest& request) {
-    auto s = feedChunk("", /*closed=*/true);
-    if (!s.ok()) return s;
-    if (has_error_) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("inference body parse error: ", error_));
-    }
-
-    payload.target.name = std::move(model_);
-    payload.sampling    = std::move(sampling_);
-    request.streaming   = streaming_;
-
-    if (residual_writer_) {
-      payload.residual_params = residual_writer_->finalize();
-    }
-
-    // Convert recorded byte ranges to PayloadRef sub-ranges of residual_params.
-    for (size_t i = 0; i < message_ranges_.size(); ++i) {
-      auto [start, end] = message_ranges_[i];
-      PayloadRef ref;
-      makeSubRef(ref, start, end - start, payload.residual_params, message_kinds_[i], store_);
-      payload.messages.push_back(std::move(ref));
-    }
-    for (size_t i = 0; i < tool_ranges_.size(); ++i) {
-      auto [start, end] = tool_ranges_[i];
-      PayloadRef ref;
-      makeSubRef(ref, start, end - start, payload.residual_params, tool_kinds_[i], store_);
-      payload.tools.push_back(std::move(ref));
-    }
-
-    return absl::OkStatus();
-  }
-
-private:
-  bool captureEnabled() const {
-    return total_bytes_ <= config_.max_element_capture_bytes;
-  }
-
-  absl::Status feedChunk(absl::string_view chunk, bool closed) {
+  // Feeds one body chunk into the Wuffs JSON tokenizer and dispatches tokens
+  // to the Handler callbacks.
+  //
+  // Wuffs token model
+  // ─────────────────
+  // Each wuffs_base__token carries three fields used here:
+  //
+  //   vbc  (value_base_category) — coarse token kind; the switch below:
+  //     FILLER     Whitespace and punctuation (commas, colons, quotes).
+  //                No semantic meaning for routing; silently skipped.
+  //     STRUCTURE  Container open/close: { } [ ].
+  //                vbd bits distinguish push vs. pop and dict vs. array:
+  //                  VBD__STRUCTURE__PUSH    set on { or [
+  //                  VBD__STRUCTURE__TO_DICT set on { (clear on [)
+  //                depth_ is incremented before onPush, decremented after onPop,
+  //                so the handler always sees the depth of the container itself.
+  //     STRING     One segment of a JSON string value or key (between the quotes,
+  //                with escape sequences still encoded — appendStringToken decodes
+  //                them). A single logical string may span multiple tokens if
+  //                Wuffs fills tok_buf_ before the closing quote; the `cont` flag
+  //                (token__continued) is true on all but the last segment.
+  //                vbd bits used by appendStringToken for escape decoding:
+  //                  VBD__STRING__CONVERT_0_DST_1_SRC_BACKSLASH_X_*
+  //                  VBD__STRING__DEFINITELY_ASCII
+  //     NUMBER     A JSON number literal (integer or floating-point).
+  //                Raw bytes forwarded to onScalar with vbc=NUMBER so the handler
+  //                can parse with absl::SimpleAtoi / absl::SimpleAtod.
+  //     LITERAL    One of: true, false, null.
+  //                Raw bytes forwarded to onScalar with vbc=LITERAL so the handler
+  //                can compare raw == "true" / "false" / "null".
+  //
+  //   vbd  (value_base_detail) — kind-specific bit flags (see vbc above).
+  //
+  //   tlen (token__length) — number of source bytes this token consumed.
+  //        body_src_pos_ is advanced by tlen for every token regardless of vbc,
+  //        giving a monotonically increasing byte counter used for byte-range
+  //        recording (onPush / onPop pass tok_start / tok_end from it).
+  //
+  // Outer loop suspension
+  // ─────────────────────
+  // decode_tokens returns one of three status classes:
+  //   nullptr / note  Complete — document fully consumed; set wuffs_done_.
+  //   short_read      tok_buf_ drained before src_buf exhausted — need more
+  //                   input; break and return, resuming on next feed() call.
+  //                   The Wuffs stackless coroutine in dec_ preserves all parse
+  //                   state so resumption is exact.
+  //   short_write     src_buf has input but tok_buf_ is full — reset the token
+  //                   ring buffer and re-invoke decode_tokens to drain more.
+  //   other error     Malformed JSON; propagate as InvalidArgumentError.
+  absl::Status feed(absl::string_view chunk, bool closed) {
     if (!dec_) return absl::InternalError("wuffs json: alloc failed");
     if (wuffs_done_) return absl::OkStatus();
 
@@ -171,19 +174,19 @@ private:
           dec_.get(), &tok_buf_, &src_buf, wuffs_base__empty_slice_u8());
 
       while (tok_buf_.meta.ri < tok_buf_.meta.wi) {
-        const wuffs_base__token* tok = &tok_buf_.data.ptr[tok_buf_.meta.ri++];
-        const int64_t  vbc       = wuffs_base__token__value_base_category(tok);
-        const uint64_t vbd       = wuffs_base__token__value_base_detail(tok);
-        const uint64_t tlen      = wuffs_base__token__length(tok);
-        const bool     cont      = wuffs_base__token__continued(tok);
-        const size_t   tok_start = body_src_pos_;
+        const wuffs_base__token* tok      = &tok_buf_.data.ptr[tok_buf_.meta.ri++];
+        const int64_t            vbc      = wuffs_base__token__value_base_category(tok);
+        const uint64_t           vbd      = wuffs_base__token__value_base_detail(tok);
+        const uint64_t           tlen     = wuffs_base__token__length(tok);
+        const bool               cont     = wuffs_base__token__continued(tok);
+        const size_t             tok_start = body_src_pos_;
         body_src_pos_ += tlen;
 
         switch (vbc) {
+        // Whitespace, commas, colons, quote delimiters — no semantic value.
+        case WUFFS_BASE__TOKEN__VBC__FILLER: break;
 
-        case WUFFS_BASE__TOKEN__VBC__FILLER:
-          break;
-
+        // { } [ ] — container open (push) or close (pop); vbd carries push/dict bits.
         case WUFFS_BASE__TOKEN__VBC__STRUCTURE: {
           const bool is_push = (vbd & WUFFS_BASE__TOKEN__VBD__STRUCTURE__PUSH) != 0;
           const bool to_dict = (vbd & WUFFS_BASE__TOKEN__VBD__STRUCTURE__TO_DICT) != 0;
@@ -193,99 +196,34 @@ private:
               is_dict_[depth_]       = to_dict;
               expecting_key_[depth_] = to_dict;
             }
-            if (depth_ == 2) {
-              if      (current_key_ == "messages") { in_messages_ = true;  in_tools_    = false; }
-              else if (current_key_ == "tools")    { in_tools_    = true;   in_messages_ = false; }
-              else if (current_key_ == "stop")     { in_stop_array_ = true; }
-            }
-            // Tier 1: begin tracking byte range for a messages/tools element.
-            if (depth_ == 3 && (in_messages_ || in_tools_) && captureEnabled()) {
-              in_elem_      = true;
-              elem_start_   = tok_start;
-              elem_is_dict_ = to_dict;
-            }
+            handler_.onPush(to_dict, depth_, tok_start);
           } else {
             const int pop_depth = depth_;
             --depth_;
-            // Close a messages/tools element at depth 3.
-            if (pop_depth == 3 && in_elem_) {
-              in_elem_ = false;
-              auto kind = elem_is_dict_ ? PayloadKind::JsonObject : PayloadKind::JsonArray;
-              if (in_messages_) {
-                message_ranges_.push_back({elem_start_, body_src_pos_});
-                message_kinds_.push_back(kind);
-              } else if (in_tools_) {
-                tool_ranges_.push_back({elem_start_, body_src_pos_});
-                tool_kinds_.push_back(kind);
-              }
-            }
-            if (pop_depth == 2) {
-              in_messages_   = false;
-              in_tools_      = false;
-              in_stop_array_ = false;
-            }
-            if (depth_ >= 1 && depth_ < kMaxDepth && is_dict_[depth_]) {
+            handler_.onPop(pop_depth, body_src_pos_);
+            if (depth_ >= 1 && depth_ < kMaxDepth && is_dict_[depth_])
               expecting_key_[depth_] = true;
-            }
           }
           break;
         }
 
+        // JSON string segment (key or value); may span multiple tokens — cont flag signals chain.
         case WUFFS_BASE__TOKEN__VBC__STRING: {
           const absl::string_view raw = chunk.substr(tok_start - chunk_base, tlen);
-          const bool first_in_group   = !in_chain_;
-          if (first_in_group) {
+          if (!in_chain_) {
             str_acc_.clear();
-            string_is_key_ = (depth_ < kMaxDepth && is_dict_[depth_] && expecting_key_[depth_]);
-            if (string_is_key_) {
-              str_target_ = &str_acc_;
-            } else if (depth_ == 1) {
-              if      (current_key_ == "model") { model_.clear();      str_target_ = &model_;      }
-              else if (current_key_ == "stop")  { string_val_.clear(); str_target_ = &string_val_; }
-              else                              { str_target_ = nullptr; }
-            } else if (depth_ == 2 && in_stop_array_) {
-              string_val_.clear(); str_target_ = &string_val_;
-            } else {
-              str_target_ = nullptr;
-            }
+            string_is_key_ = depth_ < kMaxDepth && is_dict_[depth_] && expecting_key_[depth_];
+            str_target_    = string_is_key_ ? &str_acc_ : handler_.selectStringTarget(depth_);
           }
-          if (str_target_ && tlen > 0) {
+          if (str_target_ && tlen > 0)
             appendStringToken(*str_target_, raw, vbd);
-          }
           in_chain_ = cont;
           if (!cont) {
             if (string_is_key_) {
-              if (depth_ == 1) {
-                bool* seen = nullptr;
-                if      (str_acc_ == "model")       seen = &seen_model_;
-                else if (str_acc_ == "stream")      seen = &seen_stream_;
-                else if (str_acc_ == "messages")    seen = &seen_messages_;
-                else if (str_acc_ == "tools")       seen = &seen_tools_;
-                else if (str_acc_ == "temperature") seen = &seen_temperature_;
-                else if (str_acc_ == "top_p")       seen = &seen_top_p_;
-                else if (str_acc_ == "max_tokens")  seen = &seen_max_tokens_;
-                else if (str_acc_ == "n")           seen = &seen_n_;
-                else if (str_acc_ == "seed")        seen = &seen_seed_;
-                else if (str_acc_ == "stop")        seen = &seen_stop_;
-                if (seen) {
-                  if (*seen) {
-                    has_error_ = true;
-                    error_ = absl::StrCat("duplicate key \"", str_acc_,
-                                          "\" in inference request body");
-                    break;
-                  }
-                  *seen = true;
-                }
-                current_key_ = str_acc_;
-                if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
-              } else {
-                if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
-              }
+              if (auto s = handler_.onKey(str_acc_, depth_); !s.ok()) return s;
+              if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
             } else {
-              if (str_target_ == &string_val_) {
-                sampling_.stop.push_back(std::move(string_val_));
-                string_val_.clear();
-              }
+              if (str_target_) handler_.onStringComplete(str_target_, depth_);
               if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
             }
             str_target_ = nullptr;
@@ -293,43 +231,20 @@ private:
           break;
         }
 
-        case WUFFS_BASE__TOKEN__VBC__NUMBER: {
-          if (depth_ == 1) {
-            const absl::string_view num = chunk.substr(tok_start - chunk_base, tlen);
-            int64_t i_val; double d_val;
-            if      (current_key_ == "max_tokens"  && absl::SimpleAtoi(num, &i_val)) sampling_.max_tokens  = static_cast<int32_t>(i_val);
-            else if (current_key_ == "n"           && absl::SimpleAtoi(num, &i_val)) sampling_.n           = static_cast<int32_t>(i_val);
-            else if (current_key_ == "seed"        && absl::SimpleAtoi(num, &i_val)) sampling_.seed        = i_val;
-            else if (current_key_ == "temperature" && absl::SimpleAtod(num, &d_val)) sampling_.temperature = d_val;
-            else if (current_key_ == "top_p"       && absl::SimpleAtod(num, &d_val)) sampling_.top_p       = d_val;
-          }
+        // NUMBER: integer or float literal — handler parses raw with SimpleAtoi/SimpleAtod.
+        // LITERAL: true, false, or null — handler compares raw bytes directly.
+        case WUFFS_BASE__TOKEN__VBC__NUMBER:
+        case WUFFS_BASE__TOKEN__VBC__LITERAL:
+          handler_.onScalar(chunk.substr(tok_start - chunk_base, tlen), vbc, depth_);
           if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
           break;
-        }
-
-        case WUFFS_BASE__TOKEN__VBC__LITERAL: {
-          if (depth_ == 1 && current_key_ == "stream") {
-            const absl::string_view lit = chunk.substr(tok_start - chunk_base, tlen);
-            if      (lit == "true")  streaming_ = true;
-            else if (lit == "false") streaming_ = false;
-          }
-          if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
-          break;
-        }
 
         default: break;
         } // switch(vbc)
-
-        if (has_error_) break;
       } // while tokens
 
-      if (has_error_) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("inference body parse error: ", error_));
-      }
-
-      if (status.repr == nullptr) { wuffs_done_ = true; break; } // OK
-      if (wuffs_base__status__is_note(&status)) { wuffs_done_ = true; break; }
+      if (status.repr == nullptr)                     { wuffs_done_ = true; break; }
+      if (wuffs_base__status__is_note(&status))       { wuffs_done_ = true; break; }
       if (!wuffs_base__status__is_suspension(&status)) {
         return absl::InvalidArgumentError(
             absl::StrCat("wuffs json: ", wuffs_base__status__message(&status)));
@@ -337,17 +252,12 @@ private:
       if (status.repr == wuffs_base__suspension__short_read) break;
       tok_buf_.meta.ri = tok_buf_.meta.wi = 0; // short_write: reset and retry
     }
-
     return absl::OkStatus();
   }
 
-  // ── Config / infra ─────────────────────────────────────────────────────────
-  const DecoderConfig&          config_;
-  PayloadStore&                 store_;
-  size_t                        total_bytes_{0};
-  std::unique_ptr<StreamWriter> residual_writer_;
+private:
+  Handler& handler_;
 
-  // ── Wuffs streaming state (persists across feed() calls) ───────────────────
   wuffs_json__decoder::unique_ptr dec_;
   static constexpr size_t         kTokBufLen = 256;
   wuffs_base__token               tok_data_[kTokBufLen];
@@ -355,24 +265,197 @@ private:
   size_t                          body_src_pos_{0};
   bool                            wuffs_done_{false};
 
-  // ── Depth / structure tracking ─────────────────────────────────────────────
   static constexpr int kMaxDepth = 8;
   int  depth_{0};
   bool is_dict_[kMaxDepth]{};
   bool expecting_key_[kMaxDepth]{};
 
-  // ── String accumulation ────────────────────────────────────────────────────
   bool         in_chain_{false};
   bool         string_is_key_{false};
   std::string  str_acc_;
   std::string* str_target_{nullptr};
-  std::string  string_val_; // scratch for stop strings
+};
 
-  // ── Depth-1 extracted fields ───────────────────────────────────────────────
+} // namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+// InferenceBodyParser  (Wuffs streaming)
+//
+// Thin WuffsJsonCursor::Handler subclass. The cursor owns all Wuffs mechanics;
+// this class holds only domain state (routing fields, byte-range accumulators).
+//
+// Element byte ranges for messages[]/tools[] elements are recorded during the
+// streaming parse and converted to PayloadRef sub-ranges of residual_params in
+// finish() — zero-copy for MmapPayloadStore, substring copy for tests.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class RequestDecoder::InferenceBodyParser : public WuffsJsonCursor::Handler {
+public:
+  InferenceBodyParser(const DecoderConfig& config, PayloadStore& store)
+      : config_(config), store_(store), cursor_(*this) {}
+
+  absl::Status feed(absl::string_view chunk) {
+    total_bytes_ += chunk.size();
+    if (total_bytes_ > config_.max_body_bytes) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "inference request body exceeds limit of ", config_.max_body_bytes, " bytes"));
+    }
+    if (!residual_writer_) {
+      residual_writer_ = store_.beginStore(PayloadKind::JsonObject);
+    }
+    residual_writer_->append(chunk);
+    return cursor_.feed(chunk, /*closed=*/false);
+  }
+
+  absl::Status finish(InferencePayload& payload, AiRequest& request) {
+    auto s = cursor_.feed("", /*closed=*/true);
+    if (!s.ok()) return s;
+
+    // "model" is required by the OpenAI API. seen_model_=true with empty
+    // model_ means the key was present at depth 1 but the value was not a
+    // string (e.g. null or number). seen_model_=false means the key was
+    // never seen at depth 1 — either absent or at an unexpected depth
+    // (selectStringTarget only extracts depth-1 strings; see comment there).
+    if (model_.empty()) {
+      return absl::InvalidArgumentError(
+          seen_model_ ? "inference request \"model\" field must be a non-empty string"
+                      : "inference request body missing required field \"model\"");
+    }
+
+    payload.target.name = std::move(model_);
+    payload.sampling    = std::move(sampling_);
+    request.streaming   = streaming_;
+
+    if (residual_writer_) {
+      payload.residual_params = residual_writer_->finalize();
+    }
+
+    for (size_t i = 0; i < message_ranges_.size(); ++i) {
+      auto [start, end] = message_ranges_[i];
+      PayloadRef ref;
+      makeSubRef(ref, start, end - start, payload.residual_params, message_kinds_[i], store_);
+      payload.messages.push_back(std::move(ref));
+    }
+    for (size_t i = 0; i < tool_ranges_.size(); ++i) {
+      auto [start, end] = tool_ranges_[i];
+      PayloadRef ref;
+      makeSubRef(ref, start, end - start, payload.residual_params, tool_kinds_[i], store_);
+      payload.tools.push_back(std::move(ref));
+    }
+    return absl::OkStatus();
+  }
+
+private:
+  bool captureEnabled() const { return total_bytes_ <= config_.max_element_capture_bytes; }
+
+  // ── WuffsJsonCursor::Handler ──────────────────────────────────────────────
+
+  // Routing scalars are extracted only at depth 1 (model, stop scalar) and
+  // depth 2 inside stop[] array. This matches every known OpenAI-compatible
+  // API layout (de-facto invariant, not a formal spec guarantee). A field
+  // present at depth > 1 falls through to nullptr and is silently discarded;
+  // finish() catches the required-field case (model) and returns an error.
+  std::string* selectStringTarget(int depth) override {
+    if (depth == 1) {
+      if      (current_key_ == "model") { model_.clear();      return &model_; }
+      else if (current_key_ == "stop")  { string_val_.clear(); return &string_val_; }
+    } else if (depth == 2 && in_stop_array_) {
+      string_val_.clear();
+      return &string_val_;
+    }
+    return nullptr;
+  }
+
+  absl::Status onKey(absl::string_view key, int depth) override {
+    if (depth == 1) {
+      bool* seen = nullptr;
+      if      (key == "model")       seen = &seen_model_;
+      else if (key == "stream")      seen = &seen_stream_;
+      else if (key == "messages")    seen = &seen_messages_;
+      else if (key == "tools")       seen = &seen_tools_;
+      else if (key == "temperature") seen = &seen_temperature_;
+      else if (key == "top_p")       seen = &seen_top_p_;
+      else if (key == "max_tokens")  seen = &seen_max_tokens_;
+      else if (key == "n")           seen = &seen_n_;
+      else if (key == "seed")        seen = &seen_seed_;
+      else if (key == "stop")        seen = &seen_stop_;
+      if (seen) {
+        if (*seen) return absl::InvalidArgumentError(
+            absl::StrCat("duplicate key \"", key, "\" in inference request body"));
+        *seen = true;
+      }
+      current_key_ = key;
+    }
+    return absl::OkStatus();
+  }
+
+  void onStringComplete(std::string* target, int /*depth*/) override {
+    if (target == &string_val_) {
+      sampling_.stop.push_back(std::move(string_val_));
+      string_val_.clear();
+    }
+  }
+
+  void onScalar(absl::string_view raw, int64_t vbc, int depth) override {
+    if (depth != 1) return;
+    if (vbc == WUFFS_BASE__TOKEN__VBC__NUMBER) {
+      int64_t i_val; double d_val;
+      if      (current_key_ == "max_tokens"  && absl::SimpleAtoi(raw, &i_val)) sampling_.max_tokens  = static_cast<int32_t>(i_val);
+      else if (current_key_ == "n"           && absl::SimpleAtoi(raw, &i_val)) sampling_.n           = static_cast<int32_t>(i_val);
+      else if (current_key_ == "seed"        && absl::SimpleAtoi(raw, &i_val)) sampling_.seed        = i_val;
+      else if (current_key_ == "temperature" && absl::SimpleAtod(raw, &d_val)) sampling_.temperature = d_val;
+      else if (current_key_ == "top_p"       && absl::SimpleAtod(raw, &d_val)) sampling_.top_p       = d_val;
+    } else if (vbc == WUFFS_BASE__TOKEN__VBC__LITERAL && current_key_ == "stream") {
+      if      (raw == "true")  streaming_ = true;
+      else if (raw == "false") streaming_ = false;
+    }
+  }
+
+  void onPush(bool is_dict, int depth, size_t tok_start) override {
+    if (depth == 2) {
+      if      (current_key_ == "messages") { in_messages_ = true; in_tools_ = false; }
+      else if (current_key_ == "tools")    { in_tools_ = true;    in_messages_ = false; }
+      else if (current_key_ == "stop")     { in_stop_array_ = true; }
+    }
+    if (depth == 3 && (in_messages_ || in_tools_) && captureEnabled()) {
+      in_elem_      = true;
+      elem_start_   = tok_start;
+      elem_is_dict_ = is_dict;
+    }
+  }
+
+  void onPop(int depth, size_t tok_end) override {
+    if (depth == 3 && in_elem_) {
+      in_elem_ = false;
+      const auto kind = elem_is_dict_ ? PayloadKind::JsonObject : PayloadKind::JsonArray;
+      if (in_messages_) {
+        message_ranges_.push_back({elem_start_, tok_end});
+        message_kinds_.push_back(kind);
+      } else if (in_tools_) {
+        tool_ranges_.push_back({elem_start_, tok_end});
+        tool_kinds_.push_back(kind);
+      }
+    }
+    if (depth == 2) {
+      in_messages_   = false;
+      in_tools_      = false;
+      in_stop_array_ = false;
+    }
+  }
+
+  // ── Config / infra ─────────────────────────────────────────────────────────
+  const DecoderConfig&          config_;
+  PayloadStore&                 store_;
+  WuffsJsonCursor               cursor_;
+  size_t                        total_bytes_{0};
+  std::unique_ptr<StreamWriter> residual_writer_;
+
+  // ── Extracted fields ───────────────────────────────────────────────────────
   std::string    current_key_;
   std::string    model_;
   bool           streaming_{false};
   SamplingParams sampling_;
+  std::string    string_val_; // scratch for stop strings
 
   // ── Container / element tracking ──────────────────────────────────────────
   bool   in_messages_{false};
@@ -398,36 +481,25 @@ private:
   bool seen_n_{false};
   bool seen_seed_{false};
   bool seen_stop_{false};
-
-  // ── Error state ────────────────────────────────────────────────────────────
-  bool        has_error_{false};
-  std::string error_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AgentBodyParser  (Wuffs streaming)
 //
-// Replaces the old IncrementalJsonTokenizer-based implementation.  The Wuffs
-// stackless coroutine in dec_ preserves all parse state across feed() calls,
-// so no token_buf_ accumulation occurs for arbitrarily large or deeply nested
-// keys — each Wuffs token is at most 65535 bytes and is processed in place.
+// Thin WuffsJsonCursor::Handler subclass. The cursor owns all Wuffs mechanics;
+// this class holds only domain state (method, id, params byte-ranges).
 //
-// Tier 1 (body ≤ max_element_capture_bytes) and Tier 2 share one code path.
 // params_raw, arguments, and capabilities are recorded as byte-range sub-refs
 // of residual_params — zero-copy for MmapPayloadStore, substring for tests.
 // arguments/capabilities sub-ranges are only recorded when captureEnabled().
 // ─────────────────────────────────────────────────────────────────────────────
 
-class RequestDecoder::AgentBodyParser {
+class RequestDecoder::AgentBodyParser : public WuffsJsonCursor::Handler {
 public:
   AgentBodyParser(const Http::RequestHeaderMap& headers, absl::string_view http_method,
                   absl::string_view path, const DecoderConfig& config, PayloadStore& store)
       : headers_(headers), http_method_(http_method), path_(path),
-        config_(config), store_(store) {
-    dec_     = wuffs_json__decoder::alloc();
-    tok_buf_ = wuffs_base__slice_token__writer(
-        wuffs_base__make_slice_token(tok_data_, kTokBufLen));
-  }
+        config_(config), store_(store), cursor_(*this) {}
 
   absl::Status feed(absl::string_view chunk) {
     total_bytes_ += chunk.size();
@@ -439,15 +511,21 @@ public:
       residual_writer_ = store_.beginStore(PayloadKind::JsonObject);
     }
     residual_writer_->append(chunk);
-    return feedChunk(chunk, /*closed=*/false);
+    return cursor_.feed(chunk, /*closed=*/false);
   }
 
   absl::Status finish(AgentPayload& payload, AiRequest& request) {
-    auto s = feedChunk("", /*closed=*/true);
+    auto s = cursor_.feed("", /*closed=*/true);
     if (!s.ok()) return s;
-    if (has_error_) {
+
+    // seen_method_=true: "method" key was present at depth 1, but the value
+    // was not a string (e.g. null or number) — explicit JSON-RPC violation.
+    // seen_method_=false with empty method_: key absent or at unexpected depth
+    // (selectStringTarget only extracts depth-1 strings; see comment there) —
+    // indistinguishable from webhook false-positive; falls through below.
+    if (seen_method_ && method_.empty()) {
       return absl::InvalidArgumentError(
-          absl::StrCat("agent body JSON-RPC parse error: ", error_));
+          "agent request \"method\" field must be a non-empty string");
     }
 
     request.jsonrpc_id = std::move(id_);
@@ -489,188 +567,7 @@ public:
   }
 
 private:
-  bool captureEnabled() const {
-    return total_bytes_ <= config_.max_element_capture_bytes;
-  }
-
-  absl::Status feedChunk(absl::string_view chunk, bool closed) {
-    if (!dec_) return absl::InternalError("wuffs json: alloc failed");
-    if (wuffs_done_) return absl::OkStatus();
-
-    const size_t chunk_base = body_src_pos_;
-    wuffs_base__io_buffer src_buf = wuffs_base__ptr_u8__reader(
-        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(chunk.data())),
-        chunk.size(), closed);
-
-    while (true) {
-      wuffs_base__status status = wuffs_json__decoder__decode_tokens(
-          dec_.get(), &tok_buf_, &src_buf, wuffs_base__empty_slice_u8());
-
-      while (tok_buf_.meta.ri < tok_buf_.meta.wi) {
-        const wuffs_base__token* tok = &tok_buf_.data.ptr[tok_buf_.meta.ri++];
-        const int64_t  vbc       = wuffs_base__token__value_base_category(tok);
-        const uint64_t vbd       = wuffs_base__token__value_base_detail(tok);
-        const uint64_t tlen      = wuffs_base__token__length(tok);
-        const bool     cont      = wuffs_base__token__continued(tok);
-        const size_t   tok_start = body_src_pos_;
-        body_src_pos_ += tlen;
-
-        switch (vbc) {
-
-        case WUFFS_BASE__TOKEN__VBC__FILLER:
-          break;
-
-        case WUFFS_BASE__TOKEN__VBC__STRUCTURE: {
-          const bool is_push = (vbd & WUFFS_BASE__TOKEN__VBD__STRUCTURE__PUSH) != 0;
-          const bool to_dict = (vbd & WUFFS_BASE__TOKEN__VBD__STRUCTURE__TO_DICT) != 0;
-          if (is_push) {
-            ++depth_;
-            if (depth_ < kMaxDepth) {
-              is_dict_[depth_]       = to_dict;
-              expecting_key_[depth_] = to_dict;
-            }
-            // Entering the params container at depth 2.
-            if (depth_ == 2 && current_key_ == "params") {
-              in_params_         = true;
-              params_byte_start_ = tok_start;
-            }
-            // Entering a sub-container (arguments / capabilities) at depth 3.
-            if (depth_ == 3 && in_params_ && !in_sub_container_ &&
-                (params_key_ == "arguments" || params_key_ == "capabilities")) {
-              in_sub_container_    = true;
-              sub_is_arguments_    = (params_key_ == "arguments");
-              sub_container_start_ = tok_start;
-              if (sub_is_arguments_) {
-                arguments_kind_ = to_dict ? PayloadKind::JsonObject
-                                          : PayloadKind::JsonArray;
-              }
-            }
-          } else {
-            const int pop_depth = depth_;
-            --depth_;
-            if (pop_depth == 3 && in_sub_container_) {
-              in_sub_container_ = false;
-              if (captureEnabled()) {
-                if (sub_is_arguments_) {
-                  arguments_byte_start_ = sub_container_start_;
-                  arguments_byte_end_   = body_src_pos_;
-                } else {
-                  capabilities_byte_start_ = sub_container_start_;
-                  capabilities_byte_end_   = body_src_pos_;
-                }
-              }
-            }
-            if (pop_depth == 2 && in_params_) {
-              in_params_       = false;
-              params_byte_end_ = body_src_pos_;
-            }
-            // After closing a container value, the parent expects the next key.
-            if (depth_ >= 1 && depth_ < kMaxDepth && is_dict_[depth_]) {
-              expecting_key_[depth_] = true;
-            }
-          }
-          break;
-        }
-
-        case WUFFS_BASE__TOKEN__VBC__STRING: {
-          const absl::string_view raw = chunk.substr(tok_start - chunk_base, tlen);
-          const bool first_in_group = !in_chain_;
-          if (first_in_group) {
-            str_acc_.clear();
-            string_is_key_ = (depth_ < kMaxDepth && is_dict_[depth_] &&
-                               expecting_key_[depth_]);
-            if (string_is_key_) {
-              str_target_ = &str_acc_;
-            } else if (depth_ == 1) {
-              if      (current_key_ == "id")     { id_.clear();     str_target_ = &id_;     }
-              else if (current_key_ == "method") { method_.clear(); str_target_ = &method_; }
-              else                               { str_target_ = nullptr; }
-            } else if (depth_ == 2 && in_params_) {
-              if      (params_key_ == "name") { params_name_.clear(); str_target_ = &params_name_; }
-              else if (params_key_ == "uri")  { params_uri_.clear();  str_target_ = &params_uri_;  }
-              else if (params_key_ == "ref")  { params_ref_.clear();  str_target_ = &params_ref_;  }
-              else                            { str_target_ = nullptr; }
-            } else {
-              str_target_ = nullptr;
-            }
-          }
-
-          if (str_target_ && tlen > 0) {
-            appendStringToken(*str_target_, raw, vbd);
-          }
-          in_chain_ = cont;
-
-          if (!cont) {
-            if (string_is_key_) {
-              if (depth_ == 1) {
-                bool* seen = nullptr;
-                if      (str_acc_ == "jsonrpc") seen = &seen_jsonrpc_;
-                else if (str_acc_ == "id")      seen = &seen_id_;
-                else if (str_acc_ == "method")  seen = &seen_method_;
-                else if (str_acc_ == "params")  seen = &seen_params_;
-                if (seen) {
-                  if (*seen) {
-                    has_error_ = true;
-                    error_ = absl::StrCat("duplicate key \"", str_acc_,
-                                          "\" in agent request body");
-                    break;
-                  }
-                  *seen = true;
-                }
-                current_key_ = str_acc_;
-                if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
-              } else if (depth_ == 2 && in_params_) {
-                params_key_ = str_acc_;
-                if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
-              }
-            } else {
-              if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
-            }
-            str_target_ = nullptr;
-          }
-          break;
-        }
-
-        case WUFFS_BASE__TOKEN__VBC__NUMBER: {
-          if (depth_ == 1 && current_key_ == "id") {
-            const absl::string_view num = chunk.substr(tok_start - chunk_base, tlen);
-            int64_t i_val; double d_val;
-            if      (absl::SimpleAtoi(num, &i_val)) id_ = std::to_string(i_val);
-            else if (absl::SimpleAtod(num, &d_val)) id_ = std::to_string(static_cast<int64_t>(d_val));
-          }
-          if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
-          break;
-        }
-
-        case WUFFS_BASE__TOKEN__VBC__LITERAL:
-          if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
-          break;
-
-        default: break;
-        } // switch(vbc)
-
-        if (has_error_) break;
-      } // while tokens
-
-      if (has_error_) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("agent body JSON-RPC parse error: ", error_));
-      }
-
-      if (status.repr == nullptr) { wuffs_done_ = true; break; } // OK
-      // Notes (prefixed '@') signal informational events; end_of_data is one.
-      if (wuffs_base__status__is_note(&status)) { wuffs_done_ = true; break; }
-      if (!wuffs_base__status__is_suspension(&status)) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("wuffs json: ", wuffs_base__status__message(&status)));
-      }
-      if (status.repr == wuffs_base__suspension__short_read) break; // need more input
-      // short_write: token buffer full — reset and retry same source position.
-      tok_buf_.meta.ri = tok_buf_.meta.wi = 0;
-    }
-
-    return absl::OkStatus();
-  }
+  bool captureEnabled() const { return total_bytes_ <= config_.max_element_capture_bytes; }
 
   void populatePayload(AgentPayload& payload) const {
     switch (payload.invocation) {
@@ -693,34 +590,99 @@ private:
     }
   }
 
+  // ── WuffsJsonCursor::Handler ──────────────────────────────────────────────
+
+  // Routing scalars are extracted at depth 1 (id, method) and depth 2 within
+  // params (name, uri, ref), matching JSON-RPC 2.0 and current MCP/A2A specs.
+  // Fields at other depths fall through to nullptr and are silently discarded.
+  // Empty method_ is propagated to finish() and treated as non-AI traffic by
+  // the caller — this covers both the webhook false-positive case and the
+  // (silent) depth-mismatch case where "method" appears outside depth 1.
+  std::string* selectStringTarget(int depth) override {
+    if (depth == 1) {
+      if      (current_key_ == "id")     { id_.clear();     return &id_; }
+      else if (current_key_ == "method") { method_.clear(); return &method_; }
+    } else if (depth == 2 && in_params_) {
+      if      (params_key_ == "name") { params_name_.clear(); return &params_name_; }
+      else if (params_key_ == "uri")  { params_uri_.clear();  return &params_uri_; }
+      else if (params_key_ == "ref")  { params_ref_.clear();  return &params_ref_; }
+    }
+    return nullptr;
+  }
+
+  absl::Status onKey(absl::string_view key, int depth) override {
+    if (depth == 1) {
+      bool* seen = nullptr;
+      if      (key == "jsonrpc") seen = &seen_jsonrpc_;
+      else if (key == "id")      seen = &seen_id_;
+      else if (key == "method")  seen = &seen_method_;
+      else if (key == "params")  seen = &seen_params_;
+      if (seen) {
+        if (*seen) return absl::InvalidArgumentError(
+            absl::StrCat("duplicate key \"", key, "\" in agent request body"));
+        *seen = true;
+      }
+      current_key_ = key;
+    } else if (depth == 2 && in_params_) {
+      params_key_ = key;
+    }
+    return absl::OkStatus();
+  }
+
+  void onStringComplete(std::string* /*target*/, int /*depth*/) override {}
+
+  void onScalar(absl::string_view raw, int64_t vbc, int depth) override {
+    if (depth == 1 && current_key_ == "id" && vbc == WUFFS_BASE__TOKEN__VBC__NUMBER) {
+      int64_t i_val; double d_val;
+      if      (absl::SimpleAtoi(raw, &i_val)) id_ = std::to_string(i_val);
+      else if (absl::SimpleAtod(raw, &d_val)) id_ = std::to_string(static_cast<int64_t>(d_val));
+    }
+  }
+
+  void onPush(bool is_dict, int depth, size_t tok_start) override {
+    if (depth == 2 && current_key_ == "params") {
+      in_params_         = true;
+      params_byte_start_ = tok_start;
+    }
+    if (depth == 3 && in_params_ && !in_sub_container_ &&
+        (params_key_ == "arguments" || params_key_ == "capabilities")) {
+      in_sub_container_    = true;
+      sub_is_arguments_    = (params_key_ == "arguments");
+      sub_container_start_ = tok_start;
+      if (sub_is_arguments_) {
+        arguments_kind_ = is_dict ? PayloadKind::JsonObject : PayloadKind::JsonArray;
+      }
+    }
+  }
+
+  void onPop(int depth, size_t tok_end) override {
+    if (depth == 3 && in_sub_container_) {
+      in_sub_container_ = false;
+      if (captureEnabled()) {
+        if (sub_is_arguments_) {
+          arguments_byte_start_ = sub_container_start_;
+          arguments_byte_end_   = tok_end;
+        } else {
+          capabilities_byte_start_ = sub_container_start_;
+          capabilities_byte_end_   = tok_end;
+        }
+      }
+    }
+    if (depth == 2 && in_params_) {
+      in_params_       = false;
+      params_byte_end_ = tok_end;
+    }
+  }
+
   // ── Config / infra ───────────────────────────────────────────────────────
   const Http::RequestHeaderMap& headers_;
   const std::string             http_method_;
   const std::string             path_;
   const DecoderConfig&          config_;
   PayloadStore&                 store_;
+  WuffsJsonCursor               cursor_;
   size_t                        total_bytes_{0};
   std::unique_ptr<StreamWriter> residual_writer_;
-
-  // ── Wuffs streaming state (persists across feed() calls) ─────────────────
-  wuffs_json__decoder::unique_ptr dec_;
-  static constexpr size_t         kTokBufLen = 256;
-  wuffs_base__token               tok_data_[kTokBufLen];
-  wuffs_base__token_buffer        tok_buf_{};
-  size_t                          body_src_pos_{0};
-  bool                            wuffs_done_{false};
-
-  // ── Depth / structure tracking ────────────────────────────────────────────
-  static constexpr int kMaxDepth = 8;
-  int  depth_{0};
-  bool is_dict_[kMaxDepth]{};
-  bool expecting_key_[kMaxDepth]{};
-
-  // ── String accumulation ───────────────────────────────────────────────────
-  bool         in_chain_{false};
-  bool         string_is_key_{false};
-  std::string  str_acc_;
-  std::string* str_target_{nullptr};
 
   // ── Top-level extracted fields ────────────────────────────────────────────
   std::string current_key_;
@@ -753,10 +715,6 @@ private:
   bool seen_id_{false};
   bool seen_method_{false};
   bool seen_params_{false};
-
-  // ── Error state ───────────────────────────────────────────────────────────
-  bool        has_error_{false};
-  std::string error_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
