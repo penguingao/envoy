@@ -45,25 +45,32 @@ enum class ParamField {
   ToolName,    // AgentPayload.tool_name    (tools/call)
   ResourceUri, // AgentPayload.resource_uri (resources/*)
   PromptName,  // AgentPayload.prompt_name  (prompts/get)
+  Attribute,   // AiRequest.attributes[attribute_key] — pre-extracted by Wuffs decoder
 };
 
 // A single condition on one MCP param field.
 struct ParamCondition {
   ParamField    field;
   StringMatcher matcher;
+  std::string   attribute_key; // used only when field == Attribute
 
-  // Returns true when the condition holds for the given agent payload.
-  // Returns false when payload is nullptr (param not available).
-  bool evaluate(const AiProtocolManager::Codec::AgentPayload* agent) const {
-    if (agent == nullptr) {
-      return false;
-    }
+  bool evaluate(const AiProtocolManager::Codec::AiRequest& request) const {
     switch (field) {
-    case ParamField::ToolName:    return matcher.matches(agent->tool_name);
-    case ParamField::ResourceUri: return matcher.matches(agent->resource_uri);
-    case ParamField::PromptName:  return matcher.matches(agent->prompt_name);
+    case ParamField::Attribute: {
+      auto it = request.attributes.find(attribute_key);
+      return it != request.attributes.end() && matcher.matches(it->second);
     }
-    return false;
+    default: {
+      const auto* agent = request.as_agent();
+      if (agent == nullptr) return false;
+      switch (field) {
+      case ParamField::ToolName:    return matcher.matches(agent->tool_name);
+      case ParamField::ResourceUri: return matcher.matches(agent->resource_uri);
+      case ParamField::PromptName:  return matcher.matches(agent->prompt_name);
+      default:                      return false;
+      }
+    }
+    }
   }
 };
 
@@ -82,7 +89,7 @@ struct MethodPolicy {
 
   // Returns true when method and all param conditions match.
   bool matches(absl::string_view method,
-               const AiProtocolManager::Codec::AgentPayload* agent) const {
+               const AiProtocolManager::Codec::AiRequest& request) const {
     // Method pattern check.
     if (!method_pattern.empty() && method_pattern.back() == '*') {
       if (!absl::StartsWith(method, absl::string_view(method_pattern)
@@ -94,7 +101,7 @@ struct MethodPolicy {
     }
     // All param conditions must hold.
     for (const auto& cond : param_conditions) {
-      if (!cond.evaluate(agent)) {
+      if (!cond.evaluate(request)) {
         return false;
       }
     }

@@ -2515,8 +2515,6 @@ The internal `McpAuthFilter` tests only exercise depth 1–2 fields, which might
 that is sufficient. It is not. Research into production AI gateway implementations
 shows that **depth 3 is common in real-world auth and policy decisions**.
 
-[agentgateway](https://github.com/agentgateway/agentgateway) (solo.io's open-source AI
-gateway) is a representative production system. Its CEL-based policy engine exposes:
 
 | Depth | Field | Common use case |
 |---|---|---|
@@ -2526,7 +2524,7 @@ gateway) is a representative production system. Its CEL-based policy engine expo
 | **3** | **`messages[0].content`**, **`messages[0].role`** | **Content filtering, prompt inspection, routing by message type** |
 | variable | `jwt.nested.claim` | Nested OAuth scope / custom claim-based access |
 
-**Concrete depth-3 policy examples from agentgateway documentation:**
+**Concrete depth-3 policy examples:**
 
 ```
 # Deny non-admins from calling query_db with database=prod
@@ -2540,7 +2538,7 @@ messages[0].role == "system" → provider: anthropic
 messages[].content.contains("SSN") → deny
 ```
 
-The effective maximum depth in production is **unbounded** — agentgateway supports
+The effective maximum depth in production is **unbounded** — it supports
 arbitrary nesting via CEL's `json()` function and dot-notation path traversal. Its
 ContextBuilder tracks which attributes are referenced in active policies and extracts
 only those fields lazily, avoiding full body buffering when no deep-field policy is
@@ -2575,8 +2573,7 @@ loop. For a 100 KB `arguments` blob evaluated on every request, this is material
 The decoder's `selectStringTarget` is hardcoded to a fixed routing field set. There
 is no way for an auth filter to declare at chain-build time that it needs
 `arguments.database`, and have the decoder pre-extract it inline during the Wuffs
-streaming pass — the way agentgateway's ContextBuilder tracks declared CEL attribute
-references. Any field outside the hardcoded set costs a full consumer-side re-parse.
+streaming pass . Any field outside the hardcoded set costs a full consumer-side re-parse.
 
 **Gap 2 — Tier 2 loses per-element message access.**
 When body > `max_element_capture_bytes` (256 KB), individual `messages[]` elements
@@ -2591,16 +2588,439 @@ Only `params.name`, `params.uri`, and `params.ref` are pre-extracted as typed fi
 Other depth-2 fields — `params.protocolVersion`, `params.cursor`, `params.level` —
 sit inside `params_raw`. A filter needing them re-parses the entire params blob.
 
-### 21.5 What a complete design would need
+### 21.5 The solution: policy-driven parser configuration
 
-**Field-interest registry (mirrors agentgateway's ContextBuilder).** Auth and policy
-filters declare the JSON paths they need at chain-build time. The decoder computes the
-union of declared interests across all chain filters and gates `selectStringTarget` on
-that union — pre-extracting exactly the needed set inline during the Wuffs pass,
-with zero proportional-heap cost for everything outside the declared set.
+The right fix is not to make auth filters declare their field interests in code.
+That couples filter implementation to decoder internals and requires recompilation
+when policy changes. Instead, expose a configuration interface on `DecoderConfig`
+that operators use to specify which JSON paths the Wuffs parser should pre-extract.
+Auth filters then read results from `AiRequest::attributes` — they need no knowledge
+of how or when extraction happened.
 
-**Explicit scope statement for the proportional-heap constraint.** The guarantee "no
-proportional C++ heap allocation" applies to the **decoder** only. Downstream chain
-filters accessing opaque `PayloadRef` fields pay proportional cost for those fields.
-For depth-3+ fields needed by auth policies, this cost appears on the event-loop
-thread unless a field-interest registry drives the decoder to pre-extract them.
+**The new `DecoderConfig` knob:**
+
+```cpp
+struct ExtractFieldSpec {
+  std::string json_path;  // dot-notation path, [] for array wildcard
+                          // e.g. "params.arguments.database"
+                          //      "messages[].role"
+                          //      "params.protocolVersion"
+};
+
+struct DecoderConfig {
+  size_t max_inline_bytes{4096};
+  size_t max_body_bytes{4 * 1024 * 1024};
+  size_t max_element_capture_bytes{256 * 1024};
+  std::vector<ExtractFieldSpec> extract_fields;  // operator-configured; no depth limit
+};
+```
+
+Example operator configuration (Envoy filter config YAML):
+
+```yaml
+decoder_config:
+  max_body_bytes: 4194304
+  extract_fields:
+    - json_path: "params.arguments.database"   # depth 3 — tool arg for auth policy
+    - json_path: "params.arguments.user_id"    # depth 3 — identity claim in tool call
+    - json_path: "messages[].role"             # depth 3 — per-message role inspection
+    - json_path: "params.protocolVersion"      # depth 2 — MCP version routing
+```
+
+**What the decoder changes:**
+
+1. **Full key stack**: `current_key_[kMaxDepth]` populated in `onKey` at every depth
+   (today it is only populated at depth 1). This is a small change to the existing
+   array — `current_key_[depth] = key` in `onKey` for all depths.
+
+2. **Path-aware `selectStringTarget`**: instead of the hardcoded depth-1/depth-2
+   checks, reconstruct the current path from the key stack and look it up in the
+   declared set:
+
+   ```cpp
+   std::string* selectStringTarget(int depth) override {
+     // Built-in routing fields (unchanged behaviour).
+     if (depth == 1 && current_key_[1] == "model") return &model_;
+     // ... other built-in depth-1/2 extractions ...
+
+     // Operator-declared paths.
+     std::string path = buildPath(depth);  // joins current_key_[1..depth]
+     auto it = config_.extract_field_targets.find(path);
+     if (it != config_.extract_field_targets.end()) return &it->second;
+     return nullptr;  // discard — zero heap
+   }
+   ```
+
+3. **Array wildcard matching**: for paths like `messages[].role`, the cursor already
+   tracks `in_messages_` at depth 2 (array element context). A declared path
+   `messages[].role` is stored as a pattern; `buildPath` emits `messages[].role`
+   when inside an array element at the right depth, matching the pattern.
+
+4. **Storage**: extracted values go into `AiRequest::attributes` keyed by path.
+   For array paths, per-element indexing: `"messages[0].role"`, `"messages[1].role"`.
+
+   ```cpp
+   // After take():
+   req.attributes["params.arguments.database"] == "prod"
+   req.attributes["messages[0].role"]          == "system"
+   req.attributes["messages[1].role"]          == "user"
+   ```
+
+   Auth filters read from `attributes` with no knowledge of how extraction happened.
+
+**Why this is strictly better than hardcoded depths:**
+
+| Property | Current (hardcoded) | Config-driven |
+|---|---|---|
+| Depth limit | Hardcoded depth 1–2 | None — any path at any depth |
+| Change policy | Requires code change | Change Envoy config, redeploy |
+| Auth filter coupling | Must parse `PayloadRef` in filter code | Reads `AiRequest::attributes` |
+| Heap cost for unconfigured fields | Zero (str_target_=nullptr) | Zero (unchanged mechanism) |
+| Heap cost for configured fields | N/A | O(field_value_size) — same as `model_` today |
+| Existing built-in extractions | Unchanged | Remain as hardcoded defaults; config adds to them |
+
+**No depth cutoff.** The existing hardcoded set (`model`, `method`, `stream`,
+`params.name`, `params.uri`) becomes the built-in default spec. The new
+`extract_fields` config extends it to any path at any depth. `selectStringTarget`
+returns `nullptr` — zero heap — for every path not in the combined set, regardless
+of depth.
+
+---
+
+### 21.6 Delivering extract_fields dynamically via xDS
+
+`extract_fields` is a control-plane concern, not an in-proxy concern. The proxy is
+a pure config recipient. Two xDS channels can deliver it:
+
+#### LDS (Listener Discovery Service) — standard but coarse
+
+The full listener config (`HttpConnectionManager` + all filter `typed_config`) is
+delivered via LDS. Any change to `extract_fields` triggers a LDS push. Envoy drains
+the current listener and opens a new one; existing connections complete on the old
+config, new connections use the updated `extract_fields`. This works but has
+connection churn proportional to listener drain time (typically seconds to tens of
+seconds under load).
+
+#### ECDS (Extension Config Discovery Service) — the right mechanism
+
+ECDS (xDS-v3, introduced in Envoy 1.17) allows a single named filter config to be
+updated independently of the rest of the listener. The filter config is registered
+under a name, e.g., `envoy.filters.http.ai_protocol_manager`, and subscribed to an
+ECDS stream. A push updates only that filter's `typed_config` — no listener drain,
+no connection migration. New requests that begin after the push see the new
+`extract_fields`; in-flight requests complete with the config they started with.
+
+ECDS is the correct channel for dynamic policy-driven decoder configuration: updates
+are sub-second, non-disruptive, and scoped to exactly the fields that changed.
+
+#### Proto design
+
+`extract_fields` lives in the filter config proto as a repeated field:
+
+```protobuf
+message AiProtocolManagerFilterConfig {
+  DecoderConfig decoder_config = 1;
+  // ... routing, dispatch, chain config ...
+}
+
+message DecoderConfig {
+  uint64 max_body_bytes        = 1;
+  uint64 max_inline_bytes      = 2;
+  uint64 max_element_capture_bytes = 3;
+  repeated ExtractFieldSpec extract_fields = 4;
+}
+
+message ExtractFieldSpec {
+  string json_path = 1;  // dot-notation path; [] for array wildcard
+                         // "params.arguments.database"
+                         // "messages[].role"
+}
+```
+
+#### Control-plane flow
+
+```
+operator writes CEL policy:
+  req.attributes["params.arguments.database"] == "prod"
+  req.attributes["messages[0].role"] == "system"
+
+         │
+         ▼
+control-plane policy compiler
+  scans all active CEL expressions for AiRequest.attributes lookups
+  collects paths: ["params.arguments.database", "messages[].role"]
+  deduplicates across all policies in scope
+
+         │
+         ▼
+builds ExtractFieldSpec list
+  extract_fields: [
+    { json_path: "params.arguments.database" },
+    { json_path: "messages[].role"            },
+  ]
+
+         │  ECDS push (AiProtocolManagerFilterConfig)
+         ▼
+Envoy proxy
+  DecoderConfig.extract_fields updated on new requests immediately
+  WuffsJsonCursor rebuilds lookup table from spec
+  AiRequest.attributes populated for new requests
+
+         │
+         ▼
+auth filter (McpAuthFilter, etc.)
+  reads req.attributes["params.arguments.database"]
+  no knowledge of how or when it was extracted
+```
+
+No restart. No listener drain. No in-proxy filter declaration.
+
+#### Why not in-proxy filter declaration
+
+The rejected Level 3 approach would have each auth filter call
+`declareFieldInterests({"params.arguments.database"})` at chain-build time, with the
+decoder merging them into its extraction set. This fails in three ways:
+
+1. **Coupling**: auth filter authors must know that `attributes` come from
+   `WuffsJsonCursor` and must call a decoder API. Any refactor of the decoder
+   requires touching every auth filter.
+
+2. **Timing**: `declareFieldInterests` fires at chain-build time — after
+   `RequestDecoder::onHeaders` has already run and the parser is already configured.
+   Changing the extraction set mid-stream is either impossible (the body has already
+   been parsed) or requires re-parsing.
+
+3. **Policy ownership violation**: auth filters are request-processing code;
+   they should not be the source of truth for which fields need extraction. Policy
+   belongs to the control plane. The proxy is the enforcement point, not the
+   policy author.
+
+The ECDS model cleanly separates concerns: **control plane owns policy → xDS is the
+propagation channel → decoder is the pure enforcement point → chain filters are pure
+consumers**.
+
+#### Comparison
+
+| Property | In-proxy declaration (rejected) | ECDS-driven |
+|---|---|---|
+| Policy authorship | Auth filter code (recompile to change) | Control-plane config (push to change) |
+| Update latency | Redeploy (minutes) | ECDS push (sub-second) |
+| Listener drain | Full drain on any change | None |
+| Decoder coupling | Auth filter calls decoder API | Auth filter reads `attributes` only |
+| Multi-filter coordination | Each filter declares; conflicts possible | Single list from control plane |
+| Timing correctness | Declaration arrives after parse started | Config present before any request |
+| Audit trail | Code history only | xDS config version history |
+
+---
+
+### 21.7 Heap analysis of the implemented solution — six issues found and fixed
+
+After the initial implementation landed, a systematic heap and allocation audit identified
+six defects. All six were fixed in the same pass. This section documents each issue, the
+root cause, and the resolution so future changes to `WuffsJsonCursor` or the parsers can
+avoid reintroducing them.
+
+#### Issue 1 — `key_stack_` / `push_key_` assigned unconditionally (fixed)
+
+**Root cause.**
+The key-stack maintenance code in `WuffsJsonCursor::feed()` was unconditional:
+
+```cpp
+// every STRING key at any depth:
+if (depth_ < kMaxDepth) key_stack_[depth_] = str_acc_;
+
+// every { or [ push:
+if (depth_ <= kMaxDepth)
+  push_key_[depth_] = key_stack_[depth_ - 1];
+```
+
+This ran for every key and every container open in every body, regardless of whether
+`extract_fields` was configured. For a 100-message chat body (~600 keys), that is 600
+`std::string` assignment operations on `key_stack_` plus 600 more on `push_key_` on
+every request, paying non-zero cost even when no operator policy ever uses the results.
+
+Keys like `"role"`, `"content"`, `"messages"` fit in SSO (~15 bytes on libc++ / libstdc++)
+so no heap allocation occurs, but 24-byte in-place `memcpy` operations on 1200 string
+objects per request is measurable overhead in a high-throughput proxy.
+
+**Fix.**
+Added `bool track_paths_` to `WuffsJsonCursor`, set to
+`!config.extract_field_pattern_set.empty()` at construction time. Both assignments are
+now guarded by `track_paths_`. When no `extract_fields` are configured the key stack is
+never written — the original zero-overhead invariant is fully restored.
+
+```cpp
+if (track_paths_ && depth_ < kMaxDepth) key_stack_[depth_] = str_acc_;
+if (track_paths_ && depth_ <= kMaxDepth) push_key_[depth_] = ...;
+```
+
+#### Issue 2 — `buildPaths` allocated two heap strings on every call (fixed)
+
+**Root cause.**
+`selectStringTarget` and `onScalar` both contained:
+
+```cpp
+std::string indexed_path, pattern_path;          // local temporaries
+cursor_.buildPaths(depth, indexed_path, pattern_path);
+```
+
+`buildPaths` outputs strings like `"params.arguments.database"` (25 chars) and
+`"messages[0].role"` (16 chars). Both exceed the SSO threshold (~15 bytes on major
+STL implementations), causing a heap allocation and immediate free on every call.
+When `extract_fields` is configured, `buildPaths` is called for every string and scalar
+that falls off the fast-path check — O(N_keys) allocations per request, dominated by
+bodies with many deeply-nested fields.
+
+**Fix.**
+Pre-allocated `path_scratch_indexed_` and `path_scratch_pattern_` as `std::string`
+members on each parser. After the first call the string capacity is retained, so
+subsequent calls to `buildPaths` are in-place writes with no heap allocation.
+
+```cpp
+// In selectStringTarget:
+cursor_.buildPaths(depth, path_scratch_indexed_, path_scratch_pattern_);
+// members — capacity retained across calls, no per-call alloc
+```
+
+#### Issue 3 — `config_field_scratch_` copied instead of moved into output (fixed)
+
+**Root cause.**
+In `onStringComplete`, the extracted string value was *copied* into the output
+collection:
+
+```cpp
+extracted_attrs_[config_field_indexed_path_] = config_field_scratch_;  // copy
+config_field_indexed_path_.clear();
+```
+
+`config_field_scratch_` is cleared at the start of the *next* `selectStringTarget`
+call, so after the copy both the map entry and `config_field_scratch_` held the same
+bytes simultaneously. For large values (JWT tokens, long SQL strings, base64 blobs)
+this doubled the peak live allocation for each matched field.
+
+**Fix.**
+Changed to `std::move` for both the key and value, and switched `extracted_attrs_`
+from `absl::flat_hash_map<string,string>` to `std::vector<pair<string,string>>` so
+both members of each entry are movable at `finish()` time (see Issue 6). In
+`onStringComplete`:
+
+```cpp
+extracted_attrs_.emplace_back(std::move(config_field_indexed_path_),
+                              std::move(config_field_scratch_));
+```
+
+`config_field_scratch_` is now in valid-but-unspecified state after the move; the next
+`selectStringTarget` call clears it before accumulation begins.
+
+#### Issue 4 — `buildPaths` called for shallower depths than any pattern (fixed)
+
+**Root cause.**
+The `!extract_field_patterns_.empty()` guard allowed `buildPaths` to be called for a
+depth-1 field when every configured pattern is at depth 3 or deeper. Path construction
+at depth 1 is cheap (single label, often SSO) but the call was still wasted, and with
+the fix from Issue 2 the path scratch strings are only warmed to the right capacity if
+they're actually used at the target depth.
+
+**Fix.**
+Pre-computed `min_extract_depth_` from the pattern set (stored on `DecoderConfig` and
+loaded at parser construction). `buildPaths` is now skipped entirely unless `depth >=
+min_extract_depth_`:
+
+```cpp
+if (!config_.extract_field_pattern_set.empty() &&
+    static_cast<size_t>(depth) >= min_extract_depth_) {
+  cursor_.buildPaths(depth, path_scratch_indexed_, path_scratch_pattern_);
+  ...
+}
+```
+
+For `"params.arguments.database"` (depth 3), all depth-1 and depth-2 events bypass
+the block entirely.
+
+The depth of a pattern string is computed as:
+`depth = 1 + count('.' in path) + count('[' in path)`
+
+So `"params.arguments.database"` → 1+2+0 = 3, and `"messages[].role"` → 1+1+1 = 3.
+
+#### Issue 5 — `extract_field_patterns_` rebuilt per request (fixed)
+
+**Root cause.**
+Both `InferenceBodyParser` and `AgentBodyParser` constructed a local
+`absl::flat_hash_set<std::string>` in their constructors by iterating
+`config_.extract_fields` on every request:
+
+```cpp
+for (const auto& spec : config_.extract_fields) {
+  extract_field_patterns_.insert(spec.json_path);  // N hash inserts per request
+}
+```
+
+`DecoderConfig` is an immutable shared object delivered via ECDS and identical across
+all concurrent requests — rebuilding the same set O(requests/s × N_patterns) times
+per second is pure waste.
+
+**Fix.**
+Added `extract_field_pattern_set` (the pre-built set) and `min_extract_depth` (the
+pre-computed minimum depth) directly to `DecoderConfig`, along with a `recompute()`
+method that populates them. The parsers now reference `config_.extract_field_pattern_set`
+directly — zero per-request setup:
+
+```cpp
+struct DecoderConfig {
+  ...
+  std::vector<ExtractFieldSpec>    extract_fields;
+  absl::flat_hash_set<std::string> extract_field_pattern_set;  // derived
+  size_t                           min_extract_depth{SIZE_MAX}; // derived
+
+  void recompute();  // call after mutating extract_fields
+};
+```
+
+`recompute()` is called once in `AiProtocolManagerFilterConfigFactory::buildConfig()`
+after the ECDS-delivered proto is parsed. For test code that constructs `DecoderConfig`
+directly, `cfg.recompute()` must be called after any `extract_fields` mutations.
+
+#### Issue 6 — `extracted_attrs_` key copied at move-out (fixed)
+
+**Root cause.**
+The move-out loop in `finish()` used `absl::flat_hash_map::operator[]` which copies
+the key when inserting into `request.attributes`:
+
+```cpp
+for (auto& [k, v] : extracted_attrs_) {
+  request.attributes[k] = std::move(v);  // k is const ref — copy!
+}
+```
+
+`absl::flat_hash_map` has no `extract()` or `merge()` method for moving nodes without
+copying keys. For `"params.arguments.database"` (25 chars, exceeds SSO) this means one
+heap allocation per extracted field at the end of every request.
+
+**Fix.**
+Changed `extracted_attrs_` from `absl::flat_hash_map<string,string>` to
+`std::vector<pair<string,string>>`. A vector's elements are non-const, so both the key
+and value are movable. At `finish()`:
+
+```cpp
+for (auto& [k, v] : extracted_attrs_) {
+  request.attributes.emplace(std::move(k), std::move(v));  // zero copies
+}
+```
+
+A vector is also more cache-friendly than a hash map for the typical N=1..5 entries
+and avoids the load-factor overhead of the hash table entirely.
+
+#### Combined effect summary
+
+| Issue | Scope | Before | After |
+|---|---|---|---|
+| 1: key_stack unconditional | All requests | O(N_keys) string copies even without extract_fields | Zero when unconfigured |
+| 2: buildPaths local strings | Per string/scalar when extract_fields set | O(N_fields) heap alloc+free pairs | Zero after first call (scratch warmed) |
+| 3: config_field copy | Per matched string | 2× peak allocation for matched value | 1× — zero-copy move |
+| 4: no depth guard | Per string/scalar when extract_fields set | buildPaths at all depths | Skipped for depth < min_pattern_depth |
+| 5: pattern set rebuilt | Per request | N hash inserts per request | Once at config time |
+| 6: key copy at finish | Per extracted field | 1 heap alloc per field for key | Zero — vector allows key move |
+
+The only remaining proportional allocation when `extract_fields` is configured is
+`std::string(raw)` in `onScalar` for matched numeric/literal values — this is
+unavoidable since `raw` is a `string_view` into a transient chunk buffer.

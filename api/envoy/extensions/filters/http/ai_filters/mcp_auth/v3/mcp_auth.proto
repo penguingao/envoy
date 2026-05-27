@@ -46,6 +46,16 @@ message ParamCondition {
 
     // ``AgentPayload.prompt_name`` — the prompt name in ``prompts/get``.
     PROMPT_NAME = 2;
+
+    // An arbitrary key from ``AiRequest.attributes``, pre-extracted by the
+    // Wuffs streaming decoder from a JSON path declared in
+    // ``DecoderConfig.extract_fields``.  Use this to gate access on depth-3+
+    // fields that the typed AgentPayload does not carry, e.g.
+    // ``params.arguments.database`` or ``params.arguments.user_id``.
+    //
+    // ``attribute_key`` must be set to the exact JSON path used in
+    // ``extract_fields`` (e.g. ``"params.arguments.database"``).
+    ATTRIBUTE = 3;
   }
 
   // The param field to test.  Required.
@@ -53,6 +63,11 @@ message ParamCondition {
 
   // How to match the field value.  Required.
   StringMatcher matcher = 2;
+
+  // The ``AiRequest.attributes`` key to read when ``field == ATTRIBUTE``.
+  // Must exactly match the ``json_path`` entry in ``DecoderConfig.extract_fields``.
+  // Ignored for all other field types.
+  string attribute_key = 3;
 }
 
 // Maps a JSON-RPC method name pattern to the set of principals allowed to call it,

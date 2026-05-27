@@ -544,6 +544,157 @@ TEST_F(AgentSmugglingTest, ResourceUriSmuggling_Rejected) {
   EXPECT_THAT(s.message(), testing::HasSubstr("duplicate key \"params\""));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// extract_fields — operator-configured deep-path extraction
+//
+// Verifies that DecoderConfig::extract_fields causes the Wuffs streaming parser
+// to pre-extract arbitrary-depth JSON paths into AiRequest::attributes.
+//
+//   InferenceExtractFieldsTest
+//     ArrayWildcard_MultipleRoles   messages[].role → attributes["messages[N].role"]
+//     Depth3_ScalarExtracted        custom depth-3 string extracted
+//
+//   AgentExtractFieldsTest
+//     Depth3_StringExtracted        params.arguments.database → attributes key
+//     Depth3_ScalarExtracted        params.arguments.limit (number) → attributes key
+//     NoConfig_AttributesEmpty      no extract_fields → attributes empty
+// ─────────────────────────────────────────────────────────────────────────────
+
+class InferenceExtractFieldsTest : public testing::Test {
+protected:
+  const Http::TestRequestHeaderMapImpl kInferenceHeaders{
+      {":method",      "POST"},
+      {":path",        "/v1/chat/completions"},
+      {":authority",   "host"},
+      {"content-type", "application/json"},
+  };
+};
+
+// messages[].role wildcard: one entry per array element keyed by indexed path.
+TEST_F(InferenceExtractFieldsTest, ArrayWildcard_MultipleRoles) {
+  DecoderConfig cfg = makeCfg();
+  cfg.extract_fields.push_back({"messages[].role"});
+  cfg.recompute();
+  InMemoryPayloadStore store;
+  RequestDecoder dec{cfg, store};
+
+  const std::string body =
+      R"({"model":"gpt-4o",)"
+      R"("messages":[{"role":"system","content":"You are helpful."},)"
+      R"({"role":"user","content":"Hi"}]})";
+
+  auto result = runDecoder(dec, kInferenceHeaders, body);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  EXPECT_EQ("system", result->attributes.at("messages[0].role"));
+  EXPECT_EQ("user",   result->attributes.at("messages[1].role"));
+  // Unrelated keys must NOT bleed into attributes.
+  EXPECT_EQ(0u, result->attributes.count("model"));
+}
+
+// Config-driven extraction of a depth-2 string that is not a built-in field.
+TEST_F(InferenceExtractFieldsTest, Depth2_CustomFieldExtracted) {
+  DecoderConfig cfg = makeCfg();
+  cfg.extract_fields.push_back({"metadata.tenant_id"});
+  cfg.recompute();
+  InMemoryPayloadStore store;
+  RequestDecoder dec{cfg, store};
+
+  const std::string body =
+      R"({"model":"gpt-4o",)"
+      R"("metadata":{"tenant_id":"acme","region":"us-west"},)"
+      R"("messages":[{"role":"user","content":"hi"}]})";
+
+  auto result = runDecoder(dec, kInferenceHeaders, body);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  EXPECT_EQ("acme", result->attributes.at("metadata.tenant_id"));
+  // Only the configured path; "region" must not appear.
+  EXPECT_EQ(0u, result->attributes.count("metadata.region"));
+}
+
+// No extract_fields configured → attributes stays empty (zero overhead path).
+TEST_F(InferenceExtractFieldsTest, NoConfig_AttributesEmpty) {
+  DecoderConfig cfg = makeCfg();  // default: no extract_fields
+  InMemoryPayloadStore store;
+  RequestDecoder dec{cfg, store};
+
+  const std::string body =
+      R"({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]})";
+
+  auto result = runDecoder(dec, kInferenceHeaders, body);
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_TRUE(result->attributes.empty());
+}
+
+class AgentExtractFieldsTest : public testing::Test {
+protected:
+  const Http::TestRequestHeaderMapImpl kAgentHeaders{
+      {":method",      "POST"},
+      {":path",        "/mcp"},
+      {":authority",   "host"},
+      {"content-type", "application/json"},
+  };
+};
+
+// Depth-3 string extraction: params.arguments.database.
+TEST_F(AgentExtractFieldsTest, Depth3_StringExtracted) {
+  DecoderConfig cfg = makeCfg();
+  cfg.extract_fields.push_back({"params.arguments.database"});
+  cfg.recompute();
+  InMemoryPayloadStore store;
+  RequestDecoder dec{cfg, store};
+
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":1,"method":"tools/call",)"
+      R"("params":{"name":"query","arguments":{"database":"prod","query":"SELECT 1"}}})";
+
+  auto result = runDecoder(dec, kAgentHeaders, body);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  EXPECT_EQ("prod", result->attributes.at("params.arguments.database"));
+  // "query" was not configured; must not appear.
+  EXPECT_EQ(0u, result->attributes.count("params.arguments.query"));
+}
+
+// Depth-3 scalar (number) extraction via onScalar path.
+TEST_F(AgentExtractFieldsTest, Depth3_ScalarExtracted) {
+  DecoderConfig cfg = makeCfg();
+  cfg.extract_fields.push_back({"params.arguments.limit"});
+  cfg.recompute();
+  InMemoryPayloadStore store;
+  RequestDecoder dec{cfg, store};
+
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":1,"method":"tools/call",)"
+      R"("params":{"name":"list","arguments":{"limit":50}}})";
+
+  auto result = runDecoder(dec, kAgentHeaders, body);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  EXPECT_EQ("50", result->attributes.at("params.arguments.limit"));
+}
+
+// Multiple paths configured: all populated independently.
+TEST_F(AgentExtractFieldsTest, MultiplePaths_AllExtracted) {
+  DecoderConfig cfg = makeCfg();
+  cfg.extract_fields.push_back({"params.arguments.database"});
+  cfg.extract_fields.push_back({"params.arguments.user_id"});
+  cfg.recompute();
+  InMemoryPayloadStore store;
+  RequestDecoder dec{cfg, store};
+
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":1,"method":"tools/call",)"
+      R"("params":{"name":"query","arguments":{"database":"staging","user_id":"u42","query":"SELECT 1"}}})";
+
+  auto result = runDecoder(dec, kAgentHeaders, body);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  EXPECT_EQ("staging", result->attributes.at("params.arguments.database"));
+  EXPECT_EQ("u42",     result->attributes.at("params.arguments.user_id"));
+}
+
 } // namespace
 } // namespace Codec
 } // namespace AiProtocolManager

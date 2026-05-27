@@ -1577,6 +1577,183 @@ TEST_P(McpAuthPromptNameIntegrationTest, PromptGetMissingIdentityRejects401) {
   EXPECT_THAT(response->body(), HasSubstr("\"id\":\"pn4\""));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ATTRIBUTE param_condition integration tests (depth >= 3 extraction)
+//
+// Exercises the full pipeline: the Wuffs decoder extracts a depth-3 field
+// (params.arguments.database) via DecoderConfig.extract_fields and stores it
+// in AiRequest.attributes; McpAuthFilter evaluates a ParamCondition with
+// field: ATTRIBUTE to gate access based on that extracted value.
+//
+// Policy configured for this fixture:
+//   - tools/call + ATTRIBUTE "params.arguments.database" exact "prod"
+//                → allowed_principals: ["dba"]
+//   - tools/call + ATTRIBUTE "params.arguments.database" exact "staging"
+//                → allowed_principals: ["*"]
+//   - tools/call  (catch-all)
+//                → allowed_principals: ["*"]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class McpAuthAttributeParamConditionIntegrationTest
+    : public testing::TestWithParam<Network::Address::IpVersion>,
+      public HttpIntegrationTest {
+public:
+  McpAuthAttributeParamConditionIntegrationTest()
+      : HttpIntegrationTest(Http::CodecType::HTTP2, GetParam()) {}
+
+  void initialize() override {
+    config_helper_.prependFilter(R"EOF(
+      name: envoy.filters.http.ai_protocol_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+        decoder_config:
+          extract_fields:
+          - json_path: "params.arguments.database"
+        ai_filters:
+        - name: envoy.ai_filters.mcp_auth
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ai_filters.mcp_auth.v3.McpAuthConfig
+            method_policies:
+            - method_pattern: "tools/call"
+              allowed_principals: ["dba"]
+              param_conditions:
+              - field: ATTRIBUTE
+                attribute_key: "params.arguments.database"
+                matcher:
+                  exact: "prod"
+            - method_pattern: "tools/call"
+              allowed_principals: ["*"]
+              param_conditions:
+              - field: ATTRIBUTE
+                attribute_key: "params.arguments.database"
+                matcher:
+                  exact: "staging"
+            - method_pattern: "tools/call"
+              allowed_principals: ["*"]
+    )EOF");
+    HttpIntegrationTest::initialize();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, McpAuthAttributeParamConditionIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
+
+// ── AT1. Depth-3 attribute "prod" — only dba principal allowed ────────────────
+//
+// The Wuffs decoder extracts params.arguments.database = "prod" from the body.
+// The first policy matches; "alice" is not "dba" → 403.
+
+TEST_P(McpAuthAttributeParamConditionIntegrationTest, ProdDatabaseNonDbaRejects403) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"at1","method":"tools/call","params":{"name":"query","arguments":{"database":"prod","sql":"SELECT 1"}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "alice"}},
+      body);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_FALSE(upstream_request_ != nullptr);
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), HasSubstr("-32003"));
+  EXPECT_THAT(response->body(), HasSubstr("\"id\":\"at1\""));
+}
+
+// ── AT2. Depth-3 attribute "prod" — dba principal passes ─────────────────────
+//
+// Same body, identity "dba" → matches the first policy → allowed.
+
+TEST_P(McpAuthAttributeParamConditionIntegrationTest, ProdDatabaseDbapasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"at2","method":"tools/call","params":{"name":"query","arguments":{"database":"prod","sql":"SELECT 1"}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "dba"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("query"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── AT3. Depth-3 attribute "staging" — any authenticated principal passes ─────
+//
+// database = "staging" skips the first policy (condition fails) and matches the
+// second policy (allowed_principals: ["*"]).
+
+TEST_P(McpAuthAttributeParamConditionIntegrationTest, StagingDatabaseAnyPrincipalPasses) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"at3","method":"tools/call","params":{"name":"query","arguments":{"database":"staging","sql":"SELECT 1"}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "alice"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("query"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── AT4. Attribute absent (no database key) — falls to catch-all → any principal
+//
+// When params.arguments.database is not present in the body, the attribute is
+// not extracted, so both ATTRIBUTE conditions fail. The catch-all rule (no
+// param conditions) matches and any authenticated principal passes.
+
+TEST_P(McpAuthAttributeParamConditionIntegrationTest, MissingAttributeFallsToCatchAll) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  // No "database" key in arguments.
+  const std::string body =
+      R"({"jsonrpc":"2.0","id":"at4","method":"tools/call","params":{"name":"ping","arguments":{}}})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/mcp"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"},
+                                     {"x-mcp-identity", "alice"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->body().toString(), HasSubstr("ping"));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
 } // namespace
 } // namespace McpAuth
 } // namespace AiFilters

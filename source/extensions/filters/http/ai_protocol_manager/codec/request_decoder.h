@@ -2,8 +2,11 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "envoy/http/header_map.h"
+
+#include "absl/container/flat_hash_set.h"
 
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
@@ -18,6 +21,14 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 namespace Codec {
+
+// Specifies one JSON path for the Wuffs parser to pre-extract into
+// AiRequest::attributes. Use dot-notation with [] for array wildcards:
+//   "params.arguments.database"  — depth-3 dict field
+//   "messages[].role"            — per-element field in a top-level array
+struct ExtractFieldSpec {
+  std::string json_path;
+};
 
 struct DecoderConfig {
   // Fields whose serialized size is at or below this threshold are stored as
@@ -38,6 +49,34 @@ struct DecoderConfig {
   // stream, sampling params, method, id) but individual element PayloadRefs
   // are not populated. Default: 256 KB.
   size_t max_element_capture_bytes{256 * 1024};
+
+  // Operator-configured JSON paths to pre-extract into AiRequest::attributes.
+  // Delivered via xDS (ECDS for per-filter dynamic updates without listener drain).
+  // Call recompute() after modifying this field.
+  std::vector<ExtractFieldSpec> extract_fields;
+
+  // Derived from extract_fields — call recompute() after any mutation.
+  //
+  // extract_field_pattern_set  O(1) lookup set; avoids rebuilding per request.
+  // min_extract_depth          shallowest configured depth; WuffsJsonCursor skips
+  //                            key_stack tracking and buildPaths for fields above
+  //                            this level, keeping the zero-overhead guarantee for
+  //                            unconfigured deployments.
+  absl::flat_hash_set<std::string> extract_field_pattern_set;
+  size_t min_extract_depth{SIZE_MAX};
+
+  void recompute() {
+    extract_field_pattern_set.clear();
+    min_extract_depth = SIZE_MAX;
+    for (const auto& spec : extract_fields) {
+      extract_field_pattern_set.insert(spec.json_path);
+      size_t d = 1;
+      for (char c : spec.json_path) {
+        if (c == '.' || c == '[') ++d;
+      }
+      min_extract_depth = std::min(min_extract_depth, d);
+    }
+  }
 };
 
 // RequestDecoder translates an HTTP request (headers + streamed body) into a

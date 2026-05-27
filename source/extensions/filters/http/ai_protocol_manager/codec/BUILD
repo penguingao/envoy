@@ -92,6 +92,7 @@ envoy_cc_library(
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
+        "@abseil-cpp//absl/container:flat_hash_set",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/strings",
         "@wuffs//:wuffs",

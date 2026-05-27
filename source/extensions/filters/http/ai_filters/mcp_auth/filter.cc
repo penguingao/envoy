@@ -100,9 +100,8 @@ McpAuthFilter::onRequestMetadata(AiProtocolManager::Codec::AiRequest& request,
   // When method_policies is non-empty, evaluate them in order; first match
   // wins. When empty, fall back to the deprecated admin_method_prefix rule.
   if (!config_->method_policies.empty()) {
-    const auto* agent = request.as_agent();
     for (const auto& policy : config_->method_policies) {
-      if (policy.matches(method, agent)) {
+      if (policy.matches(method, request)) {
         if (!policy.allows(principal)) {
           ENVOY_LOG(debug, "mcp_auth: policy denied principal '{}' for method '{}'",
                     principal, method);

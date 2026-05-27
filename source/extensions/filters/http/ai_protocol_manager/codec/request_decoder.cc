@@ -6,6 +6,8 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
@@ -105,7 +107,8 @@ public:
     virtual void onPop(int depth, size_t tok_end) = 0;
   };
 
-  explicit WuffsJsonCursor(Handler& handler) : handler_(handler) {
+  WuffsJsonCursor(Handler& handler, bool track_paths)
+      : handler_(handler), track_paths_(track_paths) {
     dec_     = wuffs_json__decoder::alloc();
     tok_buf_ = wuffs_base__slice_token__writer(
         wuffs_base__make_slice_token(tok_data_, kTokBufLen));
@@ -195,6 +198,13 @@ public:
             if (depth_ < kMaxDepth) {
               is_dict_[depth_]       = to_dict;
               expecting_key_[depth_] = to_dict;
+              if (!to_dict) array_index_[depth_] = 0;
+            }
+            // push_key_[depth_] = key at parent depth that opened this container.
+            // Only needed when path tracking is active (extract_fields configured).
+            if (track_paths_ && depth_ <= kMaxDepth) {
+              push_key_[depth_] = (depth_ > 1 && depth_ - 1 < kMaxDepth)
+                                      ? key_stack_[depth_ - 1] : "";
             }
             handler_.onPush(to_dict, depth_, tok_start);
           } else {
@@ -203,6 +213,9 @@ public:
             handler_.onPop(pop_depth, body_src_pos_);
             if (depth_ >= 1 && depth_ < kMaxDepth && is_dict_[depth_])
               expecting_key_[depth_] = true;
+            // An element just finished inside a parent array — advance the index.
+            if (depth_ >= 1 && depth_ < kMaxDepth && !is_dict_[depth_])
+              ++array_index_[depth_];
           }
           break;
         }
@@ -220,6 +233,7 @@ public:
           in_chain_ = cont;
           if (!cont) {
             if (string_is_key_) {
+              if (track_paths_ && depth_ < kMaxDepth) key_stack_[depth_] = str_acc_;
               if (auto s = handler_.onKey(str_acc_, depth_); !s.ok()) return s;
               if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
             } else {
@@ -255,8 +269,37 @@ public:
     return absl::OkStatus();
   }
 
+  // Builds two path representations for the string value currently being
+  // selected at `depth`:
+  //   indexed_path  — e.g. "messages[0].role"  (for attributes key storage)
+  //   pattern_path  — e.g. "messages[].role"   (for extract_fields lookup)
+  //
+  // Must be called only from within a Handler callback (key_stack_ is current).
+  void buildPaths(int depth, std::string& indexed_path, std::string& pattern_path) const {
+    indexed_path.clear();
+    pattern_path.clear();
+    for (int d = 1; d <= depth && d < kMaxDepth; ++d) {
+      if (is_dict_[d]) {
+        // Dict level: label is the key that opened this container (push_key_[d]),
+        // except at the target depth where it is the current key (key_stack_[d]).
+        const std::string& label = (d == depth) ? key_stack_[d] : push_key_[d + 1];
+        if (!indexed_path.empty()) indexed_path += '.';
+        if (!pattern_path.empty()) pattern_path += '.';
+        indexed_path += label;
+        pattern_path += label;
+      } else {
+        // Array level: indexed uses the current element index, pattern uses [].
+        indexed_path += '[';
+        indexed_path += std::to_string(array_index_[d]);
+        indexed_path += ']';
+        pattern_path += "[]";
+      }
+    }
+  }
+
 private:
   Handler& handler_;
+  bool     track_paths_{false};
 
   wuffs_json__decoder::unique_ptr dec_;
   static constexpr size_t         kTokBufLen = 256;
@@ -269,6 +312,17 @@ private:
   int  depth_{0};
   bool is_dict_[kMaxDepth]{};
   bool expecting_key_[kMaxDepth]{};
+
+  // Path-tracking state for buildPaths().
+  // key_stack_[d]  = last key seen at depth d (set when key string chain completes).
+  // push_key_[d]   = key at depth d-1 that opened the container now at depth d
+  //                  (captured at push time; size kMaxDepth+1 so push_key_[kMaxDepth]
+  //                  is accessible when depth_ increments to kMaxDepth).
+  // array_index_[d]= count of elements already completed at array depth d
+  //                  (reset on push, incremented on pop when parent is array).
+  std::string key_stack_[kMaxDepth]{};
+  std::string push_key_[kMaxDepth + 1]{};
+  int         array_index_[kMaxDepth]{};
 
   bool         in_chain_{false};
   bool         string_is_key_{false};
@@ -292,7 +346,9 @@ private:
 class RequestDecoder::InferenceBodyParser : public WuffsJsonCursor::Handler {
 public:
   InferenceBodyParser(const DecoderConfig& config, PayloadStore& store)
-      : config_(config), store_(store), cursor_(*this) {}
+      : config_(config), store_(store),
+        cursor_(*this, !config_.extract_field_pattern_set.empty()),
+        min_extract_depth_(config_.min_extract_depth) {}
 
   absl::Status feed(absl::string_view chunk) {
     total_bytes_ += chunk.size();
@@ -342,6 +398,9 @@ public:
       makeSubRef(ref, start, end - start, payload.residual_params, tool_kinds_[i], store_);
       payload.tools.push_back(std::move(ref));
     }
+    for (auto& [k, v] : extracted_attrs_) {
+      request.attributes.emplace(std::move(k), std::move(v));
+    }
     return absl::OkStatus();
   }
 
@@ -362,6 +421,15 @@ private:
     } else if (depth == 2 && in_stop_array_) {
       string_val_.clear();
       return &string_val_;
+    }
+    if (!config_.extract_field_pattern_set.empty() &&
+        static_cast<size_t>(depth) >= min_extract_depth_) {
+      cursor_.buildPaths(depth, path_scratch_indexed_, path_scratch_pattern_);
+      if (config_.extract_field_pattern_set.contains(path_scratch_pattern_)) {
+        config_field_scratch_.clear();
+        std::swap(config_field_indexed_path_, path_scratch_indexed_);
+        return &config_field_scratch_;
+      }
     }
     return nullptr;
   }
@@ -393,21 +461,32 @@ private:
     if (target == &string_val_) {
       sampling_.stop.push_back(std::move(string_val_));
       string_val_.clear();
+    } else if (target == &config_field_scratch_) {
+      extracted_attrs_.emplace_back(std::move(config_field_indexed_path_),
+                                    std::move(config_field_scratch_));
     }
   }
 
   void onScalar(absl::string_view raw, int64_t vbc, int depth) override {
-    if (depth != 1) return;
-    if (vbc == WUFFS_BASE__TOKEN__VBC__NUMBER) {
-      int64_t i_val; double d_val;
-      if      (current_key_ == "max_tokens"  && absl::SimpleAtoi(raw, &i_val)) sampling_.max_tokens  = static_cast<int32_t>(i_val);
-      else if (current_key_ == "n"           && absl::SimpleAtoi(raw, &i_val)) sampling_.n           = static_cast<int32_t>(i_val);
-      else if (current_key_ == "seed"        && absl::SimpleAtoi(raw, &i_val)) sampling_.seed        = i_val;
-      else if (current_key_ == "temperature" && absl::SimpleAtod(raw, &d_val)) sampling_.temperature = d_val;
-      else if (current_key_ == "top_p"       && absl::SimpleAtod(raw, &d_val)) sampling_.top_p       = d_val;
-    } else if (vbc == WUFFS_BASE__TOKEN__VBC__LITERAL && current_key_ == "stream") {
-      if      (raw == "true")  streaming_ = true;
-      else if (raw == "false") streaming_ = false;
+    if (depth == 1) {
+      if (vbc == WUFFS_BASE__TOKEN__VBC__NUMBER) {
+        int64_t i_val; double d_val;
+        if      (current_key_ == "max_tokens"  && absl::SimpleAtoi(raw, &i_val)) sampling_.max_tokens  = static_cast<int32_t>(i_val);
+        else if (current_key_ == "n"           && absl::SimpleAtoi(raw, &i_val)) sampling_.n           = static_cast<int32_t>(i_val);
+        else if (current_key_ == "seed"        && absl::SimpleAtoi(raw, &i_val)) sampling_.seed        = i_val;
+        else if (current_key_ == "temperature" && absl::SimpleAtod(raw, &d_val)) sampling_.temperature = d_val;
+        else if (current_key_ == "top_p"       && absl::SimpleAtod(raw, &d_val)) sampling_.top_p       = d_val;
+      } else if (vbc == WUFFS_BASE__TOKEN__VBC__LITERAL && current_key_ == "stream") {
+        if      (raw == "true")  streaming_ = true;
+        else if (raw == "false") streaming_ = false;
+      }
+    }
+    if (!config_.extract_field_pattern_set.empty() &&
+        static_cast<size_t>(depth) >= min_extract_depth_) {
+      cursor_.buildPaths(depth, path_scratch_indexed_, path_scratch_pattern_);
+      if (config_.extract_field_pattern_set.contains(path_scratch_pattern_)) {
+        extracted_attrs_.emplace_back(std::move(path_scratch_indexed_), std::string(raw));
+      }
     }
   }
 
@@ -449,6 +528,17 @@ private:
   WuffsJsonCursor               cursor_;
   size_t                        total_bytes_{0};
   std::unique_ptr<StreamWriter> residual_writer_;
+
+  // ── Config-driven field extraction ─────────────────────────────────────────
+  // min_extract_depth_: skip buildPaths entirely for shallow fields.
+  // path_scratch_*: reused across calls — avoids per-call heap alloc once warmed.
+  // extracted_attrs_: vector-of-pairs so both key and value are movable at finish().
+  size_t                                        min_extract_depth_;
+  std::string                                   path_scratch_indexed_;
+  std::string                                   path_scratch_pattern_;
+  std::string                                   config_field_scratch_;
+  std::string                                   config_field_indexed_path_;
+  std::vector<std::pair<std::string, std::string>> extracted_attrs_;
 
   // ── Extracted fields ───────────────────────────────────────────────────────
   std::string    current_key_;
@@ -499,7 +589,9 @@ public:
   AgentBodyParser(const Http::RequestHeaderMap& headers, absl::string_view http_method,
                   absl::string_view path, const DecoderConfig& config, PayloadStore& store)
       : headers_(headers), http_method_(http_method), path_(path),
-        config_(config), store_(store), cursor_(*this) {}
+        config_(config), store_(store),
+        cursor_(*this, !config_.extract_field_pattern_set.empty()),
+        min_extract_depth_(config_.min_extract_depth) {}
 
   absl::Status feed(absl::string_view chunk) {
     total_bytes_ += chunk.size();
@@ -562,6 +654,9 @@ public:
                  capabilities_byte_end_ - capabilities_byte_start_,
                  payload.residual_params, PayloadKind::JsonObject, store_);
     }
+    for (auto& [k, v] : extracted_attrs_) {
+      request.attributes.emplace(std::move(k), std::move(v));
+    }
 
     return absl::OkStatus();
   }
@@ -607,6 +702,15 @@ private:
       else if (params_key_ == "uri")  { params_uri_.clear();  return &params_uri_; }
       else if (params_key_ == "ref")  { params_ref_.clear();  return &params_ref_; }
     }
+    if (!config_.extract_field_pattern_set.empty() &&
+        static_cast<size_t>(depth) >= min_extract_depth_) {
+      cursor_.buildPaths(depth, path_scratch_indexed_, path_scratch_pattern_);
+      if (config_.extract_field_pattern_set.contains(path_scratch_pattern_)) {
+        config_field_scratch_.clear();
+        std::swap(config_field_indexed_path_, path_scratch_indexed_);
+        return &config_field_scratch_;
+      }
+    }
     return nullptr;
   }
 
@@ -629,13 +733,25 @@ private:
     return absl::OkStatus();
   }
 
-  void onStringComplete(std::string* /*target*/, int /*depth*/) override {}
+  void onStringComplete(std::string* target, int /*depth*/) override {
+    if (target == &config_field_scratch_) {
+      extracted_attrs_.emplace_back(std::move(config_field_indexed_path_),
+                                    std::move(config_field_scratch_));
+    }
+  }
 
   void onScalar(absl::string_view raw, int64_t vbc, int depth) override {
     if (depth == 1 && current_key_ == "id" && vbc == WUFFS_BASE__TOKEN__VBC__NUMBER) {
       int64_t i_val; double d_val;
       if      (absl::SimpleAtoi(raw, &i_val)) id_ = std::to_string(i_val);
       else if (absl::SimpleAtod(raw, &d_val)) id_ = std::to_string(static_cast<int64_t>(d_val));
+    }
+    if (!config_.extract_field_pattern_set.empty() &&
+        static_cast<size_t>(depth) >= min_extract_depth_) {
+      cursor_.buildPaths(depth, path_scratch_indexed_, path_scratch_pattern_);
+      if (config_.extract_field_pattern_set.contains(path_scratch_pattern_)) {
+        extracted_attrs_.emplace_back(std::move(path_scratch_indexed_), std::string(raw));
+      }
     }
   }
 
@@ -683,6 +799,14 @@ private:
   WuffsJsonCursor               cursor_;
   size_t                        total_bytes_{0};
   std::unique_ptr<StreamWriter> residual_writer_;
+
+  // ── Config-driven field extraction ─────────────────────────────────────────
+  size_t                                           min_extract_depth_;
+  std::string                                      path_scratch_indexed_;
+  std::string                                      path_scratch_pattern_;
+  std::string                                      config_field_scratch_;
+  std::string                                      config_field_indexed_path_;
+  std::vector<std::pair<std::string, std::string>> extracted_attrs_;
 
   // ── Top-level extracted fields ────────────────────────────────────────────
   std::string current_key_;

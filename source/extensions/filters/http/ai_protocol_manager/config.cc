@@ -36,8 +36,13 @@ AiProtocolManagerFilterConfigFactory::buildConfig(const ProtoConfig& proto,
     agentic_cfg.filters.push_back(std::move(spec));
   }
 
-  // Default decoder config.
+  // Decoder config — populate extract_fields from proto, then derive the
+  // fast lookup set and min depth used by WuffsJsonCursor.
   Codec::DecoderConfig decoder_cfg;
+  for (const auto& spec : proto.decoder_config().extract_fields()) {
+    decoder_cfg.extract_fields.push_back({spec.json_path()});
+  }
+  decoder_cfg.recompute();
 
   // Generate stats.
   const std::string p = absl::StrCat(stats_prefix, "ai_protocol_manager.");

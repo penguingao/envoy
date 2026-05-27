@@ -70,6 +70,10 @@ McpAuthFilterFactory::parseConfig(const Protobuf::Any& typed_config,
       case ProtoField::TOOL_NAME:    cond.field = ParamField::ToolName;    break;
       case ProtoField::RESOURCE_URI: cond.field = ParamField::ResourceUri; break;
       case ProtoField::PROMPT_NAME:  cond.field = ParamField::PromptName;  break;
+      case ProtoField::ATTRIBUTE:
+        cond.field = ParamField::Attribute;
+        cond.attribute_key = pc.attribute_key();
+        break;
       default:                       cond.field = ParamField::ToolName;    break;
       }
 

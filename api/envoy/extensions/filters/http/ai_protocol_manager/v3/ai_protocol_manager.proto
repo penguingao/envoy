@@ -17,6 +17,34 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // [#protodoc-title: AI Protocol Manager]
 // [#extension: envoy.filters.http.ai_protocol_manager]
 
+// One JSON path for the streaming Wuffs decoder to pre-extract into
+// ``AiRequest.attributes``.  Use dot-notation; ``[]`` denotes an array wildcard.
+//
+// Examples:
+//   ``params.arguments.database``  — depth-3 dict field
+//   ``messages[].role``            — per-element field in a top-level array
+message ExtractFieldSpec {
+  // The JSON path to extract.  Required.
+  string json_path = 1;
+}
+
+// Decoder configuration for the AI Protocol Manager.
+//
+// These settings are applied to every request decoded by the filter;
+// they can be updated without a listener drain via ECDS.
+message DecoderConfig {
+  // Operator-configured JSON paths to pre-extract into ``AiRequest.attributes``
+  // during streaming Wuffs parsing.
+  //
+  // Filters in the AI chain (e.g. ``mcp_auth``) can then read these values
+  // from ``AiRequest.attributes`` via ``ParamCondition.field = ATTRIBUTE``
+  // without needing to parse ``params_raw`` themselves.
+  //
+  // Zero overhead for unconfigured paths — the Wuffs tokenizer discards
+  // unmatched string values before any allocation occurs.
+  repeated ExtractFieldSpec extract_fields = 1;
+}
+
 // Top-level configuration for the AI Protocol Manager HTTP filter.
 //
 // The AI Protocol Manager classifies each incoming AI request (inference vs.
@@ -49,6 +77,11 @@ message AiProtocolManager {
   //             http_rule: { get: "/api/search?q={query}" }
   //         tools_list_rule: { get: "/api/tools" }
   McpRestTranscoderConfig rest_transcoder = 2;
+
+  // Decoder configuration — controls which JSON paths the streaming Wuffs
+  // parser pre-extracts into ``AiRequest.attributes``.  Can be pushed
+  // dynamically via ECDS without a listener drain.
+  DecoderConfig decoder_config = 3;
 }
 
 // Per-route REST transcoding rules for the AI Protocol Manager.
