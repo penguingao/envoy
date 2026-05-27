@@ -2509,80 +2509,98 @@ Everything else is either in the mmap region or is two integers (`PayloadRef::Ex
 
 ## 21. Routing vs. authorization — access to deep fields
 
-### 21.1 What the decoder pre-extracts vs. what it leaves opaque
+### 21.1 What depth is needed in practice — evidence from production systems
 
-The current design optimises for routing: the fields needed to select a protocol,
-upstream cluster, and chain configuration are pre-extracted as typed C++ values
-during the Wuffs streaming pass. Everything else is captured as opaque
-`PayloadRef` byte ranges.
+The internal `McpAuthFilter` tests only exercise depth 1–2 fields, which might suggest
+that is sufficient. It is not. Research into production AI gateway implementations
+shows that **depth 3 is common in real-world auth and policy decisions**.
+
+[agentgateway](https://github.com/agentgateway/agentgateway) (solo.io's open-source AI
+gateway) is a representative production system. Its CEL-based policy engine exposes:
+
+| Depth | Field | Common use case |
+|---|---|---|
+| 1 | `method`, `mcp.tool.name`, `llm.model` | Method allow-list, model routing |
+| 2 | `params.name`, `params.uri` | Tool/resource-level auth |
+| **3** | **`mcp.tool.arguments.*`** | **Tool argument filtering — e.g. `arguments.database == "prod"` → deny non-admins** |
+| **3** | **`messages[0].content`**, **`messages[0].role`** | **Content filtering, prompt inspection, routing by message type** |
+| variable | `jwt.nested.claim` | Nested OAuth scope / custom claim-based access |
+
+**Concrete depth-3 policy examples from agentgateway documentation:**
+
+```
+# Deny non-admins from calling query_db with database=prod
+mcp.tool.name == "query_db" && mcp.tool.arguments.database == "prod"
+  → allowed_principals: [admin]
+
+# Route to different provider based on system prompt presence
+messages[0].role == "system" → provider: anthropic
+
+# Block requests containing PII patterns in message content
+messages[].content.contains("SSN") → deny
+```
+
+The effective maximum depth in production is **unbounded** — agentgateway supports
+arbitrary nesting via CEL's `json()` function and dot-notation path traversal. Its
+ContextBuilder tracks which attributes are referenced in active policies and extracts
+only those fields lazily, avoiding full body buffering when no deep-field policy is
+configured.
+
+### 21.2 What the current decoder pre-extracts vs. what it leaves opaque
 
 | Depth | Example | What you get after `take()` |
 |---|---|---|
 | 1 | `model`, `method`, `stream`, `id` | Typed C++ values (`std::string`, `bool`, etc.) |
 | 2 (pre-extracted) | `params.name` → `tool_name`, `params.uri` → `resource_uri` | Typed `std::string` |
 | 2 (not pre-extracted) | `params.protocolVersion`, `params.cursor`, `params.level` | Inside `params_raw` opaque blob |
-| 3+ | `params.arguments.user_id`, `messages[0].content` | Inside `arguments` or `messages[i]` opaque blob |
+| **3+** | **`params.arguments.database`**, **`messages[0].content`** | **Inside `arguments` or `messages[i]` opaque blob — consumer must re-parse** |
 
-### 21.2 What happens when auth needs depth 3+ fields
+### 21.3 The cost of depth 3+ access in the current design
 
-Consider a concrete authorization case:
-
-```json
-{
-  "method": "tools/call",
-  "params": {
-    "name": "database_query",
-    "arguments": {"user_id": "admin", "query": "SELECT * FROM users"}
-  }
-}
-```
-
-`tool_name = "database_query"` is pre-extracted (depth 2). `user_id` at depth 3 is
-not. An auth filter checking `user_id` must:
+An auth filter checking `arguments.database` must:
 
 ```cpp
 std::string raw = convertPayloadRefToString(payload->arguments, request);
-auto args = json::parse(raw);          // second-pass DOM parse
-auto uid  = args["user_id"].get<std::string>();
+auto args = json::parse(raw);                          // O(arguments_size) heap
+auto db   = args["database"].get<std::string>();
 ```
 
-That `json::parse` is O(arguments_size) time and heap — the proportional cost the
-decoder avoided during streaming reappears in the auth filter. The decoder's
-proportional-heap guarantee is **scoped to the streaming parse phase only**; it does
-not extend to downstream consumers accessing fields the decoder did not pre-extract.
+That `json::parse` is O(arguments_size) time and heap — the proportional allocation
+cost the decoder avoided during streaming reappears in the auth filter on the event
+loop. For a 100 KB `arguments` blob evaluated on every request, this is material.
 
-### 21.3 Three critical gaps
+### 21.4 Three production gaps
 
-**Gap 1 — No field-interest mechanism for auth filters.**
-There is no way for an auth filter to declare at chain-build time that it needs
-`params.arguments.user_id`, and have the decoder pre-extract it inline during the
-Wuffs pass alongside `tool_name`. The decoder's `selectStringTarget` is hardcoded to
-a fixed set of routing fields. Any field outside that set costs a consumer-side
-re-parse.
+**Gap 1 — No field-interest mechanism.**
+The decoder's `selectStringTarget` is hardcoded to a fixed routing field set. There
+is no way for an auth filter to declare at chain-build time that it needs
+`arguments.database`, and have the decoder pre-extract it inline during the Wuffs
+streaming pass — the way agentgateway's ContextBuilder tracks declared CEL attribute
+references. Any field outside the hardcoded set costs a full consumer-side re-parse.
 
 **Gap 2 — Tier 2 loses per-element message access.**
-When body > `max_element_capture_bytes` (256 KB, `DecoderConfig`), individual
-`messages[]` elements are not captured as separate `PayloadRef`s. An auth filter
-checking message content (PII detection, content moderation) in a large body must
-parse the full `residual_params` DOM — O(body_size) heap in the auth filter. The
-256 KB threshold is a configurable operational choice, not a hard constraint.
+When body > `max_element_capture_bytes` (256 KB), individual `messages[]` elements
+are not captured as separate `PayloadRef`s. A content-filtering policy inspecting
+`messages[0].role` or `messages[].content` in a large body must parse the full
+`residual_params` DOM — O(body_size) heap in the auth filter. The 256 KB threshold
+is a configurable operational choice, not a hard constraint, and real inference
+bodies frequently exceed it.
 
 **Gap 3 — Depth-2 fields outside the pre-extracted set require re-parsing `params_raw`.**
-Only `params.name`, `params.uri`, and `params.ref` are pre-extracted. Other depth-2
-fields — `params.protocolVersion` (MCP initialize), `params.cursor` (list ops),
-`params.level` (logging/setLevel) — are captured inside `params_raw`. A filter
-needing them re-parses the entire params blob.
+Only `params.name`, `params.uri`, and `params.ref` are pre-extracted as typed fields.
+Other depth-2 fields — `params.protocolVersion`, `params.cursor`, `params.level` —
+sit inside `params_raw`. A filter needing them re-parses the entire params blob.
 
-### 21.4 What a more complete design would need
+### 21.5 What a complete design would need
 
-**Field-interest registry.** Auth and policy filters declare the JSON paths they need
-(`params.arguments.user_id`, `messages[].role`) at chain-build time. The decoder
-computes the union of declared interests across all chain filters and gates
-`selectStringTarget` on that union — pre-extracting exactly what the chain needs,
-nothing more, without changing the proportional-heap guarantee for everything else.
+**Field-interest registry (mirrors agentgateway's ContextBuilder).** Auth and policy
+filters declare the JSON paths they need at chain-build time. The decoder computes the
+union of declared interests across all chain filters and gates `selectStringTarget` on
+that union — pre-extracting exactly the needed set inline during the Wuffs pass,
+with zero proportional-heap cost for everything outside the declared set.
 
-**Explicit scope for the proportional-heap constraint.** The problem statement should
-read: "no proportional C++ heap allocation **in the decoder**." Downstream chain
-filters that access opaque `PayloadRef` fields may still pay proportional cost. This
-is a conscious trade-off: the decoder cannot know what every downstream filter needs;
-pre-extracting everything would defeat the constraint it is trying to enforce.
+**Explicit scope statement for the proportional-heap constraint.** The guarantee "no
+proportional C++ heap allocation" applies to the **decoder** only. Downstream chain
+filters accessing opaque `PayloadRef` fields pay proportional cost for those fields.
+For depth-3+ fields needed by auth policies, this cost appears on the event-loop
+thread unless a field-interest registry drives the decoder to pre-extract them.
