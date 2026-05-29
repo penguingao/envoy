@@ -240,6 +240,7 @@ def envoy_dependencies(skip_targets = []):
 
     _libmaxminddb()
     _thrift()
+    _wuffs()
 
     external_http_archive("rules_license")
     external_http_archive("rules_pkg")
@@ -1035,4 +1036,17 @@ def _libmaxminddb():
     external_http_archive(
         name = "libmaxminddb",
         build_file_content = LIBMAXMINDDB_BUILD_CONTENT,
+    )
+
+def _wuffs():
+    external_http_archive(
+        name = "wuffs",
+        build_file_content = """
+cc_library(
+    name = "wuffs",
+    hdrs = ["release/c/wuffs-v0.4.c"],
+    visibility = ["//visibility:public"],
+    copts = ["-Wno-unused-function"],
+)
+""",
     )
