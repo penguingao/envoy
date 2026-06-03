@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 
+#include "absl/base/nullability.h"
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 
@@ -55,28 +56,27 @@ namespace Json {
 //
 // Example callback sequence for {"messages": [{"role": "user"}]}:
 //
-//   onContainerOpen (key="",         is_dict=true,  depth=1)  ← root {
-//   onKey           ("messages",                    depth=1)
-//   onContainerOpen (key="messages", is_dict=false, depth=2)  ← [
-//   onContainerOpen (key="",         is_dict=true,  depth=3)  ← { (parent is array)
-//   onKey           ("role",                        depth=3)
-//   selectStringTarget("role",                      depth=3)  → &buf or nullptr
-//   onStringComplete  (&buf,                        depth=3)
-//   onContainerClose (depth=3, ...)
-//   onContainerClose (depth=2, ...)
-//   onContainerClose (depth=1, ...)
+//   onContainerOpen    (key="",         is_dict=true,  depth=1)  ← root {
+//   onKey              ("messages",                    depth=1)
+//   onContainerOpen    (key="messages", is_dict=false, depth=2)  ← [
+//   onContainerOpen    (key="",         is_dict=true,  depth=3)  ← { (parent is array)
+//   onKey              ("role",                        depth=3)
+//   openStringCapture ("role",         depth=3, tok_start)  → &buf or nullptr
+//   closeStringCapture   (&buf, "role",   depth=3, tok_end)
+//   onContainerClose   (depth=3, ...)
+//   onContainerClose   (depth=2, ...)
+//   onContainerClose   (depth=1, ...)
 //
 // ── String value lifecycle ────────────────────────────────────────────────────
 //
-// A JSON string value may span multiple feed() calls if a chunk boundary falls
-// inside the string.  The sequence is always:
-//   1. selectStringTarget(key, depth)  — handler returns &buf to collect into,
-//                                        or nullptr to discard at zero cost.
-//   2. (cursor appends decoded UTF-8 bytes to buf as token segments arrive)
-//   3. onStringComplete(&buf, depth)   — fired when the closing quote is seen.
+// At the start of a string value the cursor calls openStringCapture.  The
+// handler returns a pointer to a handler-owned std::string buffer, and the
+// cursor appends decoded UTF-8 bytes to it across all tokens and feed() calls.
+// When the closing quote is seen, closeStringCapture fires and the buffer holds
+// the complete value.  Return nullptr to discard the string at zero cost — the
+// cursor skips all accumulation and fires no further callbacks for that value.
 //
-// Backslash escapes (\n, \t, \uXXXX, …) are decoded transparently — the
-// handler always receives valid UTF-8, never raw escape sequences.
+// Backslash escapes (\n, \t, \uXXXX, …) are decoded to UTF-8 transparently.
 //
 // ── Container byte ranges ─────────────────────────────────────────────────────
 //
@@ -88,39 +88,46 @@ namespace Json {
 //
 // ── Path tracking ─────────────────────────────────────────────────────────────
 //
-// Construct with track_paths=true and call buildPaths(depth, indexed, pattern)
-// from within any callback to obtain dot-notation path strings for the current
-// position:
-//   indexed_path  "messages[0].role"   — concrete index, for per-element keys
-//   pattern_path  "messages[].role"    — wildcard index, for config matching
+// Construct with track_paths=true and call buildIndexedPath(depth) or
+// buildPatternPath(depth) from within any callback to obtain dot-notation
+// path strings for the current position:
+//   buildIndexedPath → "messages[0].role"  — concrete index, for per-element keys
+//   buildPatternPath → "messages[].role"   — wildcard index, for config matching
 //
 class WuffsJsonCursor {
 public:
-  enum class ScalarKind { kNumber, kLiteral };
-
   // Handler — callback interface implemented by the JSON document consumer.
   //
   // All callbacks are invoked synchronously from within feed().
   //
-  //   selectStringTarget(key, depth)
+  //   openStringCapture(key, depth, tok_start)
   //     Called at the start of every non-key string value chain.
+  //     Returns a handler-owned buffer for the cursor to write decoded UTF-8
+  //     into, or nullptr to discard this string at zero cost — no allocation,
+  //     no further callbacks for this value.
   //     `key` is the dict key for this value, or "" for array elements.
-  //     Return a std::string* to accumulate decoded characters into, or nullptr
-  //     to discard the value without any heap allocation.
+  //     `tok_start` is the byte offset of the opening " in the body stream.
+  //
+  //   closeStringCapture(target, key, depth, tok_end)
+  //     Called when a non-key string chain completes.  `target` is the same
+  //     pointer returned by openStringCapture(); it is never null here.
+  //     `tok_end` is the byte offset immediately past the closing ".
   //
   //   onKey(key, depth)
-  //     Called when a key string chain completes.  Return a non-OK Status to
-  //     abort parsing (e.g. duplicate-key detection).
+  //     Called when a dict key completes.  Return a non-OK Status to abort
+  //     parsing (e.g. duplicate-key detection).
   //
-  //   onStringComplete(target, depth)
-  //     Called when a non-key string chain completes.  `target` is the same
-  //     pointer returned by selectStringTarget(); it is never null here.
-  //
-  //   onScalar(key, raw, kind, depth)
-  //     Called for NUMBER and LITERAL (true/false/null) tokens.
-  //     `key` is the dict key for this value, or "" for array elements.
-  //     `raw` is the source bytes; `kind` distinguishes NUMBER from LITERAL.
+  //   onNumber(key, raw, depth)
+  //     Called for JSON number literals (integer or floating-point).
+  //     `raw` is the source bytes; parse with absl::SimpleAtoi / SimpleAtod.
   //     Return a non-OK Status to abort parsing.
+  //
+  //   onBoolean(key, value, depth)
+  //     Called for JSON true / false literals.
+  //     Return a non-OK Status to abort parsing.
+  //
+  //   onNull(key, depth)
+  //     Called for JSON null literals.
   //
   //   onContainerOpen(key, is_dict, depth, tok_start)
   //     Called after depth has been incremented for a { or [ open.
@@ -135,14 +142,48 @@ public:
   class Handler {
   public:
     virtual ~Handler() = default;
-    virtual std::string* selectStringTarget(absl::string_view key, int depth) = 0;
+    // Called once at the opening '"' of every non-key string value, before any
+    // content bytes are written.  This is the routing decision point: the handler
+    // inspects `key` and `depth` and decides where — or whether — to capture the value.
+    //
+    // Return a handler-owned std::string* buffer: the cursor appends all decoded
+    // UTF-8 bytes (plain text and backslash escapes) into that buffer across
+    // however many Wuffs tokens or feed() calls the string spans.  When the
+    // closing '"' is seen, closeStringCapture fires with the same pointer and the
+    // buffer holds the complete value.
+    //
+    // Return nullptr to discard: every subsequent STRING and UNICODE_CODE_POINT
+    // token for this string skips the write guard `if (str_target_)`, so no bytes
+    // are written, no allocation occurs, and closeStringCapture is never called —
+    // genuinely zero cost regardless of how large the string is.
+    //
+    // IMPORTANT — decoded UTF-8, not raw JSON bytes:
+    // The buffer receives fully decoded UTF-8.  Wuffs never emits escape sequences
+    // as STRING tokens — it decodes them into UNICODE_CODE_POINT tokens and the
+    // cursor converts those to UTF-8 before appending (e.g. \n → 0x0A, \uXXXX →
+    // the corresponding UTF-8 byte sequence).  This is correct for semantic use
+    // cases: authzm routing decisions, keyword matching, logging.  However, if you
+    // intend to re-serialize the captured value back to JSON, you must re-escape it.
+    // For verbatim forwarding of large string values (e.g. message content), prefer
+    // byte ranges via onContainerOpen/onContainerClose on the parent container —
+    // those capture raw JSON bytes from the original buffer without any decoding.
+    //
+    // `key`       — dict key immediately left of this value, or "" for array elements.
+    // `depth`     — nesting depth of this string value.
+    // `tok_start` — byte offset of the opening '"' in the body stream.
+    virtual std::string* absl_nullable openStringCapture(absl::string_view key, int depth,
+                                                         size_t tok_start) = 0;
+    virtual void         closeStringCapture(std::string* target, absl::string_view key,
+                                          int depth, size_t tok_end) = 0;
     virtual absl::Status onKey(absl::string_view key, int depth) = 0;
-    virtual void onStringComplete(std::string* target, int depth) = 0;
-    virtual absl::Status onScalar(absl::string_view key, absl::string_view raw,
-                                  ScalarKind kind, int depth) = 0;
-    virtual void onContainerOpen(absl::string_view key, bool is_dict, int depth,
-                                 size_t tok_start) = 0;
-    virtual void onContainerClose(int depth, size_t tok_end) = 0;
+    // JSON scalar types: number, boolean (true/false), and null.
+    // These are the only non-string, non-container value types in JSON.
+    virtual absl::Status onNumber(absl::string_view key, absl::string_view raw, int depth) = 0;
+    virtual absl::Status onBoolean(absl::string_view key, bool value, int depth) = 0;
+    virtual void         onNull(absl::string_view key, int depth) = 0;
+    virtual void         onContainerOpen(absl::string_view key, bool is_dict, int depth,
+                                         size_t tok_start) = 0;
+    virtual void         onContainerClose(int depth, size_t tok_end) = 0;
   };
 
   explicit WuffsJsonCursor(Handler& handler, bool track_paths = false);
@@ -152,13 +193,15 @@ public:
   absl::Status feed(absl::string_view chunk, bool closed);
 
   // Build dot-notation path strings for the field currently being selected.
-  // indexed_path: e.g. "messages[0].role"   pattern_path: e.g. "messages[].role"
+  // Return a dot-notation path string for the current cursor position.
   // Must only be called from within a Handler callback while feed() is active.
-  void buildPaths(int depth, std::string& indexed_path, std::string& pattern_path) const;
+  // Requires track_paths=true at construction.
+  std::string buildIndexedPath(int depth) const;  // e.g. "messages[0].role"
+  std::string buildPatternPath(int depth) const;  // e.g. "messages[].role"
 
   // Monotonically increasing byte offset of the next source byte to be consumed.
   // Matches the tok_start / tok_end values delivered to onContainerOpen / onContainerClose.
-  size_t srcPos() const { return body_src_pos_; }
+  size_t nextSrcPos() const { return body_src_pos_; }
 
 private:
   Handler& handler_;
@@ -172,7 +215,8 @@ private:
   size_t body_src_pos_{0};
   bool   wuffs_done_{false};
 
-  static constexpr int kMaxDepth = 8;
+  static constexpr int    kMaxDepth    = 8;
+  static constexpr size_t kMaxKeyBytes = 256;
   int  depth_{0};
   bool is_dict_[kMaxDepth]{};
   bool expecting_key_[kMaxDepth]{};
@@ -183,11 +227,11 @@ private:
   // push_key_[d]    — key at depth d-1 that opened the container at depth d;
   //                   captured at push time.  Size kMaxDepth+1 so push_key_[kMaxDepth]
   //                   is accessible when depth_ reaches kMaxDepth.
-  //                   Only maintained when track_paths_=true (used by buildPaths).
+  //                   Only maintained when track_paths_=true (used by buildIndexedPath/buildPatternPath).
   // array_index_[d] — count of elements already completed at array depth d;
   //                   reset to 0 on container open, incremented on container close
   //                   when the parent container is an array.
-  //                   Only maintained when track_paths_=true (used by buildPaths).
+  //                   Only maintained when track_paths_=true (used by buildIndexedPath).
   std::string key_stack_[kMaxDepth]{};
   std::string push_key_[kMaxDepth + 1]{};
   int         array_index_[kMaxDepth]{};

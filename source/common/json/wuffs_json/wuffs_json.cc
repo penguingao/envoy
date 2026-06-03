@@ -67,6 +67,15 @@ WuffsJsonCursor::WuffsJsonCursor(Handler& handler, bool track_paths)
 //                A single logical string may span multiple tokens if Wuffs fills
 //                tok_buf_ before the closing quote; the `cont` flag
 //                (token__continued) is true on all but the last segment.
+//                On the first token of a new value string (!in_chain_),
+//                openStringCapture is called — the handler inspects key+depth and
+//                returns a handler-owned buffer pointer (stored as str_target_), or
+//                nullptr to discard.  Every subsequent STRING token for the same
+//                string appends to *str_target_ if non-null, or skips if nullptr —
+//                zero cost regardless of string length.  On the last token
+//                (cont=false), closeStringCapture fires with the same str_target_.
+//                Key strings bypass openStringCapture: they accumulate into the
+//                internal str_acc_ buffer and fire onKey on completion.
 //                vbd bits used by appendStringToken:
 //                  VBD__STRING__CONVERT_0_DST_1_SRC_DROP  — opening/closing quote
 //                  VBD__STRING__CONVERT_1_DST_1_SRC_COPY  — plain ASCII bytes
@@ -76,9 +85,10 @@ WuffsJsonCursor::WuffsJsonCursor(Handler& handler, bool track_paths)
 //                A decoded escape sequence (\n, \t, \uXXXX, …).  vbd holds the
 //                Unicode code point value directly.  The token's length covers
 //                the raw escape bytes in the source (e.g. 2 bytes for "\n").
-//                Appended to *str_target_ as UTF-8; in_chain_ is NOT updated
-//                here because its lifecycle is managed by the surrounding STRING
-//                tokens.
+//                Decoded to UTF-8 and appended to *str_target_ (same pointer
+//                openStringCapture returned); skipped silently if str_target_ is
+//                nullptr.  in_chain_ is NOT updated here — its lifecycle is
+//                managed by the surrounding STRING tokens.
 //     NUMBER     A JSON number literal (integer or floating-point).
 //                Raw bytes forwarded to onScalar(kNumber) — handler parses with
 //                absl::SimpleAtoi / absl::SimpleAtod.
@@ -174,26 +184,37 @@ absl::Status WuffsJsonCursor::feed(absl::string_view chunk, bool closed) {
       case WUFFS_BASE__TOKEN__VBC__STRING: {
         const absl::string_view raw = chunk.substr(tok_start - chunk_base, tlen);
         if (!in_chain_) {
+          // First token of a new string: decide key vs. value and pick write target.
           str_acc_.clear();
-          // expecting_key_ distinguishes key strings from value strings at dict depths.
           string_is_key_ = depth_ < kMaxDepth && is_dict_[depth_] && expecting_key_[depth_];
-          // For value strings, key_stack_[depth_] holds the key set by the preceding
-          // onKey call — always current because onKey fires before the value begins.
-          const absl::string_view val_key =
-              (!string_is_key_ && depth_ < kMaxDepth && is_dict_[depth_])
-                  ? absl::string_view(key_stack_[depth_]) : absl::string_view();
-          str_target_ = string_is_key_ ? &str_acc_ : handler_.selectStringTarget(val_key, depth_);
-        }
-        if (str_target_ && tlen > 0)
-          appendStringToken(*str_target_, raw, vbd);
-        in_chain_ = cont;
-        if (!cont) {
           if (string_is_key_) {
+            str_target_ = &str_acc_;
+          } else {
+            // key_stack_[depth_] is always current here — onKey fired before this value.
+            const absl::string_view val_key =
+                (depth_ < kMaxDepth && is_dict_[depth_])
+                    ? absl::string_view(key_stack_[depth_]) : absl::string_view();
+            str_target_ = handler_.openStringCapture(val_key, depth_, tok_start);
+          }
+        }
+        if (str_target_ && tlen > 0) appendStringToken(*str_target_, raw, vbd);
+        in_chain_ = cont;
+        if (!in_chain_) {
+          if (string_is_key_) {
+            if (str_acc_.size() > kMaxKeyBytes) {
+              return absl::InvalidArgumentError(absl::StrCat(
+                  "wuffs json: key exceeds ", kMaxKeyBytes, " bytes"));
+            }
             if (depth_ < kMaxDepth) key_stack_[depth_] = str_acc_;
             if (auto s = handler_.onKey(str_acc_, depth_); !s.ok()) return s;
             if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
           } else {
-            if (str_target_) handler_.onStringComplete(str_target_, depth_);
+            if (str_target_) {
+              const absl::string_view val_key =
+                  (depth_ < kMaxDepth && is_dict_[depth_])
+                      ? absl::string_view(key_stack_[depth_]) : absl::string_view();
+              handler_.closeStringCapture(str_target_, val_key, depth_, body_src_pos_);
+            }
             if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
           }
           str_target_ = nullptr;
@@ -208,16 +229,21 @@ absl::Status WuffsJsonCursor::feed(absl::string_view chunk, bool closed) {
         if (str_target_) appendCodePoint(*str_target_, static_cast<uint32_t>(vbd));
         break;
 
-      // NUMBER / LITERAL: forward raw bytes to the handler for domain parsing.
+      // NUMBER / LITERAL: dispatch to typed callbacks so the handler never
+      // sees raw Wuffs token category constants.
       case WUFFS_BASE__TOKEN__VBC__NUMBER:
       case WUFFS_BASE__TOKEN__VBC__LITERAL: {
-        const ScalarKind kind = (vbc == WUFFS_BASE__TOKEN__VBC__NUMBER)
-                                    ? ScalarKind::kNumber : ScalarKind::kLiteral;
         const absl::string_view val_key =
             (depth_ < kMaxDepth && is_dict_[depth_])
                 ? absl::string_view(key_stack_[depth_]) : absl::string_view();
-        if (auto s = handler_.onScalar(val_key, chunk.substr(tok_start - chunk_base, tlen),
-                                       kind, depth_); !s.ok()) return s;
+        const absl::string_view raw = chunk.substr(tok_start - chunk_base, tlen);
+        if (vbc == WUFFS_BASE__TOKEN__VBC__NUMBER) {
+          if (auto s = handler_.onNumber(val_key, raw, depth_); !s.ok()) return s;
+        } else if (raw == "true" || raw == "false") {
+          if (auto s = handler_.onBoolean(val_key, raw[0] == 't', depth_); !s.ok()) return s;
+        } else {
+          handler_.onNull(val_key, depth_);
+        }
         if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
         break;
       }
@@ -238,29 +264,39 @@ absl::Status WuffsJsonCursor::feed(absl::string_view chunk, bool closed) {
   return absl::OkStatus();
 }
 
-void WuffsJsonCursor::buildPaths(int depth, std::string& indexed_path,
-                                  std::string& pattern_path) const {
-  indexed_path.clear();
-  pattern_path.clear();
+std::string WuffsJsonCursor::buildIndexedPath(int depth) const {
+  std::string path;
   for (int d = 1; d <= depth && d < kMaxDepth; ++d) {
     if (is_dict_[d]) {
       // At the target depth, key_stack_[d] is the key currently being processed.
       // At intermediate depths, the label is the key that opened the child container
       // at d+1, stored in push_key_[d+1] at push time.
       const std::string& label = (d == depth) ? key_stack_[d] : push_key_[d + 1];
-      if (!indexed_path.empty()) indexed_path += '.';
-      if (!pattern_path.empty()) pattern_path += '.';
-      indexed_path += label;
-      pattern_path += label;
+      if (!path.empty()) path += '.';
+      path += label;
     } else {
       // array_index_[d] is the count of elements completed so far at this depth,
       // which equals the 0-based index of the element currently being processed.
-      indexed_path += '[';
-      indexed_path += std::to_string(array_index_[d]);
-      indexed_path += ']';
-      pattern_path += "[]";
+      path += '[';
+      path += std::to_string(array_index_[d]);
+      path += ']';
     }
   }
+  return path;
+}
+
+std::string WuffsJsonCursor::buildPatternPath(int depth) const {
+  std::string path;
+  for (int d = 1; d <= depth && d < kMaxDepth; ++d) {
+    if (is_dict_[d]) {
+      const std::string& label = (d == depth) ? key_stack_[d] : push_key_[d + 1];
+      if (!path.empty()) path += '.';
+      path += label;
+    } else {
+      path += "[]";
+    }
+  }
+  return path;
 }
 
 } // namespace Json

@@ -1044,6 +1044,11 @@ def _wuffs():
         build_file_content = """
 cc_library(
     name = "wuffs",
+    # Wuffs uses an amalgamated single-file distribution: wuffs-v0.4.c acts as
+    # a header (declarations only) when included without WUFFS_IMPLEMENTATION,
+    # and as a full implementation when WUFFS_IMPLEMENTATION is defined (done
+    # in exactly one TU: wuffs_impl.c).  Listed as hdrs so dependent targets
+    # may #include it.
     hdrs = ["release/c/wuffs-v0.4.c"],
     visibility = ["//visibility:public"],
     copts = ["-Wno-unused-function"],

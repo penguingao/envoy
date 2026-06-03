@@ -18,7 +18,7 @@ struct CapturingHandler : WuffsJsonCursor::Handler {
   struct Field {
     std::string key;
     std::string str_val;  // for string fields
-    std::string raw_val;  // for scalars (NUMBER / LITERAL raw bytes)
+    std::string raw_val;  // for scalars (number / bool / null as string)
     bool is_string{false};
     bool is_scalar{false};
   };
@@ -27,8 +27,15 @@ struct CapturingHandler : WuffsJsonCursor::Handler {
   std::string pending_key_;
   std::string pending_str_;
 
-  std::string* selectStringTarget(absl::string_view /*key*/, int depth) override {
-    return (depth == 1) ? &pending_str_ : nullptr;
+  std::string* openStringCapture(absl::string_view /*key*/, int depth,
+                                   size_t /*tok_start*/) override {
+    if (depth == 1) { pending_str_.clear(); return &pending_str_; }
+    return nullptr;
+  }
+
+  void closeStringCapture(std::string* target, absl::string_view /*key*/,
+                        int /*depth*/, size_t /*tok_end*/) override {
+    fields.push_back({pending_key_, *target, {}, /*is_string=*/true});
   }
 
   absl::Status onKey(absl::string_view key, int depth) override {
@@ -36,18 +43,21 @@ struct CapturingHandler : WuffsJsonCursor::Handler {
     return absl::OkStatus();
   }
 
-  void onStringComplete(std::string* /*target*/, int depth) override {
-    if (depth == 1) {
-      fields.push_back({pending_key_, pending_str_, {}, /*is_string=*/true});
-      pending_str_.clear();
-    }
-  }
-
-  absl::Status onScalar(absl::string_view /*key*/, absl::string_view raw,
-                        WuffsJsonCursor::ScalarKind /*kind*/, int depth) override {
+  absl::Status onNumber(absl::string_view /*key*/, absl::string_view raw, int depth) override {
     if (depth == 1)
       fields.push_back({pending_key_, {}, std::string(raw), {}, /*is_scalar=*/true});
     return absl::OkStatus();
+  }
+
+  absl::Status onBoolean(absl::string_view /*key*/, bool value, int depth) override {
+    if (depth == 1)
+      fields.push_back({pending_key_, {}, value ? "true" : "false", {}, /*is_scalar=*/true});
+    return absl::OkStatus();
+  }
+
+  void onNull(absl::string_view /*key*/, int depth) override {
+    if (depth == 1)
+      fields.push_back({pending_key_, {}, "null", {}, /*is_scalar=*/true});
   }
 
   void onContainerOpen(absl::string_view /*key*/, bool /*is_dict*/, int /*depth*/,
@@ -100,13 +110,12 @@ TEST(WuffsJsonCursorTest, StringEscapes) {
   EXPECT_EQ(h.fields[2].str_val, "A"); // U+0041
 }
 
-// Deeper-than-1 content is discarded (selectStringTarget returns nullptr).
+// Deeper-than-1 content is discarded (openStringCapture returns nullptr).
 TEST(WuffsJsonCursorTest, NestedObjectDiscarded) {
   CapturingHandler h;
   EXPECT_TRUE(parse(R"({"top":"v","nested":{"a":"b"}})", h).ok());
   // "top" is a depth-1 string → captured.
-  // "nested" value is a depth-1 push → onPush fired, but inner "a"/"b" at
-  // depth 2 have selectStringTarget return nullptr, so they are discarded.
+  // Inner "a"/"b" at depth 2 have openStringCapture return nullptr → discarded.
   ASSERT_EQ(h.fields.size(), 1u);
   EXPECT_EQ(h.fields[0].str_val, "v");
 }
