@@ -90,11 +90,9 @@ WuffsJsonCursor::WuffsJsonCursor(Handler& handler, bool track_paths)
 //                nullptr.  in_chain_ is NOT updated here — its lifecycle is
 //                managed by the surrounding STRING tokens.
 //     NUMBER     A JSON number literal (integer or floating-point).
-//                Raw bytes forwarded to onScalar(kNumber) — handler parses with
-//                absl::SimpleAtoi / absl::SimpleAtod.
+//                Raw bytes forwarded to onNumber(key, raw, depth).
 //     LITERAL    One of: true, false, null.
-//                Raw bytes forwarded to onScalar(kLiteral) — handler compares
-//                raw == "true" / "false" / "null".
+//                Dispatched to onBoolean(key, value, depth) or onNull(key, depth).
 //
 //   vbd  (value_base_detail) — kind-specific bit flags (see vbc above).
 //
@@ -102,6 +100,20 @@ WuffsJsonCursor::WuffsJsonCursor(Handler& handler, bool track_paths)
 //        body_src_pos_ is advanced by tlen for every token regardless of vbc,
 //        giving a monotonically increasing byte counter.  onContainerOpen and
 //        onContainerClose deliver tok_start / tok_end from this counter.
+//
+// VBC dispatch summary
+// ────────────────────
+//   VBC constant        Meaning                           Action
+//   ─────────────────   ──────────────────────────────   ──────────────────────────────────────────
+//   FILLER              Whitespace, commas, colons        Advance body_src_pos_; no other action
+//   STRUCTURE           Object/array open or close        Manage depth_, is_dict_[], expecting_key_[];
+//                                                         record byte ranges for containers
+//   STRING              String content or quote delim     Gate on str_target_; DROP tokens skip,
+//                       (plain bytes only — no escapes)   COPY tokens append via appendStringToken
+//   UNICODE_CODE_POINT  Decoded backslash escape          Gate on str_target_; decode code point to
+//                       (\n, \t, \uXXXX, …)              UTF-8 and append via appendCodePoint
+//   NUMBER              Numeric literal                   Forward raw bytes to onNumber
+//   LITERAL             true / false / null               Dispatch to onBoolean or onNull
 //
 // Outer loop suspension
 // ─────────────────────
