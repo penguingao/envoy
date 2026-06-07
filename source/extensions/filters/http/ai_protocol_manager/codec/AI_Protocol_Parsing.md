@@ -70,14 +70,17 @@ Every `wuffs_json__decoder__decode_tokens()` call fills a 256-slot token ring. F
 
 ### `str_target_` null gate — the central memory safety mechanism
 
-At the start of each STRING chain, the parser calls `handler_.selectStringTarget(depth)`. If it returns `nullptr`, `appendStringToken` is never called — **zero heap allocated for that token regardless of its size**.
+At the start of each STRING chain, the parser calls `handler_.selectStringTarget(depth, tok_start)`. If it returns `nullptr`, `appendStringToken` is never called — **zero heap allocated for that token regardless of its size**.
 
 ```
 InferenceBodyParser:
-  depth 1, key == "model"    → &model_       (extract)
-  depth 1, key == "stop"     → &string_val_  (extract)
-  depth 2, in_stop_array_    → &string_val_  (extract)
-  anything else (depth 3+)   → nullptr       ← 0 bytes heap, unconditionally
+  depth 1, key == "model"              → &model_                      (extract)
+  depth 1, key == "stop"               → &string_val_                 (extract)
+  depth 1, key is passthrough          → &passthrough_string_scratch_ (range tracking)
+                                         tok_start saved to passthrough_string_start_
+  depth 2, in_stop_array_              → &string_val_                 (extract)
+  anything else (depth 2+ non-stop,    → nullptr       ← 0 bytes heap, unconditionally
+                 depth 3+)
 
 AgentBodyParser:
   depth 1, key == "id"       → &id_          (extract)
@@ -85,6 +88,11 @@ AgentBodyParser:
   depth 2, in_params_, known → &params_name_ / &params_uri_ / &params_ref_
   anything else (depth 3+)   → nullptr       ← 0 bytes heap, unconditionally
 ```
+
+`passthrough_string_scratch_` is a non-null sentinel: returning it from
+`selectStringTarget` ensures `onStringComplete` fires (so the range can be
+recorded), but the accumulated content is discarded. The byte range
+`[passthrough_string_start_, tok_end + 1)` in `residual_params` is what is kept.
 
 A 4 MB `content` value at depth 3 produces ~62 STRING tokens. All 62 are discarded before any allocation — the guarantee is structural, not flag-dependent.
 
@@ -216,12 +224,16 @@ Both `InferenceBodyParser` and `AgentBodyParser` are private inner classes of `R
 
 ```
 InferencePayload:
-  target.name     = model_        (std::string)
-  sampling        = sampling_     (SamplingParams)
-  streaming       = streaming_    (bool)
-  messages[]      = External refs (Tier 1 only)
-  tools[]         = External refs (Tier 1 only)
-  residual_params = External{0, body_size}
+  target.name        = model_        (std::string)
+  sampling           = sampling_     (SamplingParams)
+  streaming          = streaming_    (bool)
+  messages[]         = External refs (Tier 1 only)
+  tools[]            = External refs (Tier 1 only)
+  passthrough_fields = [(key, External ref), …]
+                       depth-1 fields not modelled as typed members
+                       e.g. response_format, tool_choice, stream_options, logit_bias, user…
+                       zero-copy sub-refs of residual_params via passthrough_ranges_
+  residual_params    = External{0, body_size}
 
 AgentPayload:
   invocation      = classified from rpc_method

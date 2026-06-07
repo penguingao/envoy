@@ -581,6 +581,14 @@ RequestDecoder
        │    std::vector<pair<size_t,size_t>>  tool_ranges_
        │    std::vector<PayloadKind>           tool_kinds_
        │
+       ├─ Passthrough field tracking (depth-1 fields not modelled as typed members)
+       │    bool        current_key_is_passthrough_              ← current depth-1 key is passthrough
+       │    std::string passthrough_string_scratch_              ← non-null sentinel; content discarded
+       │    size_t      passthrough_string_start_{0}             ← body offset of opening `"` (DROP token)
+       │    bool        in_passthrough_container_{false}         ← inside a passthrough depth-1 container
+       │    size_t      passthrough_container_start_{0}          ← body offset of container `{` or `[`
+       │    std::vector<tuple<string,size_t,size_t>>  passthrough_ranges_  ← (key, start, end) in residual
+       │
        ├─ Duplicate-key guards
        │    bool  seen_model_, seen_stream_, seen_messages_, seen_tools_
        │    bool  seen_temperature_, seen_top_p_, seen_max_tokens_, seen_n_
@@ -613,6 +621,9 @@ finish(payload, request):
   payload.residual_params = residual_writer_->finalize()
   for each message_ranges_[i]: makeSubRef → payload.messages.push_back(ref)
   for each tool_ranges_[i]:    makeSubRef → payload.tools.push_back(ref)
+  for each (key, start, end) in passthrough_ranges_:
+    makeSubRef(ref, start, end-start, residual_params)
+    payload.passthrough_fields.push_back({key, ref})
 ```
 
 ### 5.3 STRUCTURE token handling
@@ -656,14 +667,42 @@ if string_is_key_:
 
 else if depth_ == 1:
     current_key_ == "model"  → &model_
-    current_key_ == "stop"   → &string_val_    (single stop string at depth 1)
-    anything else            → nullptr          (discarded — e.g. "jsonrpc" value)
+    current_key_ == "stop"   → &string_val_                (single stop string at depth 1)
+    current_key_is_passthrough_       → &passthrough_string_scratch_
+                                          (non-null sentinel; tok_start saved to
+                                           passthrough_string_start_ for range tracking)
+    anything else            → nullptr          (discarded — should not be reachable)
 
 else if depth_ == 2 && in_stop_array_:
     str_target_ = &string_val_        (array stop string element)
 
 else:
     nullptr                            (discarded unconditionally — depth 3+ values: 0 bytes)
+```
+
+`current_key_is_passthrough_` is true for any depth-1 key that is not one of the
+extracted scalars (`model`, `stream`, `messages`, `tools`, `temperature`, `top_p`,
+`max_tokens`, `n`, `seed`, `stop`). Examples: `response_format`, `tool_choice`,
+`stream_options`, `logit_bias`, `user`, `metadata`, etc.
+
+For passthrough strings, `selectStringTarget` is called with a `tok_start` argument.
+Because the first STRING token for a value uses the DROP VBD flag and covers the
+opening `"` itself, `tok_start` is exactly the position of the opening `"` in the
+raw body — no offset adjustment needed:
+
+```cpp
+passthrough_string_start_ = tok_start;   // first DROP token IS the opening `"`
+passthrough_string_scratch_.clear();
+return &passthrough_string_scratch_;     // non-null: ensures onStringComplete fires
+```
+
+`onStringComplete` records the final range:
+
+```cpp
+if (target == &passthrough_string_scratch_ && depth == 1) {
+    // tok_end is the position of the closing `"` (1-byte FILLER); +1 for exclusive end
+    passthrough_ranges_.push_back({current_key_, passthrough_string_start_, tok_end + 1});
+}
 ```
 
 When a stop string chain completes (`str_target_ == &string_val_`), the completed
@@ -2286,35 +2325,50 @@ params->addRawJson(convertPayloadRefToString(payload->arguments, request));
 
 Same verbatim path. The arguments object is forwarded opaquely.
 
-**Inference `messages[]` and `tools[]` (per-element re-parse):**
+**Inference `messages[]` and `tools[]` (verbatim `addRawJson`):**
 
 ```cpp
-// request_encoder.cc — encodeInferenceBody, step 3/4
-auto elem = json::parse(convertPayloadRefToString(ref, request), nullptr,
-                        /*allow_exceptions=*/false);
-msgs.push_back(std::move(elem));
+// request_encoder.cc — encodeInferenceBody
+for (const auto& ref : payload->messages) {
+    if (!ref.empty())
+        msgs->addRawJson(convertPayloadRefToString(ref, request));
+}
 ```
 
-Each element is re-parsed with `json::parse` and re-serialised. This differs from
-the agent path because the Q2 chain phase may have mutated individual
-`messages[]` or `tools[]` entries by writing a new PayloadRef (e.g. a content
-moderation filter replacing a message). The encoder must re-serialise whatever
-the filter left in the ref, so a DOM round-trip per element is required. The full
-array is never accumulated simultaneously — one element at a time, O(element_size)
-peak heap.
+Each element is forwarded verbatim with `addRawJson` — identical to the agent path
+for `params_raw` and `arguments`. No `json::parse` or re-serialisation occurs.
+The `PayloadRef` for each element is a sub-range of `residual_params` (External
+on the mmap path), so `convertPayloadRefToString` returns the original bytes after
+the prefetch step materialises them.
 
-### 18.5 Why `params_raw` and `arguments` can be verbatim but `messages[]` cannot
+**Inference passthrough fields (`response_format`, `tool_choice`, `stream_options`, …):**
 
-The asymmetry comes from the mutation model:
+```cpp
+// request_encoder.cc — encodeInferenceBody
+for (const auto& [key, value_ref] : payload->passthrough_fields) {
+    root->addKey(key);
+    root->addRawJson(convertPayloadRefToString(value_ref, request));
+}
+```
 
-- **Agent params** are mutated via typed fields (`tool_name`, `resource_uri`,
-  `prompt_name`). The encoder rebuilds `params` from those fields for Category A
-  invocations. For Category B, nothing in the chain touches the raw params blob —
-  it is forwarded as-is.
-- **Inference messages[]** are mutable at the element level (Q2 `onRequestItem`
-  phase). A filter may rewrite the content of a single message without touching
-  others. The ref for that element gets a new value; the encoder must pick it up.
-  Re-parsing each element is the only way to handle that correctly.
+Depth-1 fields not modelled as typed members are captured by the decoder as
+byte-range sub-refs of `residual_params` and replayed verbatim here. This replaces
+the earlier approach of re-parsing the full `residual_params` DOM to harvest
+unmodelled fields.
+
+### 18.5 How all fields reach upstream without a DOM round-trip
+
+Both agent and inference encoders are now fully DOM-free for the OpenAI pass-through
+path:
+
+| Field class | Encoder path |
+|---|---|
+| Extracted scalars (`model`, `stream`, `sampling`) | Written directly via `Json::StringStreamer` — no parse |
+| `messages[]` / `tools[]` elements | `addRawJson(ref)` — verbatim bytes from mmap sub-ref |
+| Passthrough depth-1 fields (`response_format`, etc.) | `addRawJson(ref)` — verbatim bytes from `passthrough_ranges_` sub-refs |
+| Agent `params_raw` / `arguments` | `addRawJson(ref)` — verbatim bytes (unchanged) |
+
+The Anthropic encoder remains DOM-based by design (see §19.1).
 
 ### 18.6 End-to-end flow summary
 
@@ -2324,10 +2378,12 @@ decodeData chunks arrive
     ▼ MmapStreamWriter::append()
     │   raw bytes → mmap fd; body_src_pos_ advances per token
     │   element [start, end) pairs recorded at push/pop events
+    │   passthrough_ranges_ populated for unknown depth-1 fields
     ▼
 onEndStream → finish()
     │   makeSubRef(): PayloadRef::External{mmap_offset, length}
-    │   two integers; no copy, no parse
+    │   two integers per ref; no copy, no parse
+    │   passthrough_fields populated from passthrough_ranges_
     ▼
 dispatch() → prefetchExternalPayloadRefs()
     │   detached pread() thread per External ref
@@ -2335,39 +2391,53 @@ dispatch() → prefetchExternalPayloadRefs()
     │   External → Buffered in-place; on_done() fires when all complete
     ▼
 RequestEncoder::encode*Body()
-    ├── params_raw / arguments  → addRawJson()   verbatim, zero interpretation
-    └── messages[] / tools[]    → json::parse() per element + re-serialize
-                                  (supports per-element chain-filter mutations)
+    ├── extracted scalars (model, stream, sampling) → Json::StringStreamer directly
+    ├── messages[] / tools[]    → addRawJson()   verbatim, zero interpretation
+    ├── passthrough_fields       → addRawJson()   verbatim, zero interpretation
+    └── params_raw / arguments  → addRawJson()   verbatim, zero interpretation
 ```
 
 ---
 
 ## 19. TODOs and open questions
 
-### 19.1 Inference encoder: eliminate per-element `json::parse()` in the encode path
+### 19.1 Inference encoder: eliminate per-element `json::parse()` in the encode path — **DONE**
 
-**Current behaviour.** `RequestEncoder::encodeInferenceBody` seeds the output from
-`residual_params` (the full original body parsed into a nlohmann DOM), overlays
-extracted scalars, then re-inserts each `messages[]`/`tools[]` element by calling
-`json::parse(convertPayloadRefToString(ref, request))` per element. This means two
-copies per element on the event-loop thread: one in the `pread()` prefetch (off
-event loop), and one in `json::parse()` (on event loop).
+**Resolved.** `RequestEncoder::encodeInferenceBody` now uses `Json::StringStreamer`
+throughout. Extracted scalars are written directly; `messages[]`/`tools[]` elements
+and passthrough depth-1 fields are inserted with `addRawJson` from their
+`PayloadRef` sub-refs — the same path the agent encoder uses for `params_raw` and
+`arguments`. No `json::parse` or `nlohmann` DOM is involved.
 
-**Why it exists.** The "seed from residual" approach preserves every unmodeled field
-(`response_format`, `tool_choice`, `stream_options`, `user`, …) without the encoder
-needing to enumerate them. Once the output is being built as a nlohmann DOM, raw
-bytes cannot be inserted without parsing — nlohmann requires `json` values.
+Unmodelled depth-1 fields (`response_format`, `tool_choice`, `stream_options`, …)
+are captured during the decode pass as byte-range sub-refs in
+`InferencePayload::passthrough_fields` (populated via `passthrough_ranges_` in
+`finish()`) and replayed verbatim. Adding a newly-modelled field requires only: (a)
+adding it to `isExtractedInferenceKey()` so the decoder skips it in passthrough, and
+(b) writing it explicitly in the encoder.
 
-**The alternative.** Switch to a streaming writer (`Json::StringStreamer`) for
-inference bodies, calling `addRawJson(element_bytes)` for each messages[]/tools[]
-element — the same path the agent encoder uses for `params_raw` and `arguments`.
-The trade-off: the encoder would have to explicitly re-emit every OpenAI field it
-wants to preserve, losing the implicit round-trip for fields the proxy has not
-modelled yet.
+### 19.2 Anthropic encoder: replace two `json::parse(residual_params)` with `passthrough_fields` scan
 
-**TODO:** Evaluate whether the streaming-writer approach is viable given the current
-set of modelled OpenAI fields. If the field set is stable and enumerable, switching
-would make the inference encode path truly zero-copy end-to-end (after prefetch).
+**Current behaviour.** `anthropic_request_encoder.cc` calls `json::parse(residual_params)`
+twice — once at line ~355 (to read `prompt` for the legacy Completions endpoint) and
+once at lines ~393–406 (to read `tool_choice`, `top_k`, `metadata`). These fields are
+now present in `InferencePayload::passthrough_fields` from the decode pass, making the
+full-body re-parses redundant.
+
+**The fix.** Replace both blocks with a linear scan of `payload->passthrough_fields`:
+
+```cpp
+for (const auto& [key, ref] : payload->passthrough_fields) {
+    if (key == "tool_choice") { ... }
+    else if (key == "top_k")  { ... }
+    else if (key == "metadata") { ... }
+}
+```
+
+O(n) where n ≤ 10 (typical number of depth-1 passthrough fields). Eliminates two
+full DOM parses of the request body on the Anthropic path.
+
+**TODO:** Implement the scan-based replacement in `anthropic_request_encoder.cc`.
 
 ---
 
@@ -2417,7 +2487,7 @@ at its **first byte**, inside `WuffsJsonCursor::feed()`:
 if (!in_chain_) {
   str_acc_.clear();
   string_is_key_ = depth_ < kMaxDepth && is_dict_[depth_] && expecting_key_[depth_];
-  str_target_    = string_is_key_ ? &str_acc_ : handler_.selectStringTarget(depth_);
+  str_target_    = string_is_key_ ? &str_acc_ : handler_.selectStringTarget(depth_, tok_start);
 }
 if (str_target_ && tlen > 0)
   appendStringToken(*str_target_, raw, vbd);   // only executes when non-null
@@ -2427,14 +2497,19 @@ if (str_target_ && tlen > 0)
 small set of routing fields:
 
 ```cpp
-std::string* selectStringTarget(int depth) override {
+std::string* selectStringTarget(int depth, size_t tok_start) override {
   if (depth == 1) {
     if      (current_key_ == "model") return &model_;
     else if (current_key_ == "stop")  return &string_val_;
+    else if (current_key_is_passthrough_) {
+      passthrough_string_start_ = tok_start;  // DROP token covers opening `"`
+      passthrough_string_scratch_.clear();
+      return &passthrough_string_scratch_;    // non-null sentinel
+    }
   } else if (depth == 2 && in_stop_array_) {
     return &string_val_;
   }
-  return nullptr;   // all depth-2+ values, all depth-3+ content
+  return nullptr;   // all other depth-2+ values, all depth-3+ content
 }
 ```
 
