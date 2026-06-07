@@ -164,6 +164,7 @@ absl::Status WuffsJsonCursor::feed(absl::string_view chunk, bool closed) {
         if (is_push) {
           ++depth_;
           if (depth_ < kMaxDepth) {
+            seen_keys_[depth_].clear();
             is_dict_[depth_]       = to_dict;
             expecting_key_[depth_] = to_dict;
             if (!to_dict) array_index_[depth_] = 0;
@@ -201,6 +202,7 @@ absl::Status WuffsJsonCursor::feed(absl::string_view chunk, bool closed) {
           string_is_key_ = depth_ < kMaxDepth && is_dict_[depth_] && expecting_key_[depth_];
           if (string_is_key_) {
             str_target_ = &str_acc_;
+            key_tok_start_ = tok_start;
           } else {
             // key_stack_[depth_] is always current here — onKey fired before this value.
             const absl::string_view val_key =
@@ -217,8 +219,12 @@ absl::Status WuffsJsonCursor::feed(absl::string_view chunk, bool closed) {
               return absl::InvalidArgumentError(absl::StrCat(
                   "wuffs json: key exceeds ", kMaxKeyBytes, " bytes"));
             }
+            if (depth_ < kMaxDepth && !seen_keys_[depth_].insert(str_acc_).second) {
+              return absl::InvalidArgumentError(
+                  absl::StrCat("wuffs json: duplicate key \"", str_acc_, "\""));
+            }
             if (depth_ < kMaxDepth) key_stack_[depth_] = str_acc_;
-            if (auto s = handler_.onKey(str_acc_, depth_); !s.ok()) return s;
+            if (auto s = handler_.onKey(str_acc_, depth_, key_tok_start_); !s.ok()) return s;
             if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
           } else {
             if (str_target_) {
@@ -250,11 +256,11 @@ absl::Status WuffsJsonCursor::feed(absl::string_view chunk, bool closed) {
                 ? absl::string_view(key_stack_[depth_]) : absl::string_view();
         const absl::string_view raw = chunk.substr(tok_start - chunk_base, tlen);
         if (vbc == WUFFS_BASE__TOKEN__VBC__NUMBER) {
-          if (auto s = handler_.onNumber(val_key, raw, depth_); !s.ok()) return s;
+          if (auto s = handler_.onNumber(val_key, raw, depth_, tok_start, body_src_pos_); !s.ok()) return s;
         } else if (raw == "true" || raw == "false") {
-          if (auto s = handler_.onBoolean(val_key, raw[0] == 't', depth_); !s.ok()) return s;
+          if (auto s = handler_.onBoolean(val_key, raw[0] == 't', depth_, tok_start, body_src_pos_); !s.ok()) return s;
         } else {
-          handler_.onNull(val_key, depth_);
+          handler_.onNull(val_key, depth_, tok_start, body_src_pos_);
         }
         if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
         break;

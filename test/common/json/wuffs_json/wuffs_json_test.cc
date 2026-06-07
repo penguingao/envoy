@@ -38,24 +38,27 @@ struct CapturingHandler : WuffsJsonCursor::Handler {
     fields.push_back({pending_key_, *target, {}, /*is_string=*/true});
   }
 
-  absl::Status onKey(absl::string_view key, int depth) override {
+  absl::Status onKey(absl::string_view key, int depth, size_t /*tok_start*/) override {
     if (depth == 1) pending_key_ = std::string(key);
     return absl::OkStatus();
   }
 
-  absl::Status onNumber(absl::string_view /*key*/, absl::string_view raw, int depth) override {
+  absl::Status onNumber(absl::string_view /*key*/, absl::string_view raw, int depth,
+                        size_t /*tok_start*/, size_t /*tok_end*/) override {
     if (depth == 1)
       fields.push_back({pending_key_, {}, std::string(raw), {}, /*is_scalar=*/true});
     return absl::OkStatus();
   }
 
-  absl::Status onBoolean(absl::string_view /*key*/, bool value, int depth) override {
+  absl::Status onBoolean(absl::string_view /*key*/, bool value, int depth,
+                         size_t /*tok_start*/, size_t /*tok_end*/) override {
     if (depth == 1)
       fields.push_back({pending_key_, {}, value ? "true" : "false", {}, /*is_scalar=*/true});
     return absl::OkStatus();
   }
 
-  void onNull(absl::string_view /*key*/, int depth) override {
+  void onNull(absl::string_view /*key*/, int depth,
+              size_t /*tok_start*/, size_t /*tok_end*/) override {
     if (depth == 1)
       fields.push_back({pending_key_, {}, "null", {}, /*is_scalar=*/true});
   }
@@ -137,6 +140,28 @@ TEST(WuffsJsonCursorTest, StreamingAcrossChunks) {
 TEST(WuffsJsonCursorTest, InvalidJsonReturnsError) {
   CapturingHandler h;
   EXPECT_FALSE(parse("not json", h).ok());
+}
+
+TEST(WuffsJsonCursorTest, DuplicateKeyRejected) {
+  CapturingHandler h;
+  EXPECT_FALSE(parse(R"({"model":"gpt-4","model":"gpt-4o"})", h).ok());
+}
+
+TEST(WuffsJsonCursorTest, DuplicateKeyInNestedObjectRejected) {
+  CapturingHandler h;
+  EXPECT_FALSE(parse(R"({"x":{"a":1,"a":2}})", h).ok());
+}
+
+// Same key name at different nesting depths must not trigger a false positive.
+TEST(WuffsJsonCursorTest, SameKeyNameAtDifferentDepthsAllowed) {
+  CapturingHandler h;
+  EXPECT_TRUE(parse(R"({"a":{"a":1}})", h).ok());
+}
+
+// Same key name in sibling objects must not trigger a false positive.
+TEST(WuffsJsonCursorTest, SameKeyNameInSiblingObjectsAllowed) {
+  CapturingHandler h;
+  EXPECT_TRUE(parse(R"([{"a":1},{"a":2}])", h).ok());
 }
 
 } // namespace

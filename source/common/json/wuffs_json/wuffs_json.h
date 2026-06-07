@@ -5,6 +5,7 @@
 #include <string>
 
 #include "absl/base/nullability.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 
@@ -175,12 +176,23 @@ public:
                                                          size_t tok_start) = 0;
     virtual void         closeStringCapture(std::string* target, absl::string_view key,
                                           int depth, size_t tok_end) = 0;
-    virtual absl::Status onKey(absl::string_view key, int depth) = 0;
+    // `tok_start` is the byte offset of the opening '"' of the key in the body
+    // stream.  Combined with the tok_end delivered by the subsequent value
+    // callback (closeStringCapture, onNumber, onBoolean, onNull, or
+    // onContainerClose), it gives the half-open byte range [tok_start, tok_end)
+    // covering the complete "key":value field — suitable for verbatim passthrough
+    // without DOM parsing.
+    virtual absl::Status onKey(absl::string_view key, int depth, size_t tok_start) = 0;
     // JSON scalar types: number, boolean (true/false), and null.
-    // These are the only non-string, non-container value types in JSON.
-    virtual absl::Status onNumber(absl::string_view key, absl::string_view raw, int depth) = 0;
-    virtual absl::Status onBoolean(absl::string_view key, bool value, int depth) = 0;
-    virtual void         onNull(absl::string_view key, int depth) = 0;
+    // `tok_start` / `tok_end` delimit the scalar value token in the body stream.
+    // Together with the tok_start from the preceding onKey call they cover the
+    // complete "key":value field byte range.
+    virtual absl::Status onNumber(absl::string_view key, absl::string_view raw,
+                                  int depth, size_t tok_start, size_t tok_end) = 0;
+    virtual absl::Status onBoolean(absl::string_view key, bool value,
+                                   int depth, size_t tok_start, size_t tok_end) = 0;
+    virtual void         onNull(absl::string_view key, int depth,
+                                size_t tok_start, size_t tok_end) = 0;
     virtual void         onContainerOpen(absl::string_view key, bool is_dict, int depth,
                                          size_t tok_start) = 0;
     virtual void         onContainerClose(int depth, size_t tok_end) = 0;
@@ -235,11 +247,16 @@ private:
   std::string key_stack_[kMaxDepth]{};
   std::string push_key_[kMaxDepth + 1]{};
   int         array_index_[kMaxDepth]{};
+  // Tracks keys seen at each dict depth to detect and reject duplicates.
+  // Cleared on container open; flat_hash_set gives O(1) insert/lookup with
+  // one contiguous backing allocation (no per-node malloc unlike std::set).
+  absl::flat_hash_set<std::string> seen_keys_[kMaxDepth]{};
 
   bool         in_chain_{false};
   bool         string_is_key_{false};
   std::string  str_acc_;
   std::string* str_target_{nullptr};
+  size_t       key_tok_start_{0};
 };
 
 } // namespace Json

@@ -1,0 +1,131 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Wuffs JSON Parser Architecture" id="0">
+    <mxGraphModel dx="3088" dy="1211" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2200" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;" value="&lt;b&gt;&lt;font style=&quot;font-size:20px;&quot;&gt;Wuffs-Based AI Proxy JSON Parser — Architecture&lt;/font&gt;&lt;/b&gt;" vertex="1">
+          <mxGeometry height="40" width="1800" x="200" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="http_box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;                        fontSize=13;arcSize=8;" value="&lt;b&gt;HTTP Body Chunks&lt;/b&gt;&lt;br/&gt;chunk₁ | chunk₂ | … | chunkₙ &amp;nbsp;(last chunk: closed=true)" vertex="1">
+          <mxGeometry height="50" width="760" x="400" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="filter_box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;                        fontSize=11;arcSize=5;" value="&lt;b&gt;AiProtocolManagerFilter&lt;/b&gt;&lt;br/&gt;Classify protocol on headers &amp;nbsp;·&amp;nbsp; Feed each body chunk to parser &amp;nbsp;·&amp;nbsp; Signal end-of-stream on trailers" vertex="1">
+          <mxGeometry height="45" width="1060" x="250" y="165" as="geometry" />
+        </mxCell>
+        <mxCell id="a_http_filter" edge="1" parent="1" source="http_box" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=10;                        exitX=0.5;exitY=1;exitDx=0;exitDy=0;                        entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="filter_box" value="per chunk">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="parser_bg" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;                        verticalAlign=top;arcSize=3;fontSize=11;" value="&lt;b&gt;&lt;font style=&quot;font-size:13px;&quot;&gt;InferenceBodyParser / AgentBodyParser&lt;/font&gt;&lt;/b&gt;&lt;br/&gt;&lt;i&gt;implements WuffsJsonCursor::Handler&lt;/i&gt;" vertex="1">
+          <mxGeometry height="597" width="1540" x="80" y="240" as="geometry" />
+        </mxCell>
+        <mxCell id="a_filter_parser" edge="1" parent="1" source="filter_box" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=10;                        exitX=0.5;exitY=1;exitDx=0;exitDy=0;                        entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="parser_bg" value="onData(chunk)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="cursor_bg" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;                        verticalAlign=top;arcSize=5;fontSize=12;" value="&lt;b&gt;WuffsJsonCursor&lt;/b&gt;" vertex="1">
+          <mxGeometry height="490" width="820" x="110" y="310" as="geometry" />
+        </mxCell>
+        <mxCell id="mmap_write_box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;                        fontSize=10;verticalAlign=middle;arcSize=5;align=left;" value="&lt;b&gt;InferenceBodyParser: Persist each chunk to mmap Arena&lt;/b&gt; — bytes appended verbatim, no decode · byte offsets recorded → zero-copy sub-range refs · content never re-parsed or re-copied" vertex="1">
+          <mxGeometry height="33" width="820" x="110" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="wuffs_engine_box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;                        fontSize=10;verticalAlign=top;arcSize=5;align=left;" value="&lt;b&gt;Tokenize via Wuffs&lt;/b&gt;&lt;hr/&gt;&lt;b&gt;Streaming:&lt;/b&gt; parses each chunk as it arrives — no full-body buffering needed&lt;br/&gt;&lt;br/&gt;&lt;b&gt;Stateful resumption:&lt;/b&gt; coroutine picks up at the exact byte across chunk boundaries&lt;br/&gt;&lt;br/&gt;&lt;b&gt;Token-based, not DOM:&lt;/b&gt; no parse tree built; O(depth) memory regardless of document size; only captured fields are materialized" vertex="1">
+          <mxGeometry height="165" width="790" x="120" y="335" as="geometry" />
+        </mxCell>
+        <mxCell id="wuffs_safety" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f4e8;strokeColor=#6aaf6a;                        fontSize=10;align=left;fontStyle=0;" value="&lt;b&gt;Wuffs Memory Safety&lt;/b&gt; &amp;nbsp;·&amp;nbsp; ① &lt;b&gt;Compile-time verified&lt;/b&gt; — bounds &amp;amp; integer overflow proven correct by the Wuffs compiler; no runtime checks needed &amp;nbsp;·&amp;nbsp; ② &lt;b&gt;No dynamic allocation&lt;/b&gt; — fixed token ring; zero malloc/free during parsing &amp;nbsp;·&amp;nbsp; ③ &lt;b&gt;Stackless coroutines&lt;/b&gt; — all state in decoder struct; no recursion, no stack overflow possible" vertex="1">
+          <mxGeometry height="44" width="790" x="120" y="513" as="geometry" />
+        </mxCell>
+        <mxCell id="cont_note" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3e8ff;strokeColor=#9673a6;                        fontSize=10;align=left;fontStyle=0;" value="&lt;font color=&quot;#9673a6&quot;&gt;&lt;b&gt;Multi-token strings:&lt;/b&gt; a large string may span many tokens and multiple feed() calls — the cursor accumulates seamlessly until the closing quote is seen, then fires closeStringCapture.&lt;/font&gt;" vertex="1">
+          <mxGeometry height="30" width="790" x="120" y="565" as="geometry" />
+        </mxCell>
+        <mxCell id="dup_key_box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;                        fontSize=10;verticalAlign=middle;align=left;arcSize=5;" value="&lt;b&gt;Duplicate Key Prevention&lt;/b&gt; — one flat_hash_set per depth (seen_keys_[kMaxDepth]); cleared on every container open · if a key is already in the set, feed() returns InvalidArgumentError before onKey fires · unconditional: all handlers protected automatically" vertex="1">
+          <mxGeometry height="32" width="790" x="120" y="600" as="geometry" />
+        </mxCell>
+        <mxCell id="a_wuffs_vbc" edge="1" parent="1" source="wuffs_engine_box" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=10;                        exitX=0.5;exitY=1;exitDx=0;exitDy=0;                        entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="vbc_header" value="emits tokens">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="vbc_header" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;                        verticalAlign=middle;fontSize=12;fontStyle=1;" value="&lt;b&gt;Token Dispatch&lt;/b&gt;" vertex="1">
+          <mxGeometry height="25" width="820" x="110" y="655" as="geometry" />
+        </mxCell>
+        <mxCell id="col_filler" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;                        fontSize=10;verticalAlign=top;arcSize=5;" value="&lt;b&gt;FILLER&lt;/b&gt;&lt;br/&gt;whitespace · commas&lt;br/&gt;colons · quotes&lt;br/&gt;&lt;hr/&gt;No semantic value&lt;br/&gt;Silently skipped" vertex="1">
+          <mxGeometry height="105" width="145" x="110" y="685" as="geometry" />
+        </mxCell>
+        <mxCell id="col_structure" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;                        fontSize=10;verticalAlign=top;arcSize=5;" value="&lt;b&gt;STRUCTURE&lt;/b&gt;&lt;br/&gt;{ } [ ]&lt;br/&gt;&lt;hr/&gt;Track nesting depth&lt;br/&gt;Record dict vs. array&lt;br/&gt;Container open/close&lt;br/&gt;callbacks with byte offsets" vertex="1">
+          <mxGeometry height="105" width="160" x="265" y="685" as="geometry" />
+        </mxCell>
+        <mxCell id="col_string" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;                        fontSize=10;verticalAlign=top;arcSize=5;" value="&lt;b&gt;STRING&lt;/b&gt;&lt;br/&gt;plain text bytes&lt;br/&gt;&lt;hr/&gt;Routing decision at first token&lt;br/&gt;Capture → append to buffer&lt;br/&gt;Skip → zero cost,&lt;br/&gt;zero allocation" vertex="1">
+          <mxGeometry height="105" width="185" x="435" y="685" as="geometry" />
+        </mxCell>
+        <mxCell id="col_unicode" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;                        fontSize=10;verticalAlign=top;arcSize=5;" value="&lt;b&gt;UNICODE_CODE_POINT&lt;/b&gt;&lt;br/&gt;\n &amp;nbsp;\t &amp;nbsp;\uXXXX …&lt;br/&gt;&lt;hr/&gt;Backslash escapes decoded&lt;br/&gt;to UTF-8 transparently&lt;br/&gt;Appended only if capturing&lt;br/&gt;same zero-cost skip otherwise" vertex="1">
+          <mxGeometry height="105" width="185" x="630" y="685" as="geometry" />
+        </mxCell>
+        <mxCell id="col_scalar" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;                        fontSize=10;verticalAlign=top;arcSize=5;" value="&lt;b&gt;NUMBER / LITERAL&lt;/b&gt;&lt;br/&gt;42 · 1.5 · true · null&lt;br/&gt;&lt;hr/&gt;Typed callbacks fired&lt;br/&gt;with raw text value&lt;br/&gt;No decode needed" vertex="1">
+          <mxGeometry height="105" width="105" x="825" y="685" as="geometry" />
+        </mxCell>
+        <mxCell id="a_dispatch_handler" edge="1" parent="1" source="cursor_bg" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=10;strokeColor=#9673a6;fontColor=#9673a6;fontStyle=1;                        exitX=1;exitY=0.78;exitDx=0;exitDy=0;                        entryX=0;entryY=0.25;entryDx=0;entryDy=0;" target="handler_panel" value="decoded events">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="handler_panel" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;                        verticalAlign=top;arcSize=3;fontSize=11;" value="" vertex="1">
+          <mxGeometry height="453" width="640" x="960" y="310" as="geometry" />
+        </mxCell>
+        <mxCell id="depth_key_box" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3e8ff;strokeColor=#9673a6;                        fontSize=10;verticalAlign=middle;align=left;arcSize=5;" value="&lt;b&gt;Depth &amp; Key&lt;/b&gt; — callbacks carry &lt;b&gt;depth&lt;/b&gt; (nesting level; root = 1) and &lt;b&gt;key&lt;/b&gt; (dict key left of value; &quot;&quot; for array elements) · onContainerOpen fires after depth increments; onContainerClose fires before decrement" vertex="1">
+          <mxGeometry height="55" width="600" x="980" y="335" as="geometry" />
+        </mxCell>
+        <mxCell id="callbacks_ref" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;                        fontSize=10;verticalAlign=top;align=left;arcSize=5;" value="&lt;b&gt;Callback Surface&lt;/b&gt;&lt;br/&gt;&lt;br/&gt;&lt;b&gt;Container Byte Ranges&lt;/b&gt; — [tok_start, tok_end) half-open range for zero-copy extraction&lt;br/&gt;String value lifecycle &amp;nbsp;·&amp;nbsp; Dict key completion &amp;nbsp;·&amp;nbsp; Number &amp;nbsp;·&amp;nbsp; Boolean &amp;nbsp;·&amp;nbsp; Null&lt;br/&gt;&lt;font color=&quot;#555&quot;&gt;onKey · onNumber · onBoolean return Status to abort; onNull is void&lt;/font&gt;" vertex="1">
+          <mxGeometry height="80" width="600" x="980" y="420" as="geometry" />
+        </mxCell>
+        <mxCell id="open_cap" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;                        fontSize=10;verticalAlign=top;align=left;arcSize=5;" value="&lt;b&gt;String Value Lifecycle&lt;/b&gt;&lt;br/&gt;&lt;br/&gt;At the opening &quot; of every string value, handler inspects key + depth and returns:&lt;br/&gt;&lt;br/&gt;→ &lt;b&gt;buffer*&lt;/b&gt; — cursor accumulates decoded UTF-8 (backslash escapes decoded transparently through same path); closeStringCapture fires on completion&lt;br/&gt;&lt;br/&gt;→ &lt;b&gt;nullptr&lt;/b&gt; — all writes skipped; zero allocation regardless of string size" vertex="1">
+          <mxGeometry height="155" width="600" x="980" y="530" as="geometry" />
+        </mxCell>
+
+        <!-- MmapPayloadStore — external storage on the right side -->
+        <mxCell id="store_bg" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;                        arcSize=3;fontSize=11;verticalAlign=top;" value="&lt;b&gt;&lt;font style=&quot;font-size:12px;&quot;&gt;MmapPayloadStore&lt;/font&gt;&lt;/b&gt;&lt;br/&gt;file-backed memory-mapped arena · zero-copy sub-range references · grows on demand · lifetime outlasts any individual chunk" vertex="1">
+          <mxGeometry height="470" width="420" x="1660" y="300" as="geometry" />
+        </mxCell>
+        <mxCell id="ref_inline" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;                        fontSize=10;arcSize=5;" value="&lt;b&gt;Inline&lt;/b&gt;&lt;br/&gt;Small fields (≤ 4 KB)&lt;br/&gt;stored directly in ref&lt;br/&gt;&lt;br/&gt;&lt;font color=&quot;#555&quot;&gt;model, stream,&lt;br/&gt;sampling params&lt;/font&gt;" vertex="1">
+          <mxGeometry height="90" width="390" x="1670" y="390" as="geometry" />
+        </mxCell>
+        <mxCell id="ref_external" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;                        fontSize=10;arcSize=5;" value="&lt;b&gt;External&lt;/b&gt;&lt;br/&gt;{offset, length} into mmap&lt;br/&gt;Zero-copy sub-range&lt;br/&gt;&lt;br/&gt;&lt;font color=&quot;#555&quot;&gt;messages[], tools[],&lt;br/&gt;residual body&lt;/font&gt;" vertex="1">
+          <mxGeometry height="90" width="390" x="1670" y="495" as="geometry" />
+        </mxCell>
+        <mxCell id="ref_buffered" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;                        fontSize=10;arcSize=5;" value="&lt;b&gt;Buffered&lt;/b&gt;&lt;br/&gt;Heap copy materialized&lt;br/&gt;after background prefetch&lt;br/&gt;&lt;br/&gt;&lt;font color=&quot;#555&quot;&gt;All refs Buffered&lt;br/&gt;before dispatch fires&lt;/font&gt;" vertex="1">
+          <mxGeometry height="90" width="390" x="1670" y="600" as="geometry" />
+        </mxCell>
+        <mxCell id="a_ext_buf" edge="1" parent="1" source="ref_external" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=10;dashed=1;                        exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="ref_buffered" value="background prefetch (copy 2)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Write: parser → store (per chunk + finish) -->
+        <mxCell id="a_mmap_store" edge="1" parent="1" source="mmap_write_box" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;dashed=1;                        exitX=1;exitY=0.5;exitDx=0;exitDy=0;                        entryX=0;entryY=0.2;entryDx=0;entryDy=0;" target="store_bg" value="append per chunk (copy 1)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a_parser_store" edge="1" parent="1" source="parser_bg" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;                        exitX=1;exitY=0.85;exitDx=0;exitDy=0;                        entryX=0;entryY=0.85;entryDx=0;entryDy=0;" target="store_bg" value="finish() → PayloadRef {offset, length}">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Fetch back: store → prefetch -->
+        <mxCell id="a_store_prefetch" edge="1" parent="1" source="store_bg" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;                        exitX=0;exitY=1;exitDx=0;exitDy=0;                        entryX=1;entryY=0.5;entryDx=0;entryDy=0;" target="prefetch_bg" value="pread → Buffered">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="prefetch_bg" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;                        dashed=1;strokeWidth=2;arcSize=5;" value="" vertex="1">
+          <mxGeometry height="70" width="1540" x="80" y="857" as="geometry" />
+        </mxCell>
+        <mxCell id="prefetch_label" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;                        verticalAlign=middle;fontSize=11;" value="&lt;b&gt;Async Prefetch&lt;/b&gt; (off event loop) — External refs materialized on background threads · page faults handled here, not on the event loop · all refs ready → dispatch fires" vertex="1">
+          <mxGeometry height="70" width="1540" x="80" y="857" as="geometry" />
+        </mxCell>
+        <mxCell id="a_prefetch_enc" edge="1" parent="1" source="prefetch_bg" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=10;                        exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="reencode_bg" value="doDispatch() — all refs Buffered">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="reencode_bg" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;                        arcSize=3;fontSize=11;verticalAlign=middle;" value="&lt;b&gt;Re-encode + Forward Upstream&lt;/b&gt; — Structured fields re-serialized to target provider format · Large content spliced in verbatim from mmap refs · New body injected into filter chain → upstream" vertex="1">
+          <mxGeometry height="60" width="1540" x="80" y="947" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_bg" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#cccccc;arcSize=5;" value="" vertex="1">
+          <mxGeometry height="60" width="1540" x="80" y="1027" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_label" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;                        verticalAlign=middle;fontSize=10;" value="&lt;b&gt;Copy budget — large content field crosses memory three times:&lt;/b&gt; &amp;nbsp;&amp;nbsp; ① Network buffer → mmap &amp;nbsp;(unavoidable: Envoy recycles buffers after each chunk) &amp;nbsp;→&amp;nbsp; ② mmap → heap &amp;nbsp;(background prefetch; unavoidable: page faults off event loop) &amp;nbsp;→&amp;nbsp; ③ heap → upstream send buffer &amp;nbsp;(unavoidable: upstream needs its own writable buffer). &amp;nbsp;&amp;nbsp; Everything in between: zero bytes touched — only {offset, length} integers pass through." vertex="1">
+          <mxGeometry height="60" width="1500" x="100" y="1027" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
