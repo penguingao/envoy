@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <tuple>
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
@@ -67,6 +68,14 @@ void appendStringToken(std::string& out, absl::string_view raw, uint64_t vbd) {
   }
 }
 
+// Returns true for the depth-1 inference keys extracted into structured fields.
+// Everything else is a passthrough field preserved for DOM-free re-encoding.
+bool isExtractedInferenceKey(absl::string_view key) {
+  return key == "model" || key == "stream" || key == "messages" || key == "tools" ||
+         key == "temperature" || key == "top_p" || key == "max_tokens" ||
+         key == "n" || key == "seed" || key == "stop";
+}
+
 // Create a sub-ref of `residual` covering [start, start+len).
 // Shared by InferenceBodyParser and AgentBodyParser.
 void makeSubRef(PayloadRef& ref, size_t start, size_t len,
@@ -90,16 +99,21 @@ public:
   class Handler {
   public:
     virtual ~Handler() = default;
-    // Called at the start of a non-key string chain.
+    // Called at the start of a non-key string chain. tok_start is the byte
+    // position of the first STRING token (opening `"` is at tok_start - 1).
     // Returns the target to accumulate into, or nullptr to discard.
-    virtual std::string* selectStringTarget(int depth) = 0;
-    // Called when a key chain completes. Return error to abort (e.g. duplicate key).
-    virtual absl::Status onKey(absl::string_view key, int depth) = 0;
-    // Called when a non-key string chain completes (target is the same pointer
-    // returned by selectStringTarget, always non-null).
-    virtual void onStringComplete(std::string* target, int depth) = 0;
-    // Called for NUMBER and LITERAL tokens. vbc distinguishes them.
-    virtual void onScalar(absl::string_view raw, int64_t vbc, int depth) = 0;
+    virtual std::string* selectStringTarget(int depth, size_t tok_start) = 0;
+    // Called when a key chain completes. key_tok_start is the position of the
+    // opening `"` of the key token (includes the byte before the key content).
+    // Return error to abort (e.g. duplicate key).
+    virtual absl::Status onKey(absl::string_view key, int depth, size_t key_tok_start) = 0;
+    // Called when a non-key string chain completes. tok_end is body_src_pos_
+    // after consuming the last STRING token (position of the closing `"`).
+    virtual void onStringComplete(std::string* target, int depth, size_t tok_end) = 0;
+    // Called for NUMBER and LITERAL tokens. tok_start/tok_end are the byte
+    // positions of the token within the accumulated body stream.
+    virtual void onScalar(absl::string_view raw, int64_t vbc, int depth,
+                          size_t tok_start, size_t tok_end) = 0;
     // Called after depth has been incremented for a STRUCTURE push.
     virtual void onPush(bool is_dict, int depth, size_t tok_start) = 0;
     // Called with the closing container's depth (before decrement) and the
@@ -226,7 +240,8 @@ public:
           if (!in_chain_) {
             str_acc_.clear();
             string_is_key_ = depth_ < kMaxDepth && is_dict_[depth_] && expecting_key_[depth_];
-            str_target_    = string_is_key_ ? &str_acc_ : handler_.selectStringTarget(depth_);
+            str_target_    = string_is_key_ ? &str_acc_ : handler_.selectStringTarget(depth_, tok_start);
+            if (string_is_key_) key_tok_start_ = tok_start;
           }
           if (str_target_ && tlen > 0)
             appendStringToken(*str_target_, raw, vbd);
@@ -234,10 +249,10 @@ public:
           if (!cont) {
             if (string_is_key_) {
               if (track_paths_ && depth_ < kMaxDepth) key_stack_[depth_] = str_acc_;
-              if (auto s = handler_.onKey(str_acc_, depth_); !s.ok()) return s;
+              if (auto s = handler_.onKey(str_acc_, depth_, key_tok_start_); !s.ok()) return s;
               if (depth_ < kMaxDepth) expecting_key_[depth_] = false;
             } else {
-              if (str_target_) handler_.onStringComplete(str_target_, depth_);
+              if (str_target_) handler_.onStringComplete(str_target_, depth_, body_src_pos_);
               if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
             }
             str_target_ = nullptr;
@@ -249,7 +264,8 @@ public:
         // LITERAL: true, false, or null — handler compares raw bytes directly.
         case WUFFS_BASE__TOKEN__VBC__NUMBER:
         case WUFFS_BASE__TOKEN__VBC__LITERAL:
-          handler_.onScalar(chunk.substr(tok_start - chunk_base, tlen), vbc, depth_);
+          handler_.onScalar(chunk.substr(tok_start - chunk_base, tlen), vbc, depth_,
+                            tok_start, body_src_pos_);
           if (depth_ < kMaxDepth && is_dict_[depth_]) expecting_key_[depth_] = true;
           break;
 
@@ -326,6 +342,7 @@ private:
 
   bool         in_chain_{false};
   bool         string_is_key_{false};
+  size_t       key_tok_start_{0};
   std::string  str_acc_;
   std::string* str_target_{nullptr};
 };
@@ -398,6 +415,12 @@ public:
       makeSubRef(ref, start, end - start, payload.residual_params, tool_kinds_[i], store_);
       payload.tools.push_back(std::move(ref));
     }
+    for (auto& [k, start, end] : passthrough_ranges_) {
+      PayloadRef ref;
+      makeSubRef(ref, start, end - start, payload.residual_params,
+                 PayloadKind::JsonObject, store_);
+      payload.passthrough_fields.push_back({std::move(k), std::move(ref)});
+    }
     for (auto& [k, v] : extracted_attrs_) {
       request.attributes.emplace(std::move(k), std::move(v));
     }
@@ -414,10 +437,15 @@ private:
   // API layout (de-facto invariant, not a formal spec guarantee). A field
   // present at depth > 1 falls through to nullptr and is silently discarded;
   // finish() catches the required-field case (model) and returns an error.
-  std::string* selectStringTarget(int depth) override {
+  std::string* selectStringTarget(int depth, size_t tok_start) override {
     if (depth == 1) {
       if      (current_key_ == "model") { model_.clear();      return &model_; }
       else if (current_key_ == "stop")  { string_val_.clear(); return &string_val_; }
+      else if (current_key_is_passthrough_) {
+        passthrough_string_start_ = tok_start; // first STRING token is a DROP covering the opening "
+        passthrough_string_scratch_.clear();
+        return &passthrough_string_scratch_;
+      }
     } else if (depth == 2 && in_stop_array_) {
       string_val_.clear();
       return &string_val_;
@@ -434,7 +462,7 @@ private:
     return nullptr;
   }
 
-  absl::Status onKey(absl::string_view key, int depth) override {
+  absl::Status onKey(absl::string_view key, int depth, size_t /*key_tok_start*/) override {
     if (depth == 1) {
       bool* seen = nullptr;
       if      (key == "model")       seen = &seen_model_;
@@ -452,22 +480,27 @@ private:
             absl::StrCat("duplicate key \"", key, "\" in inference request body"));
         *seen = true;
       }
-      current_key_ = key;
+      current_key_              = key;
+      current_key_is_passthrough_ = !isExtractedInferenceKey(key);
     }
     return absl::OkStatus();
   }
 
-  void onStringComplete(std::string* target, int /*depth*/) override {
+  void onStringComplete(std::string* target, int depth, size_t tok_end) override {
     if (target == &string_val_) {
       sampling_.stop.push_back(std::move(string_val_));
       string_val_.clear();
+    } else if (target == &passthrough_string_scratch_ && depth == 1) {
+      // tok_end is the position of the closing `"` (1 byte), so +1 for the exclusive end.
+      passthrough_ranges_.push_back({current_key_, passthrough_string_start_, tok_end + 1});
     } else if (target == &config_field_scratch_) {
       extracted_attrs_.emplace_back(std::move(config_field_indexed_path_),
                                     std::move(config_field_scratch_));
     }
   }
 
-  void onScalar(absl::string_view raw, int64_t vbc, int depth) override {
+  void onScalar(absl::string_view raw, int64_t vbc, int depth,
+                size_t tok_start, size_t tok_end) override {
     if (depth == 1) {
       if (vbc == WUFFS_BASE__TOKEN__VBC__NUMBER) {
         int64_t i_val; double d_val;
@@ -479,6 +512,9 @@ private:
       } else if (vbc == WUFFS_BASE__TOKEN__VBC__LITERAL && current_key_ == "stream") {
         if      (raw == "true")  streaming_ = true;
         else if (raw == "false") streaming_ = false;
+      }
+      if (current_key_is_passthrough_) {
+        passthrough_ranges_.push_back({current_key_, tok_start, tok_end});
       }
     }
     if (!config_.extract_field_pattern_set.empty() &&
@@ -495,6 +531,10 @@ private:
       if      (current_key_ == "messages") { in_messages_ = true; in_tools_ = false; }
       else if (current_key_ == "tools")    { in_tools_ = true;    in_messages_ = false; }
       else if (current_key_ == "stop")     { in_stop_array_ = true; }
+      else if (current_key_is_passthrough_) {
+        in_passthrough_container_    = true;
+        passthrough_container_start_ = tok_start;
+      }
     }
     if (depth == 3 && (in_messages_ || in_tools_) && captureEnabled()) {
       in_elem_      = true;
@@ -516,9 +556,13 @@ private:
       }
     }
     if (depth == 2) {
-      in_messages_   = false;
-      in_tools_      = false;
-      in_stop_array_ = false;
+      if (in_passthrough_container_) {
+        passthrough_ranges_.push_back({current_key_, passthrough_container_start_, tok_end});
+      }
+      in_messages_              = false;
+      in_tools_                 = false;
+      in_stop_array_            = false;
+      in_passthrough_container_ = false;
     }
   }
 
@@ -559,6 +603,15 @@ private:
   std::vector<PayloadKind>               message_kinds_;
   std::vector<std::pair<size_t, size_t>> tool_ranges_;
   std::vector<PayloadKind>               tool_kinds_;
+
+  // ── Passthrough field tracking ─────────────────────────────────────────────
+  bool        current_key_is_passthrough_{false};
+  std::string passthrough_string_scratch_; // non-null sentinel for onStringComplete
+  size_t      passthrough_string_start_{0}; // byte position of opening `"` in residual
+  bool        in_passthrough_container_{false};
+  size_t      passthrough_container_start_{0};
+  // All passthrough values (strings, scalars, containers): (key, start, end) in residual.
+  std::vector<std::tuple<std::string, size_t, size_t>> passthrough_ranges_;
 
   // ── Duplicate-key tracking ─────────────────────────────────────────────────
   bool seen_model_{false};
@@ -693,7 +746,7 @@ private:
   // Empty method_ is propagated to finish() and treated as non-AI traffic by
   // the caller — this covers both the webhook false-positive case and the
   // (silent) depth-mismatch case where "method" appears outside depth 1.
-  std::string* selectStringTarget(int depth) override {
+  std::string* selectStringTarget(int depth, size_t /*tok_start*/) override {
     if (depth == 1) {
       if      (current_key_ == "id")     { id_.clear();     return &id_; }
       else if (current_key_ == "method") { method_.clear(); return &method_; }
@@ -714,7 +767,7 @@ private:
     return nullptr;
   }
 
-  absl::Status onKey(absl::string_view key, int depth) override {
+  absl::Status onKey(absl::string_view key, int depth, size_t /*key_tok_start*/) override {
     if (depth == 1) {
       bool* seen = nullptr;
       if      (key == "jsonrpc") seen = &seen_jsonrpc_;
@@ -733,14 +786,15 @@ private:
     return absl::OkStatus();
   }
 
-  void onStringComplete(std::string* target, int /*depth*/) override {
+  void onStringComplete(std::string* target, int /*depth*/, size_t /*tok_end*/) override {
     if (target == &config_field_scratch_) {
       extracted_attrs_.emplace_back(std::move(config_field_indexed_path_),
                                     std::move(config_field_scratch_));
     }
   }
 
-  void onScalar(absl::string_view raw, int64_t vbc, int depth) override {
+  void onScalar(absl::string_view raw, int64_t vbc, int depth,
+                size_t /*tok_start*/, size_t /*tok_end*/) override {
     if (depth == 1 && current_key_ == "id" && vbc == WUFFS_BASE__TOKEN__VBC__NUMBER) {
       int64_t i_val; double d_val;
       if      (absl::SimpleAtoi(raw, &i_val)) id_ = std::to_string(i_val);

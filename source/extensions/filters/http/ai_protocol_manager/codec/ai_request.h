@@ -76,6 +76,12 @@ struct InferencePayload {
 
   // Every field the mapper didn't pull apart — keeps pass-through honest.
   PayloadRef residual_params;
+
+  // Depth-1 fields not modelled by the structured fields above (e.g.
+  // response_format, tool_choice, stream_options, logit_bias, …).
+  // Populated by the decoder for DOM-free round-trip in encodeInferenceBody.
+  // Each element: (field_name, raw_json_value).
+  std::vector<std::pair<std::string, PayloadRef>> passthrough_fields;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

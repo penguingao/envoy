@@ -340,18 +340,17 @@ RequestEncoder::encodeAgentBodyAsRest(const AiRequest& request,
 
 // ── encodeInferenceBody ───────────────────────────────────────────────────────
 //
-// Re-encodes the InferencePayload back into an OpenAI-compatible JSON body.
+// Re-encodes the InferencePayload back into an OpenAI-compatible JSON body
+// without a DOM parse — no json::parse / body.dump() pass.
 //
-// Round-trip strategy:
-//   1. Parse residual_params (the full original request body) as the base JSON.
-//      This preserves every field the decoder did not extract into structured
-//      form (response_format, tool_choice, stream_options, user, …).
-//   2. Overwrite extracted scalar fields with their current values so that
-//      chain-filter mutations (e.g. model swap, temperature adjustment) appear
-//      in the outgoing request.
-//   3. Rebuild messages[] and tools[] from PayloadRefs.  The chain runner
-//      updates PayloadRefs in-place when a Q2 onRequestItem handler calls
-//      markDirty(), so this step naturally reflects per-item mutations.
+// Strategy:
+//   Extracted scalars (model, stream, sampling params) and rebuilt arrays
+//   (messages[], tools[]) are written directly via Json::StringStreamer.
+//   Unknown depth-1 fields (response_format, tool_choice, stream_options, …)
+//   are replayed from InferencePayload::passthrough_fields, which the decoder
+//   pre-populated with their raw JSON values during the cursor pass.
+//   Chain-filter mutations to extracted scalars appear immediately; per-item
+//   mutations via markDirty() are reflected through the PayloadRefs.
 //
 // Bodiless invocations (Retrieve / Cancel / Delete / ListInputItems) return ""
 // because those operations carry no JSON body on the wire.
@@ -374,76 +373,82 @@ std::string RequestEncoder::encodeInferenceBody(const AiRequest& request) {
     break;
   }
 
-  // ── Step 1: seed from residual (full original body) ──────────────────────
-  json body;
-  if (!payload->residual_params.empty()) {
-    body = json::parse(convertPayloadRefToString(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
-    if (body.is_discarded()) {
-      body = json::object();
-    }
-  } else {
-    body = json::object();
+  // DOM-free re-encoding: write extracted/overridden fields directly via the
+  // JSON streamer, then splice passthrough fields verbatim — no json::parse or
+  // body.dump(). The passthrough_fields vector is populated by InferenceBodyParser
+  // during the decode pass with all depth-1 fields not modelled by structured
+  // members (response_format, tool_choice, stream_options, logit_bias, …).
+  std::string out;
+  Json::StringOutput so(out);
+  Json::StringStreamer streamer(so);
+  auto root = streamer.makeRootMap();
+
+  if (!payload->target.name.empty()) {
+    root->addKey("model");
+    root->addString(payload->target.name);
   }
 
-  // ── Step 2: overlay extracted scalars (may have been mutated by chain) ───
-  if (!payload->target.name.empty()) {
-    body["model"] = payload->target.name;
-  }
-  body["stream"] = request.streaming;
+  root->addKey("stream");
+  root->addBool(request.streaming);
 
   if (payload->sampling.temperature.has_value()) {
-    body["temperature"] = *payload->sampling.temperature;
+    root->addKey("temperature");
+    root->addNumber(*payload->sampling.temperature);
   }
   if (payload->sampling.top_p.has_value()) {
-    body["top_p"] = *payload->sampling.top_p;
+    root->addKey("top_p");
+    root->addNumber(*payload->sampling.top_p);
   }
   if (payload->sampling.max_tokens.has_value()) {
-    body["max_tokens"] = *payload->sampling.max_tokens;
+    root->addKey("max_tokens");
+    root->addNumber(static_cast<int64_t>(*payload->sampling.max_tokens));
   }
   if (payload->sampling.n.has_value()) {
-    body["n"] = *payload->sampling.n;
+    root->addKey("n");
+    root->addNumber(static_cast<int64_t>(*payload->sampling.n));
   }
   if (payload->sampling.seed.has_value()) {
-    body["seed"] = *payload->sampling.seed;
+    root->addKey("seed");
+    root->addNumber(*payload->sampling.seed);
   }
   if (!payload->sampling.stop.empty()) {
-    body["stop"] = payload->sampling.stop;
+    root->addKey("stop");
+    auto stop_arr = root->addArray();
+    for (const auto& s : payload->sampling.stop) {
+      stop_arr->addString(s);
+    }
   }
 
-  // ── Step 3: rebuild messages[] from PayloadRefs ───────────────────────────
-  // Only overwrite the "messages" key when the payload actually carries
-  // messages so that we don't clobber an absent key for invocations like
-  // Embeddings that don't have a messages array.
+  // messages[] — only emit when present (Embeddings etc. have no messages).
   if (!payload->messages.empty()) {
-    json msgs = json::array();
+    root->addKey("messages");
+    auto msgs = root->addArray();
     for (const auto& ref : payload->messages) {
-      if (ref.empty()) {
-        continue;
-      }
-      auto elem = json::parse(convertPayloadRefToString(ref, request), nullptr, /*allow_exceptions=*/false);
-      if (!elem.is_discarded()) {
-        msgs.push_back(std::move(elem));
+      if (!ref.empty()) {
+        msgs->addRawJson(convertPayloadRefToString(ref, request));
       }
     }
-    body["messages"] = std::move(msgs);
   }
 
-  // ── Step 4: rebuild tools[] from PayloadRefs ─────────────────────────────
+  // tools[] — only emit when present.
   if (!payload->tools.empty()) {
-    json tools_arr = json::array();
+    root->addKey("tools");
+    auto tools_arr = root->addArray();
     for (const auto& ref : payload->tools) {
-      if (ref.empty()) {
-        continue;
-      }
-      auto elem = json::parse(convertPayloadRefToString(ref, request), nullptr, /*allow_exceptions=*/false);
-      if (!elem.is_discarded()) {
-        tools_arr.push_back(std::move(elem));
+      if (!ref.empty()) {
+        tools_arr->addRawJson(convertPayloadRefToString(ref, request));
       }
     }
-    body["tools"] = std::move(tools_arr);
   }
 
-  return body.dump();
+  // Passthrough fields (response_format, tool_choice, stream_options, …).
+  for (const auto& [key, value_ref] : payload->passthrough_fields) {
+    root->addKey(key);
+    root->addRawJson(convertPayloadRefToString(value_ref, request));
+  }
+
+  root.reset(); // emits closing "}"
+  return out;
 }
 
 } // namespace Codec

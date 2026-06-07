@@ -38,6 +38,7 @@
 //   NAndSeedDropped                          n:3, seed:42                        neither field in Anthropic body
 //   LegacyCompletionWrapsPromptAsUserMsg     POST /v1/completions + prompt       messages:[{role:user,content:prompt}]
 //   MultipleSystemMessagesJoined             two system messages                 single "system" value
+//   UnknownFieldsForwardedVerbatimInRoundTrip  response_format + stream_options + user  all three present at upstream
 
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
@@ -666,6 +667,57 @@ TEST_P(AnthropicInferenceIntegrationTest, MultipleSystemMessagesJoined) {
   EXPECT_THAT(upstream_body, HasSubstr("You are concise."));
   EXPECT_THAT(upstream_body, HasSubstr("Reply in English."));
   EXPECT_THAT(upstream_body, Not(HasSubstr("\"role\":\"system\"")));
+
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// ── 18. Unknown depth-1 fields forwarded verbatim in OpenAI round-trip ───────
+//
+// Without x-ai-provider the encoder uses encodeInferenceBody, which must
+// forward every depth-1 field that isn't in the extracted set (model, stream,
+// messages, tools, sampling params) verbatim via passthrough_fields.
+//
+// This test uses:
+//   response_format  — object passthrough
+//   stream_options   — object passthrough
+//   user             — string passthrough
+//
+// All three must appear unchanged in the upstream body; none must be absent.
+
+TEST_P(AnthropicInferenceIntegrationTest, UnknownFieldsForwardedVerbatimInRoundTrip) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const std::string body =
+      R"({"model":"gpt-4o",)"
+      R"("messages":[{"role":"user","content":"Hi"}],)"
+      R"("response_format":{"type":"json_object"},)"
+      R"("stream_options":{"include_usage":true},)"
+      R"("user":"user-abc123"})";
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/v1/chat/completions"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"content-type", "application/json"}},
+      body);
+
+  waitForNextUpstreamRequest();
+  const std::string upstream_body = upstream_request_->body().toString();
+
+  // Object passthrough fields must be present verbatim.
+  EXPECT_THAT(upstream_body, HasSubstr("\"response_format\""));
+  EXPECT_THAT(upstream_body, HasSubstr("\"type\":\"json_object\""));
+  EXPECT_THAT(upstream_body, HasSubstr("\"stream_options\""));
+  EXPECT_THAT(upstream_body, HasSubstr("\"include_usage\":true"));
+  // String passthrough field must be present.
+  EXPECT_THAT(upstream_body, HasSubstr("\"user\":\"user-abc123\""));
+  // Extracted fields must still be present.
+  EXPECT_THAT(upstream_body, HasSubstr("\"model\":\"gpt-4o\""));
+  EXPECT_THAT(upstream_body, HasSubstr("\"role\":\"user\""));
 
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());
