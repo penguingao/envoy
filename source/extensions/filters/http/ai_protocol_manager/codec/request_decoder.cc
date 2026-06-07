@@ -108,7 +108,7 @@ public:
     // Return error to abort (e.g. duplicate key).
     virtual absl::Status onKey(absl::string_view key, int depth, size_t key_tok_start) = 0;
     // Called when a non-key string chain completes. tok_end is body_src_pos_
-    // after consuming the last STRING token (position of the closing `"`).
+    // after consuming the closing `"` DROP token (one past the closing `"`).
     virtual void onStringComplete(std::string* target, int depth, size_t tok_end) = 0;
     // Called for NUMBER and LITERAL tokens. tok_start/tok_end are the byte
     // positions of the token within the accumulated body stream.
@@ -491,8 +491,9 @@ private:
       sampling_.stop.push_back(std::move(string_val_));
       string_val_.clear();
     } else if (target == &passthrough_string_scratch_ && depth == 1) {
-      // tok_end is the position of the closing `"` (1 byte), so +1 for the exclusive end.
-      passthrough_ranges_.push_back({current_key_, passthrough_string_start_, tok_end + 1});
+      // tok_end is body_src_pos_ after consuming the closing `"` DROP token, so
+      // it already points one past the closing `"` — no +1 needed.
+      passthrough_ranges_.push_back({current_key_, passthrough_string_start_, tok_end});
     } else if (target == &config_field_scratch_) {
       extracted_attrs_.emplace_back(std::move(config_field_indexed_path_),
                                     std::move(config_field_scratch_));

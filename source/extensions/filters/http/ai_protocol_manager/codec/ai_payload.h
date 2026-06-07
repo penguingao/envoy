@@ -97,6 +97,25 @@ public:
 
   bool empty() const { return size() == 0; }
 
+  // Creates an independent copy of this ref.
+  // External: new handle to the same byte range (zero extra allocation).
+  // Inline:   copies the string.
+  // Buffered: copies the buffer contents.
+  PayloadRef clone() const {
+    switch (storage_) {
+    case Storage::Inline:
+      return PayloadRef::makeInline(inline_data_);
+    case Storage::External:
+      return PayloadRef::makeExternal(external_offset_, external_length_);
+    case Storage::Buffered: {
+      auto buf = std::make_unique<Buffer::OwnedImpl>();
+      if (buffered_data_) buf->add(*buffered_data_);
+      return PayloadRef::makeBuffered(std::move(buf));
+    }
+    }
+    return {};
+  }
+
   // Materializes the value into a std::string. Valid only for Inline and Buffered;
   // External refs must be fetched through PayloadStore::fetch().
   std::string toString() const;

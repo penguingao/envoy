@@ -1,6 +1,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/providers/anthropic/anthropic_request_encoder.h"
 
 #include "source/extensions/filters/http/ai_protocol_manager/codec/ai_request.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/wuffs_json.h"
 
 #include "absl/strings/match.h"
 #include "nlohmann/json.hpp"
@@ -138,33 +139,6 @@ json convertToolChoice(const json& tc) {
 
 // ── Message processing ────────────────────────────────────────────────────────
 
-// Collects consecutive OpenAI `role: "tool"` messages starting at `idx` into
-// a single Anthropic user message containing an array of tool_result blocks.
-// Advances `idx` past all consumed tool messages.
-//
-// OpenAI:   {"role":"tool","tool_call_id":"...","content":"..."}  (one per result)
-// Anthropic: {"role":"user","content":[{"type":"tool_result","tool_use_id":"...","content":"..."},...]}
-json collectToolResults(const std::vector<json>& parsed, size_t& idx) {
-  json blocks = json::array();
-  while (idx < parsed.size()) {
-    const json& msg = parsed[idx];
-    if (msg.value("role", "") != "tool") {
-      break;
-    }
-    json tr = {{"type", "tool_result"}};
-    if (msg.contains("tool_call_id")) {
-      tr["tool_use_id"] = msg["tool_call_id"];
-    }
-    if (msg.contains("content")) {
-      // Content may be a string or an array of content blocks.
-      tr["content"] = msg["content"];
-    }
-    blocks.push_back(std::move(tr));
-    ++idx;
-  }
-  return {{"role", "user"}, {"content", std::move(blocks)}};
-}
-
 // Converts an OpenAI assistant message that carries tool_calls into the
 // Anthropic representation where tool_calls become tool_use content blocks.
 //
@@ -215,85 +189,136 @@ json convertAssistantWithToolCalls(const json& msg) {
   return {{"role", "assistant"}, {"content", std::move(content)}};
 }
 
-// Builds the Anthropic messages array and extracts the system prompt(s) from
-// an OpenAI messages PayloadRef vector.
+// Emits an Anthropic user turn that merges a pre-grouped set of consecutive
+// OpenAI `role: "tool"` message refs into a single tool_result block array.
+// Each ref is parsed individually — O(1) peak heap per message.
 //
-// Rules applied:
-//   - role=system  → concatenated into `system_out` (not added to messages).
-//   - role=tool    → consecutive runs merged into one user turn (tool_result).
-//   - role=assistant + tool_calls → tool_use content blocks.
-//   - role=user/assistant (plain) → content blocks converted.
-void buildMessages(const std::vector<Codec::PayloadRef>& refs, json& messages_out,
-                   json& system_out, const Codec::AiRequest& request) {
-  // Pre-parse every ref so we can do lookahead for tool-result grouping.
-  std::vector<json> parsed;
-  parsed.reserve(refs.size());
+// OpenAI:   {"role":"tool","tool_call_id":"...","content":"..."}  (one per result)
+// Anthropic: {"role":"user","content":[{"type":"tool_result","tool_use_id":"...","content":"..."},...]}
+json collectToolResults(const std::vector<Codec::PayloadRef>& refs,
+                        const Codec::AiRequest& request) {
+  json blocks = json::array();
   for (const auto& ref : refs) {
-    if (ref.empty()) {
-      continue;
-    }
-    auto msg = json::parse(Codec::convertPayloadRefToString(ref, request), nullptr, /*allow_exceptions=*/false);
-    if (!msg.is_discarded()) {
-      parsed.push_back(std::move(msg));
-    }
+    auto msg = json::parse(Codec::convertPayloadRefToString(ref, request),
+                           nullptr, /*allow_exceptions=*/false);
+    if (msg.is_discarded()) continue;
+    json tr = {{"type", "tool_result"}};
+    if (msg.contains("tool_call_id")) tr["tool_use_id"] = msg["tool_call_id"];
+    if (msg.contains("content"))     tr["content"]      = msg["content"];
+    blocks.push_back(std::move(tr));
   }
+  return {{"role", "user"}, {"content", std::move(blocks)}};
+}
 
-  // Collect system messages first (may appear anywhere in the array per OpenAI spec).
-  std::string system_text;
-  for (const auto& msg : parsed) {
-    if (msg.value("role", "") == "system") {
-      const auto& c = msg["content"];
-      if (!system_text.empty()) {
-        system_text += "\n\n";
-      }
-      if (c.is_string()) {
-        system_text += c.get<std::string>();
-      } else if (c.is_array()) {
-        // Flatten text blocks from system content array.
-        for (const auto& block : c) {
-          if (block.value("type", "") == "text") {
-            system_text += block.value("text", "");
+// Organized form of messages[] produced in one pass for Anthropic encoding.
+// Kept local to this file — InferencePayload has no Anthropic-specific fields.
+struct PreparedMessages {
+  std::string system_content;
+  struct Entry {
+    std::string             role;       // empty = merged tool group
+    Codec::PayloadRef       ref;        // single message (when role non-empty)
+    std::vector<Codec::PayloadRef> tool_refs;  // tool group (when role empty)
+  };
+  std::vector<Entry> entries;
+};
+
+// One-pass message preparation. Uses WuffsJsonObjectReader to extract only the
+// `role` field from each message (no full DOM). Routes:
+//   role=system  → content extracted into result.system_content
+//   role=tool    → buffered into a pending group; flushed as a single entry on break
+//   other roles  → flush pending group then store as a tagged entry
+//
+// Replaces the old two-pass approach (full pre-parse of all messages into
+// std::vector<json> + separate system scan). Peak heap is now O(1) per message
+// for role extraction; full parse only for messages that need conversion.
+PreparedMessages prepareAnthropicMessages(const Codec::InferencePayload& payload,
+                                          const Codec::AiRequest& request) {
+  PreparedMessages result;
+  std::vector<Codec::PayloadRef> pending_tools;
+
+  auto flush_tools = [&]() {
+    if (!pending_tools.empty()) {
+      result.entries.push_back({"", {}, std::move(pending_tools)});
+      pending_tools.clear();
+    }
+  };
+
+  for (const auto& ref : payload.messages) {
+    if (ref.empty()) continue;
+
+    // Lightweight role extraction — only the role string is decoded here.
+    std::string role;
+    {
+      struct RoleExtractor : Codec::WuffsJsonObjectReader::Handler {
+        std::string& out;
+        explicit RoleExtractor(std::string& r) : out(r) {}
+        void onStringField(absl::string_view key, std::string value) override {
+          if (key == "role") out = std::move(value);
+        }
+      } h(role);
+      (void)Codec::WuffsJsonObjectReader::read(
+          Codec::convertPayloadRefToString(ref, request), h);
+    }
+
+    if (role == "system") {
+      flush_tools();
+      auto msg = json::parse(Codec::convertPayloadRefToString(ref, request),
+                             nullptr, /*allow_exceptions=*/false);
+      if (!msg.is_discarded() && msg.contains("content")) {
+        const auto& c = msg["content"];
+        if (!result.system_content.empty())
+          result.system_content += "\n\n";
+        if (c.is_string()) {
+          result.system_content += c.get<std::string>();
+        } else if (c.is_array()) {
+          for (const auto& block : c) {
+            if (block.value("type", "") == "text")
+              result.system_content += block.value("text", "");
           }
         }
       }
-    }
-  }
-  if (!system_text.empty()) {
-    system_out = std::move(system_text);
-  }
-
-  // Convert the non-system messages in order.
-  messages_out = json::array();
-  size_t i = 0;
-  while (i < parsed.size()) {
-    const json& msg = parsed[i];
-    const std::string role = msg.value("role", "");
-
-    if (role == "system") {
-      ++i;
       continue;
     }
 
     if (role == "tool") {
-      // Merge consecutive tool messages into one user turn.
-      messages_out.push_back(collectToolResults(parsed, i));
-      continue; // i already advanced by collectToolResults
-    }
-
-    if (role == "assistant" && msg.contains("tool_calls") && msg["tool_calls"].is_array() &&
-        !msg["tool_calls"].empty()) {
-      messages_out.push_back(convertAssistantWithToolCalls(msg));
-      ++i;
+      pending_tools.push_back(ref.clone());
       continue;
     }
 
-    // Plain user or assistant message.
-    json anthropic_msg = {{"role", role}};
-    if (msg.contains("content")) {
-      anthropic_msg["content"] = convertContent(msg["content"]);
+    flush_tools();
+    result.entries.push_back({std::move(role), ref.clone(), {}});
+  }
+
+  flush_tools();
+  return result;
+}
+
+// Serializes a PreparedMessages into the Anthropic JSON messages array.
+// Each entry is parsed individually — no simultaneous full DOM.
+void buildMessages(const PreparedMessages& prepared, json& messages_out,
+                   const Codec::AiRequest& request) {
+  messages_out = json::array();
+  for (const auto& entry : prepared.entries) {
+    if (entry.role.empty()) {
+      messages_out.push_back(collectToolResults(entry.tool_refs, request));
+      continue;
     }
+
+    auto msg = json::parse(Codec::convertPayloadRefToString(entry.ref, request),
+                           nullptr, /*allow_exceptions=*/false);
+    if (msg.is_discarded()) continue;
+
+    if (entry.role == "assistant" &&
+        msg.contains("tool_calls") && msg["tool_calls"].is_array() &&
+        !msg["tool_calls"].empty()) {
+      messages_out.push_back(convertAssistantWithToolCalls(msg));
+      continue;
+    }
+
+    json anthropic_msg = {{"role", entry.role}};
+    if (msg.contains("content"))
+      anthropic_msg["content"] = convertContent(msg["content"]);
     messages_out.push_back(std::move(anthropic_msg));
-    ++i;
   }
 }
 
@@ -343,31 +368,30 @@ AnthropicRequestEncoder::encode(const Codec::AiRequest& request) {
 
   // ── messages / system ─────────────────────────────────────────────────────
   json messages = json::array();
-  json system_val = json(nullptr);
 
   if (is_chat) {
-    buildMessages(payload->messages, messages, system_val, request);
-  } else {
-    // Legacy Completion: pull `prompt` from residual_params and wrap it.
-    std::string prompt_text;
-    if (!payload->residual_params.empty()) {
-      auto residual =
-          json::parse(Codec::convertPayloadRefToString(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
-      if (!residual.is_discarded() && residual.contains("prompt")) {
-        const auto& p = residual["prompt"];
-        if (p.is_string()) {
-          prompt_text = p.get<std::string>();
-        }
-      }
+    // One-pass role extraction via WuffsJsonObjectReader; per-message parse
+    // only for messages that need format conversion. No full pre-parse.
+    const PreparedMessages prepared = prepareAnthropicMessages(*payload, request);
+    if (!prepared.system_content.empty()) {
+      body["system"] = prepared.system_content;
     }
-    if (!prompt_text.empty()) {
-      messages.push_back({{"role", "user"}, {"content", prompt_text}});
+    buildMessages(prepared, messages, request);
+  } else {
+    // Legacy Completion: find "prompt" in passthrough_fields (zero-copy sub-ref
+    // from the decode pass) — no full-body json::parse needed.
+    for (const auto& [key, ref] : payload->passthrough_fields) {
+      if (key == "prompt") {
+        auto j = json::parse(Codec::convertPayloadRefToString(ref, request),
+                             nullptr, /*allow_exceptions=*/false);
+        if (!j.is_discarded() && j.is_string()) {
+          messages.push_back({{"role", "user"}, {"content", j.get<std::string>()}});
+        }
+        break;
+      }
     }
   }
 
-  if (!system_val.is_null()) {
-    body["system"] = std::move(system_val);
-  }
   body["messages"] = std::move(messages);
 
   // ── tools ─────────────────────────────────────────────────────────────────
@@ -387,21 +411,19 @@ AnthropicRequestEncoder::encode(const Codec::AiRequest& request) {
     }
   }
 
-  // ── tool_choice (from residual_params) ────────────────────────────────────
-  // tool_choice is not extracted into a structured field by InferenceBodyParser,
-  // so we read it back from the full original body stored in residual_params.
-  if (!payload->residual_params.empty()) {
-    auto residual =
-        json::parse(Codec::convertPayloadRefToString(payload->residual_params, request), nullptr, /*allow_exceptions=*/false);
-    if (!residual.is_discarded() && residual.contains("tool_choice")) {
-      body["tool_choice"] = convertToolChoice(residual["tool_choice"]);
-    }
-    // Pass through Anthropic-specific extras that OpenAI callers may inject
-    // into residual_params (top_k, metadata, etc.).
-    for (const auto& key : {"top_k", "metadata"}) {
-      if (residual.contains(key)) {
-        body[key] = residual[key];
-      }
+  // ── tool_choice, top_k, metadata (from passthrough_fields) ───────────────
+  // These fields land in passthrough_fields as zero-copy sub-refs from the
+  // decode pass. Scanning passthrough_fields (n < 10) replaces the previous
+  // two full-body json::parse(residual_params) calls.
+  for (const auto& [key, ref] : payload->passthrough_fields) {
+    if (key == "tool_choice") {
+      auto j = json::parse(Codec::convertPayloadRefToString(ref, request),
+                           nullptr, /*allow_exceptions=*/false);
+      if (!j.is_discarded()) body["tool_choice"] = convertToolChoice(j);
+    } else if (key == "top_k" || key == "metadata") {
+      auto j = json::parse(Codec::convertPayloadRefToString(ref, request),
+                           nullptr, /*allow_exceptions=*/false);
+      if (!j.is_discarded()) body[key] = std::move(j);
     }
   }
 

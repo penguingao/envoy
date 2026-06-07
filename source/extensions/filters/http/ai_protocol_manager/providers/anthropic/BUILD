@@ -15,6 +15,7 @@ envoy_cc_library(
     deps = [
         "//source/extensions/filters/http/ai_protocol_manager/codec:ai_request_lib",
         "//source/extensions/filters/http/ai_protocol_manager/codec:request_encoder_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/codec:wuffs_json_lib",
         "@abseil-cpp//absl/strings",
         "@abseil-cpp//absl/types:optional",
         "@nlohmann_json//:json",
