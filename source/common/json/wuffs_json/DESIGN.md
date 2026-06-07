@@ -375,21 +375,336 @@ copies unselected strings.
 
 ---
 
+## PayloadStore
+
+`PayloadStore` is the abstraction that decouples **where bytes live** from **how
+the rest of the system accesses them**. The decoder, handler, and encoder all
+refer to field values through `PayloadRef` handles; `PayloadStore` owns the
+backing memory and resolves handles to bytes on demand.
+
+### Why a store abstraction is needed
+
+Envoy's network layer owns the `Buffer::Instance` passed to `decodeData`. That
+buffer is recycled as soon as `decodeData` returns — by the time `onEndStream`
+fires, every chunk buffer that was ever passed in is gone. The byte positions
+the handler recorded during parsing (`elem_start_`, `params_byte_start_`,
+`passthrough_string_start_`, …) are meaningless without a backing store that
+survived past each `decodeData` call.
+
+`residual_writer_->append(chunk)` is the bridge: every chunk is durably written
+into the store before the cursor reads it. At `finish()` time, the stored bytes
+are still there and `makeSubRef` can safely index into them.
+
+### PayloadRef — the handle type
+
+`PayloadRef` is a discriminated union with three storage variants:
+
+```
+PayloadRef
+├── Inline   — value embedded directly in the ref (≤ max_inline_bytes, default 4 KB)
+│              std::string inline_data_
+│              toString() → direct return; no store lookup needed
+│
+├── External — value lives in the store's backing region; ref holds coordinates only
+│              uint64_t external_offset_
+│              size_t   external_length_
+│              toString() → PANIC — must go through PayloadStore::fetch()
+│
+└── Buffered — value in a heap Buffer::OwnedImpl
+               Buffer::InstancePtr buffered_data_
+               toString() → buffered_data_->toString()
+```
+
+`External` is the normal production variant for large fields. It stores two
+integers and nothing else — the bytes remain in the backing region until
+`fetch()` or `fetchAsync()` materialises them. Calling `toString()` directly on
+an `External` ref panics, surfacing any encoder that bypasses the store at test
+time.
+
+### PayloadStore interface
+
+```cpp
+class PayloadStore {
+  // One-shot store: returns a ref immediately.
+  virtual PayloadRef store(std::string data, PayloadKind) = 0;
+  virtual PayloadRef store(Buffer::Instance&, PayloadKind) = 0;
+
+  // Streaming store: write chunks incrementally, finalise when done.
+  virtual std::unique_ptr<StreamWriter> beginStore(PayloadKind) = 0;
+
+  // Materialise ref on the calling thread (sync; page-fault risk on External).
+  virtual void fetch(const PayloadRef&, FetchCallback) = 0;
+
+  // Materialise ref off the event loop; post result back via dispatcher.
+  virtual void fetchAsync(const PayloadRef&, Event::Dispatcher&, FetchCallback);
+};
+```
+
+`beginStore` / `StreamWriter` is the path used for the request body:
+`residual_writer_ = store_.beginStore(JsonObject)` opens a session at
+construction; each `append(chunk)` call extends it; `finalize()` returns the
+`PayloadRef` for the whole accumulated body.
+
+### Three-tier storage hierarchy
+
+The design recognises three tiers, each with its own trade-offs:
+
+```
+Tier   Variant    Implementation           Fetch mechanism
+────────────────────────────────────────────────────────────────────────
+  1    Inline /   InMemoryPayloadStore     toString() — synchronous,
+       Buffered   (heap Buffer::OwnedImpl) no I/O; always in RAM
+
+  2    External   MmapPayloadStore         pread() on detached thread;
+       (local)    (anonymous mmap file)    page faults off event loop;
+                                           doesn't count against malloc heap
+
+  3    Remote     (future implementation)  network I/O via fetchAsync();
+       External   e.g. Redis, shared       dispatcher.post(cb) when ready;
+                  content-addressed store  enables cross-request dedup
+```
+
+Tier 1 (heap) is the fallback when mmap is unavailable. It counts against the
+C++ allocator heap — up to 4 MB per request — and is not evictable under memory
+pressure.
+
+Tier 2 (mmap) absorbs body bytes in the OS page cache. Under memory pressure the
+kernel can evict cold pages; the allocator heap sees only the fixed parser
+overhead (~6 KB) regardless of body size. The read page-fault risk is isolated to
+`pread` threads by `prefetchExternalPayloadRefs`.
+
+Tier 3 (remote) is not yet implemented but the architecture supports it without
+changes to the decoder, handler, or encoder. A `RemotePayloadStore` would
+introduce a new `PayloadRef` variant (e.g., `Remote{key_hash, length}`) and
+implement `fetchAsync` as a network call. Content-addressed storage would allow
+identical tool schemas or system prompts shared across concurrent requests to
+occupy storage once. All callers already fan out through `prefetchExternalPayloadRefs`
+and wait for `on_done()` — a network-latency fetch is transparent to them.
+
+### Sub-refs and `makeSubRef`
+
+Both parsers create sub-refs of `residual_params` for captured sub-trees
+(`messages[i]`, `tools[i]`, `arguments`, `params_raw`, passthrough fields).
+`makeSubRef` produces the correct variant based on the parent's storage:
+
+```
+parent External → PayloadRef::makeExternal(parent.offset + field_start, field_len)
+                  zero additional copy — shares the same backing region
+
+parent Inline   → store_.store(parent.substr(field_start, field_len), kind)
+                  small copy; always fits in Inline
+
+parent Buffered → store_.store(extracted bytes, kind)
+                  Inline or Buffered depending on field_len vs max_inline_bytes
+```
+
+`makeSubRef` is a no-op when `field_len == 0` or the parent is empty, so
+callers do not need to guard against empty ranges.
+
+### How PayloadRef bridges parse time and encode time
+At finish(), byte-range pairs become PayloadRef::External sub-refs — pointer arithmetic only:
+
+
+makeSubRef(ref, elem_start, elem_end - elem_start, residual_params)
+  → PayloadRef::makeExternal(residual_params.offset + elem_start, length)
+The bytes have not moved. residual_params is External{0, body_size} — the whole body in mmap. 
+Each sub-ref is External{offset+start, len} — a window into the same mmap region. No copy, no parse.
+
+InferencePayload ends up holding:
+
+Typed fields: std::string model_, bool streaming, SamplingParams sampling_ — decoded, in heap
+Sub-tree refs: messages[], tools[], passthrough_fields[] — each an External{offset, len} pair into mmap
+
+### Storage strategy for the core split: typed extraction vs. raw capture
+
+`residual_writer_->append(chunk)` runs blindly on every chunk — it stores every
+byte of the body including the bytes for fields the cursor is simultaneously
+extracting as typed values. This means typed fields exist in two places after
+`finish()`:
+
+```
+Field            mmap (residual_params)             Heap (Inline / member string)
+─────────────────────────────────────────────────────────────────────────────────
+"model":"gpt-4o" raw JSON bytes, with quotes        payload.target.name = "gpt-4o"
+                 inside External{0, body_size}       decoded, no quotes, Inline ref
+"temperature":0.7 raw JSON bytes                    payload.sampling.temperature = 0.7
+                                                     double on stack/heap
+messages[i]      raw JSON bytes                     External{base+elem_start, len}
+                                                     — window into same mmap region
+```
+
+For typed scalars (`model`, `stream`, sampling params, `id`, `method`) the
+decoded C++ value on the heap and the raw bytes in `residual_params` are
+**intentional duplicates**:
+
+- The decoder needs the decoded value for routing and policy decisions
+  (`payload.target.name`, `request.streaming`, etc.).
+- The encoder writes typed fields directly from those decoded values, possibly
+  after chain-filter mutation.
+- `residual_params` must be the complete original body so that passthrough
+  sub-refs (`passthrough_fields`, `params_raw`) remain valid windows into it.
+  Selectively omitting extracted-field bytes from the mmap write would require
+  non-contiguous writes and invalidate all subsequent byte offsets.
+
+The duplication is negligible in practice: model names and sampling params total
+under ~200 bytes against a body of up to 4 MB. The cost of avoiding it
+(non-contiguous mmap writes, offset fixup) far exceeds the cost of the extra
+bytes.
+
+For sub-tree fields (`messages[]`, `tools[]`, `arguments`, `passthrough_fields`)
+there is **no duplication** — each is an `External{offset, len}` pair, a window
+into the same mmap region as `residual_params`, not a copy:
+
+```
+residual_params       External{0, 4096}      ← whole body
+messages[0]           External{42, 150}      ← window into same mmap region
+passthrough_fields[0] External{210, 38}      ← window into same mmap region
+```
+
+Summary:
+
+| Field category | mmap (`residual_params`) | Heap (`Inline` / member) | Duplication? |
+|---|---|---|---|
+| Typed scalars | Yes — raw JSON bytes | Yes — decoded C++ value | **Yes, ~200 B total** |
+| Sub-trees | Yes — raw JSON bytes | No — `External` sub-ref only | **No** |
+
+---
+
 ## Re-Assembly Path
 
-After parsing and prefetch, `RequestEncoder` / `AnthropicRequestEncoder`
-re-encodes the request:
+### Summary
 
-1. Parse `residual_params` (top-level fields the cursor didn't extract) from the
-   mmap-backed `PayloadRef` via `json::parse(payload->residual_params.toString())`.
-2. Overlay captured scalars: `body["model"] = payload->target.name`, `body["stream"] = ...`.
-3. Splice `messages[]` and `tools[]` back in from their `Buffered` refs via
-   `ref.toString()` — verbatim raw JSON bytes, no re-escaping.
-4. `body.dump()` → `addDecodedData()` → `continueDecoding()` → upstream.
+Re-Assembly Path is the encode half of the decode→encode pipeline. After the
+cursor+handler have parsed the request into typed fields and `PayloadRef`
+sub-refs, the encoder reconstructs a well-formed JSON body for the upstream
+provider.
 
-The original request body is consumed and discarded. The parser builds an
-`AiRequest` struct; the encoder re-serializes it, potentially translating
-format (e.g. OpenAI → Anthropic).
+Three things happen:
+
+1. **Typed scalars re-serialized** — `model`, `stream`, sampling params are
+   written from decoded C++ values via `addKey`/`addString`/`addNumber`. No
+   bytes read from mmap.
+
+2. **Sub-trees spliced verbatim** — `messages[]`, `tools[]`, and
+   `passthrough_fields` are `PayloadRef` windows into the mmap region. They are
+   emitted with `addRawJson(ref)` — zero parsing, the original bytes flow
+   straight through.
+
+3. **Format translation (Anthropic only)** — when the upstream provider speaks
+   a different schema (OpenAI→Anthropic), structural rewrites (system promotion,
+   tool result merging) are handled by a provider-specific `AnthropicDecodeHandler`
+   during the decode pass, producing a pre-organized `AnthropicInferencePayload`.
+   The encoder then serializes directly — no `json::parse`, no DOM.
+
+The result is streamed into the filter chain via `addDecodedData()` and
+forwarded upstream. The copy budget for large content is exactly three hops:
+network in → mmap → prefetch heap → upstream send buffer.
+
+---
+
+Two encode paths exist, with different DOM requirements.
+
+### OpenAI pass-through (`RequestEncoder::encodeInferenceBody`) — DOM-free
+
+`encodeInferenceBody` uses `Json::StringStreamer` throughout. No `json::parse`,
+no `nlohmann` DOM, no duplicate storage:
+
+1. **Extracted scalars** (`model`, `stream`, sampling params) — written directly
+   via `addKey` / `addString` / `addNumber`.
+2. **`messages[]` and `tools[]`** — each element is a `PayloadRef` sub-range of
+   `residual_params`; emitted verbatim with `addRawJson(convertPayloadRefToString(ref))`.
+3. **Passthrough depth-1 fields** (`response_format`, `tool_choice`,
+   `stream_options`, `logit_bias`, `user`, …) — captured during the decode pass
+   as byte-range sub-refs in `InferencePayload::passthrough_fields` and emitted
+   with `addRawJson`. No field enumeration or `json::parse` required.
+
+The full encode path is: `addKey`/`addRawJson` calls → `body.dump()` →
+`addDecodedData()` → upstream. The original body bytes flow from mmap through
+`PayloadRef` to the upstream socket touching only their two unavoidable copies
+(network buffer → mmap on decode; mmap → send buffer on encode).
+
+### Agentic JSON-RPC (`RequestEncoder::encodeAgentBody`) — DOM-free
+
+`encodeAgentBody` also uses `Json::StringStreamer` throughout. The JSON-RPC
+envelope (`jsonrpc`, `id`, `method`) is always rebuilt from typed fields on
+`AiRequest`. The `params` value depends on the invocation:
+
+**Category A — structured params** (ToolsCall, ResourcesRead/Subscribe/Unsubscribe,
+PromptsGet): `params` is rebuilt from the typed payload fields (`tool_name`,
+`resource_uri`, `prompt_name`), with the `arguments` blob injected verbatim via
+`addRawJson`. No `json::parse`.
+
+**Category B — pass-through params** (Initialize, Ping, ToolsList, ResourcesList,
+CompletionComplete, LoggingSetLevel, SamplingCreateMessage, all A2A operations):
+the entire `params_raw` blob — a zero-copy sub-ref of `residual_params` from the
+decode pass — is injected verbatim via `addRawJson`. The proxy has never looked
+inside it; it reaches upstream exactly as the client sent it.
+
+No DOM parse on either category. No duplicate storage.
+
+### MCP REST transcoding (`RequestEncoder::encodeAgentBodyAsRest`) — targeted DOM
+
+When an operator configures REST transcoding rules, `encodeAgentBodyAsRest`
+translates a JSON-RPC `tools/call` request into a REST HTTP call. This requires
+`json::parse(arguments)` for the ToolsCall case only — individual fields must be
+extracted from `arguments` to substitute into URL path templates like
+`/api/{resource.name}` and to build query parameters.
+
+All other operations (ToolsList, ResourcesList, ResourcesRead) construct their
+argument objects directly from typed fields (`resource_uri`) or use an empty
+object, with no parse.
+
+The DOM parse here is unavoidable: URL template substitution requires field-level
+access into the `arguments` object, which raw bytes cannot provide.
+
+### Anthropic (`AnthropicRequestEncoder::encode`) — target: DOM-free via provider-specific handler
+
+The Anthropic path performs OpenAI→Anthropic format translation. Three
+structural operations require knowledge of message order and role:
+
+1. **System message promotion** — `role:system` may appear anywhere in the
+   OpenAI array; Anthropic requires a top-level `"system"` field written before
+   `messages[]`.
+2. **Tool result merging** — consecutive `role:tool` messages are collapsed into
+   one `user` turn with `tool_result` content blocks, requiring lookahead.
+3. **Arguments double-encoding** — `tool_calls[].function.arguments` is a
+   JSON-encoded string in OpenAI; Anthropic requires an object, so the string
+   must be re-parsed as JSON.
+
+**Current implementation** pre-parses all message refs into a `std::vector<json>`
+before emitting anything. Peak memory: all message bytes exist simultaneously as
+`Buffered` refs **and** as nlohmann DOM nodes.
+
+**Target design — move structural work into the decode pass:**
+
+The WuffsJsonCursor already parses `messages[]` once during the decode pass.
+Re-parsing it in the encoder discards all structural knowledge the cursor already
+produced. The fix is a provider-specific `AnthropicDecodeHandler` that performs
+the structural work during the original cursor pass:
+
+- `role: "system"` → accumulate `content` into a `system_content` string (small,
+  just text; not a PayloadRef)
+- `role: "tool"` → buffer into a consecutive tool group (`vector<PayloadRef>`)
+- any other role → flush current tool group; store message as tagged `PayloadRef`
+
+This produces an `AnthropicInferencePayload` already organized for encoding:
+
+```
+system_content : string                    ← extracted during decode
+messages       : [{role, PayloadRef}]      ← non-system, in order
+tool_groups    : [vector<PayloadRef>]      ← pre-merged consecutive tool results
+```
+
+The Anthropic encoder then serializes the pre-organized structure directly —
+writes `"system"`, iterates messages, wraps tool groups — with zero `json::parse`
+calls and zero DOM allocation. The cursor does the structural work exactly once.
+
+**Remaining TODO (current code):** `encode()` also calls `json::parse(residual_params)`
+twice — once for the legacy `"prompt"` field and once for `tool_choice`, `top_k`,
+`metadata`. All four fields are already in `payload->passthrough_fields` as
+zero-copy sub-refs. Replacing both blocks with a linear scan over
+`passthrough_fields` (O(n), n < 10) eliminates two full-body DOM parses per
+request.
 
 
 ---
@@ -511,4 +826,34 @@ The `wuffs_json.h` header includes `wuffs-v0.4.c` without
 implementation exactly once.
 
 
+## The whole pipeline as a single flow
+
+Incoming chunks
+     │
+     ├─ residual_writer_->append(chunk)
+     │    └─ memcpy → mmap arena
+     │         body_src_pos_ advances with every wuffs token
+     │
+     └─ cursor_.feed(chunk)
+          ├─ selectStringTarget → &model_  → cursor fills it  (typed)
+          ├─ selectStringTarget → nullptr  → zero alloc        (discarded)
+          ├─ selectStringTarget → &passthrough_scratch_
+          │    → tok_start saved → range recorded in passthrough_ranges_
+          ├─ onPush(depth 3, in_messages_) → elem_start_ = tok_start
+          └─ onPop(depth 3)               → message_ranges_ ← {elem_start_, pos}
+
+finish()
+     ├─ typed fields → payload.target.name, payload.sampling, …
+     ├─ residual_params = External{0, body_size}   ← whole mmap region
+     ├─ message_ranges_ → makeSubRef → messages[i] = External{base+start, len}
+     └─ passthrough_ranges_ → makeSubRef → passthrough_fields[i] = External{…}
+
+prefetchExternalPayloadRefs()
+     └─ pread() per External ref on detached thread
+          → External → Buffered; on_done() when all complete
+
+RequestEncoder::encode*Body()
+     ├─ typed: addKey/addString/addNumber directly
+     └─ sub-trees: addRawJson(convertPayloadRefToString(ref))
+          └─ ref is now Buffered → one Buffer::toString() → verbatim bytes out
 
