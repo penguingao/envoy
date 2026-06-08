@@ -561,6 +561,13 @@ messages[0]           External{42, 150}      ← window into same mmap region
 passthrough_fields[0] External{210, 38}      ← window into same mmap region
 ```
 
+the same chunk bytes are written to two different destinations simultaneously. 
+Looking at the actual code in InferenceBodyParser::feed() (line 379–380 on the wuffs branch):
+
+residual_writer_->append(chunk);          // ① blind byte capture → mmap
+return cursor_.feed(chunk, /*closed=*/false);  // ② structural parse → Wuffs
+
+
 Summary:
 
 | Field category | mmap (`residual_params`) | Heap (`Inline` / member) | Duplication? |
@@ -828,32 +835,108 @@ implementation exactly once.
 
 ## The whole pipeline as a single flow
 
-Incoming chunks
-     │
-     ├─ residual_writer_->append(chunk)
-     │    └─ memcpy → mmap arena
-     │         body_src_pos_ advances with every wuffs token
-     │
-     └─ cursor_.feed(chunk)
-          ├─ selectStringTarget → &model_  → cursor fills it  (typed)
-          ├─ selectStringTarget → nullptr  → zero alloc        (discarded)
-          ├─ selectStringTarget → &passthrough_scratch_
-          │    → tok_start saved → range recorded in passthrough_ranges_
-          ├─ onPush(depth 3, in_messages_) → elem_start_ = tok_start
-          └─ onPop(depth 3)               → message_ranges_ ← {elem_start_, pos}
+──── Stage 1 — AiProtocolManagerFilter::decodeData ────────────────────────────
 
-finish()
+HTTP body chunks arrive per Envoy buffer slice.
+     │
+     └─ decoder_.onData(chunk)  [per slice]
+          → RequestDecoder dispatches to the active parser
+
+──── Stage 2 — Parser::feed(chunk) — Dual Write ────────────────────────────────
+
+Both parsers perform the same dual write on every chunk:
+
+     ├─ residual_writer_->append(chunk)   ← blind byte capture → mmap arena (copy ①)
+     │    no parsing; bytes land in OS page cache
+     │
+     └─ cursor_.feed(chunk)               ← structural parse → Wuffs tokenizer
+
+──── Stage 3 — Wuffs Tokenizer (WuffsJsonCursor) ───────────────────────────────
+
+Stackless coroutine; suspends on short_read, resumes across chunk boundaries.
+tok_start = body_src_pos_ before token; body_src_pos_ += tlen after.
+
+──── Stage 4 — VBC Dispatch ────────────────────────────────────────────────────
+
+     FILLER    (whitespace, ':', ',')   → skip
+     STRUCTURE ({ } [ ])               → depth tracking → onPush / onPop
+     STRING    (content / " DROP)       → accumulate → onStringComplete
+     NUMBER                             → onScalar
+     LITERAL   (true/false/null)        → onScalar
+
+──── Stage 5 — Handler Callbacks ───────────────────────────────────────────────
+
+Classifier in onHeaders() selects the active handler:
+
+  ParsingInferenceBody → InferenceBodyParser   (REST JSON — OpenAI-format)
+  ParsingAgentBody     → AgentBodyParser        (JSON-RPC — MCP / A2A)
+
+InferenceBodyParser:
+     ├─ selectStringTarget → &model_              → typed capture
+     ├─ selectStringTarget → nullptr              → discard (zero alloc)
+     ├─ selectStringTarget → &passthrough_scratch_
+     │    → passthrough_string_start_ = tok_start; range pushed on completion
+     ├─ onScalar(depth=1)  → sampling params, stream flag, passthrough scalars
+     ├─ onPush(depth=2, key="messages")  → in_messages_ = true
+     ├─ onPush(depth=3, in_messages_)   → elem_start_ = tok_start
+     ├─ onPop(depth=3, in_elem_)        → message_ranges_.push_back({elem_start_, tok_end})
+     └─ onPop(depth=2, passthrough)     → passthrough_ranges_.push_back({key, start, tok_end})
+
+AgentBodyParser:
+     ├─ onStringComplete(depth=1, key="id")     → id_ string (JSON-RPC id)
+     ├─ onStringComplete(depth=1, key="method") → method_ string
+     ├─ onPush(depth=2, key="params")           → params_byte_start_ = tok_start
+     ├─ onPop(depth=2, key="params")            → params_byte_end_ = tok_end
+     └─ onPush(depth=3, key="arguments")        → arguments_byte_start_
+     finish(): re-runs classifier with method_ → resolves AgentInvocation + dialect
+
+──── Stage 6 — finish() — Materialise Sub-Refs ─────────────────────────────────
+
      ├─ typed fields → payload.target.name, payload.sampling, …
-     ├─ residual_params = External{0, body_size}   ← whole mmap region
-     ├─ message_ranges_ → makeSubRef → messages[i] = External{base+start, len}
+     ├─ residual_params = residual_writer_->finalize()
+     │    → External{offset=0, length=body_size}   (whole mmap region)
+     ├─ message_ranges_ → makeSubRef → messages[i]        = External{base+start, len}
+     ├─ tool_ranges_    → makeSubRef → tools[i]           = External{…}
      └─ passthrough_ranges_ → makeSubRef → passthrough_fields[i] = External{…}
 
-prefetchExternalPayloadRefs()
-     └─ pread() per External ref on detached thread
-          → External → Buffered; on_done() when all complete
+No bytes copied — only {offset, length} integers created per element.
 
-RequestEncoder::encode*Body()
-     ├─ typed: addKey/addString/addNumber directly
-     └─ sub-trees: addRawJson(convertPayloadRefToString(ref))
-          └─ ref is now Buffered → one Buffer::toString() → verbatim bytes out
+──── Stage 7 — prefetchExternalPayloadRefs (off event loop) ─────────────────────
+
+     pread(mmap_fd, buf, length, offset) per External ref on detached thread  (copy ②)
+     → External{offset, len} upgraded to Buffered{heap OwnedImpl}
+     → on_done() fires on dispatcher thread when all refs are ready
+
+──── Stage 8 — Re-Assembly Path (Encoder) ──────────────────────────────────────
+
+OpenAI pass-through — DOM-free:
+     ├─ typed scalars: addKey/addString/addNumber from C++ values
+     └─ large content: addRawJson(convertPayloadRefToString(ref))
+          ref is Buffered → original bytes flow verbatim into output
+
+Anthropic — one SAX pass over messages[], per-message DOM:
+     ├─ prepareAnthropicMessages: WuffsJsonObjectReader extracts role only (no DOM)
+     │    role=system → system_content string
+     │    role=tool   → pending tool group
+     │    other       → Entry{role, ref}
+     ├─ buildMessages: one json::parse per message for format conversion
+     └─ passthrough_fields scan: tool_choice / top_k / metadata via PayloadRef
+
+Agentic — DOM-free:
+     ├─ Category A (ToolsCall, ResourcesRead, PromptsGet):
+     │    typed fields + addRawJson(arguments)
+     └─ Category B (Initialize, Ping, list ops, A2A):
+          addRawJson(params_raw) verbatim
+
+──── Stage 9 — Forward Upstream ────────────────────────────────────────────────
+
+addDecodedData() injects encoded body into filter chain → upstream cluster  (copy ③)
+
+──── Copy Budget ────────────────────────────────────────────────────────────────
+
+  ① network buffer → mmap        (unavoidable: Envoy recycles buffers per chunk)
+  ② mmap → heap Buffered         (unavoidable: background prefetch, page faults off event loop)
+  ③ heap → upstream send buffer  (unavoidable: upstream needs its own writable buffer)
+
+Between ① and ③: only {offset, length} integers touch large content — zero byte copies.
 
