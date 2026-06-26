@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.ai_protocol_manager.v3;
+
+import "envoy/config/core/v3/extension.proto";
+
+import "udpa/annotations/status.proto";
+import "xds/annotations/v3/status.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.ai_protocol_manager.v3";
+option java_outer_classname = "AiProtocolManagerProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ai_protocol_manager/v3;ai_protocol_managerv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: AI Protocol Manager]
+// [#extension: envoy.filters.http.ai_protocol_manager]
+
+// One JSON path for the streaming Wuffs decoder to pre-extract into
+// ``AiRequest.attributes``.  Use dot-notation; ``[]`` denotes an array wildcard.
+//
+// Examples:
+//   ``params.arguments.database``  — depth-3 dict field
+//   ``messages[].role``            — per-element field in a top-level array
+message ExtractFieldSpec {
+  // The JSON path to extract.  Required.
+  string json_path = 1;
+}
+
+// Decoder configuration for the AI Protocol Manager.
+//
+// These settings are applied to every request decoded by the filter;
+// they can be updated without a listener drain via ECDS.
+message DecoderConfig {
+  // Operator-configured JSON paths to pre-extract into ``AiRequest.attributes``
+  // during streaming Wuffs parsing.
+  //
+  // Filters in the AI chain (e.g. ``mcp_auth``) can then read these values
+  // from ``AiRequest.attributes`` via ``ParamCondition.field = ATTRIBUTE``
+  // without needing to parse ``params_raw`` themselves.
+  //
+  // Zero overhead for unconfigured paths — the Wuffs tokenizer discards
+  // unmatched string values before any allocation occurs.
+  repeated ExtractFieldSpec extract_fields = 1;
+}
+
+// Top-level configuration for the AI Protocol Manager HTTP filter.
+//
+// The AI Protocol Manager classifies each incoming AI request (inference vs.
+// agentic), builds the appropriate AI filter chain, and dispatches through it.
+message AiProtocolManager {
+  // Ordered list of AI filters to run for each AI request.
+  //
+  // Mirrors the ``http_filters`` list in HCM: filters are instantiated and
+  // run in declaration order. Each entry's ``typed_config`` is unpacked
+  // and passed to the corresponding ``NamedAiFilterConfigFactory``.
+  repeated config.core.v3.TypedExtensionConfig ai_filters = 1;
+
+  // Per-route REST transcoder config.
+  //
+  // When set via ``typed_per_filter_config`` on a route, outgoing MCP/A2A
+  // requests are lowered from the protocol-neutral ``AiRequest`` representation
+  // to plain JSON REST rather than being re-wrapped in JSON-RPC.
+  // ``ai_filters`` is ignored when this message is used as a per-route config.
+  //
+  // Example route config (RDS):
+  //
+  // .. code-block:: yaml
+  //
+  //   typed_per_filter_config:
+  //     envoy.filters.http.ai_protocol_manager:
+  //       "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+  //       rest_transcoder:
+  //         tools:
+  //           - tool_name: search
+  //             http_rule: { get: "/api/search?q={query}" }
+  //         tools_list_rule: { get: "/api/tools" }
+  McpRestTranscoderConfig rest_transcoder = 2;
+
+  // Decoder configuration — controls which JSON paths the streaming Wuffs
+  // parser pre-extracts into ``AiRequest.attributes``.  Can be pushed
+  // dynamically via ECDS without a listener drain.
+  DecoderConfig decoder_config = 3;
+}
+
+// Per-route REST transcoding rules for the AI Protocol Manager.
+//
+// Each field maps a specific ``AgentInvocation`` type to an ``HttpRule`` that
+// describes the REST endpoint the backend exposes. The ``RequestEncoder`` uses
+// these rules to lower the already-parsed ``AgentPayload`` fields (tool_name,
+// arguments, resource_uri, …) directly into the REST HTTP request — no
+// re-parsing of the incoming body is required.
+message McpRestTranscoderConfig {
+  // Mappings from MCP tool names to REST HTTP rules (used for tools/call).
+  repeated ToolHttpRule tools = 1;
+
+  // REST mapping for tools/list requests (optional).
+  // Typically: ``{ get: "/tools" }``
+  HttpRule tools_list_rule = 2;
+
+  // REST mapping for resources/list requests (optional).
+  HttpRule resources_list_rule = 3;
+
+  // REST mapping for resources/read requests (optional).
+  // The ``{uri}`` template variable is substituted with ``AgentPayload.resource_uri``.
+  HttpRule resources_read_rule = 4;
+}
+
+// Maps a single MCP tool name to a REST HTTP rule.
+message ToolHttpRule {
+  // The MCP tool name as it appears in ``tools/call`` params (e.g. "search").
+  string tool_name = 1;
+
+  // The REST mapping for this tool's invocation.
+  HttpRule http_rule = 2;
+}
+
+// Describes how to map AgentPayload fields to a REST HTTP request.
+//
+// Identical semantics to the ``HttpRule`` in ``mcp_json_rest_bridge``:
+//
+// - Path variables ``{var}`` are substituted from the arguments JSON.
+// - ``body: "*"`` maps all non-path arguments to the request body.
+// - ``body: "field"`` maps that specific argument field to the body.
+// - Arguments not consumed by path or body become URL query parameters.
+// [#next-free-field: 7]
+message HttpRule {
+  // Maps to HTTP GET. Value is the URL path template.
+  string get = 1;
+  // Maps to HTTP PUT.
+  string put = 2;
+  // Maps to HTTP POST.
+  string post = 3;
+  // Maps to HTTP DELETE.
+  string delete = 4;
+  // Maps to HTTP PATCH.
+  string patch = 5;
+  // Field from the arguments JSON to use as the request body.
+  // Use ``"*"`` for all non-path fields; omit for no body.
+  string body = 6;
+}

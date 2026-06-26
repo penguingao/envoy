@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.ai_filters.mcp_auth.v3;
+
+import "udpa/annotations/status.proto";
+import "xds/annotations/v3/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.ai_filters.mcp_auth.v3";
+option java_outer_classname = "McpAuthProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ai_filters/mcp_auth/v3;mcp_authv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: MCP Auth Filter]
+// [#extension: envoy.ai_filters.mcp_auth]
+
+// Matches a string value using one of three modes.
+message StringMatcher {
+  oneof match_pattern {
+    // Exact equality.  ``"search"`` matches only ``"search"``.
+    string exact = 1;
+
+    // The value must start with this prefix.  ``"docs/"`` matches
+    // ``"docs/readme"`` and ``"docs/api/v2"``.
+    string prefix = 2;
+
+    // The value must end with this suffix.  ``".json"`` matches
+    // ``"schema.json"`` and ``"api/schema.json"``.
+    string suffix = 3;
+  }
+}
+
+// A condition on one MCP-specific param field extracted from the request.
+// All conditions on a ``MethodPolicy`` must hold for the policy to match.
+message ParamCondition {
+  // Identifies which MCP param field to inspect.
+  enum Field {
+    // ``AgentPayload.tool_name`` — the tool name inside a ``tools/call`` request.
+    TOOL_NAME = 0;
+
+    // ``AgentPayload.resource_uri`` — the URI in ``resources/read``,
+    // ``resources/subscribe``, ``resources/unsubscribe``.
+    RESOURCE_URI = 1;
+
+    // ``AgentPayload.prompt_name`` — the prompt name in ``prompts/get``.
+    PROMPT_NAME = 2;
+
+    // An arbitrary key from ``AiRequest.attributes``, pre-extracted by the
+    // Wuffs streaming decoder from a JSON path declared in
+    // ``DecoderConfig.extract_fields``.  Use this to gate access on depth-3+
+    // fields that the typed AgentPayload does not carry, e.g.
+    // ``params.arguments.database`` or ``params.arguments.user_id``.
+    //
+    // ``attribute_key`` must be set to the exact JSON path used in
+    // ``extract_fields`` (e.g. ``"params.arguments.database"``).
+    ATTRIBUTE = 3;
+  }
+
+  // The param field to test.  Required.
+  Field field = 1;
+
+  // How to match the field value.  Required.
+  StringMatcher matcher = 2;
+
+  // The ``AiRequest.attributes`` key to read when ``field == ATTRIBUTE``.
+  // Must exactly match the ``json_path`` entry in ``DecoderConfig.extract_fields``.
+  // Ignored for all other field types.
+  string attribute_key = 3;
+}
+
+// Maps a JSON-RPC method name pattern to the set of principals allowed to call it,
+// with optional MCP-specific param conditions.
+//
+// A rule matches a request when:
+//   1. ``method_pattern`` matches the JSON-RPC method name, AND
+//   2. every entry in ``param_conditions`` matches its designated param field.
+//
+// Rules are evaluated in order; the first matching rule wins. Methods not matched
+// by any rule are accessible to any authenticated principal (default allow).
+message MethodPolicy {
+  // Pattern to match the JSON-RPC method name.
+  //
+  // Two matching modes:
+  //   - Exact match: ``"tools/call"`` matches only that method.
+  //   - Prefix match: a pattern ending with ``"*"`` matches any method whose name
+  //     starts with the prefix before the ``*``.
+  //     Example: ``"admin/*"`` matches ``"admin/restart"``, ``"admin/shutdown"``, etc.
+  //
+  // Required.
+  string method_pattern = 1 [(validate.rules).string.min_len = 1];
+
+  // Principals that may call methods matching this policy.
+  //
+  // ``"*"`` matches any authenticated principal.
+  // An empty list denies all authenticated principals for matched methods.
+  repeated string allowed_principals = 2;
+
+  // Optional MCP param conditions.  ALL must match for the policy to apply.
+  //
+  // Example — allow only ``"alice"`` to call ``tools/call`` with tool ``"delete"``:
+  //
+  // .. code-block:: yaml
+  //
+  //   method_pattern: "tools/call"
+  //   allowed_principals: ["alice"]
+  //   param_conditions:
+  //   - field: TOOL_NAME
+  //     matcher:
+  //       exact: "delete"
+  repeated ParamCondition param_conditions = 3;
+}
+
+// Configuration for the MCP authentication AI filter.
+//
+// McpAuthFilter is the authentication gate in the AI filter chain.
+// It runs before all other filters so that unauthenticated requests are
+// rejected as early as possible, before params are fully parsed.
+//
+// Analogous to ``envoy.filters.http.ext_authz`` in the HTTP filter chain.
+message McpAuthConfig {
+  // HTTP header whose value identifies the session principal (e.g. a JWT
+  // sub, an API key, or an OAuth2 client_id).
+  //
+  // When present in the request, its value is stored as the session's
+  // ``principal`` and ``isAuthenticated()`` returns true.
+  //
+  // Defaults to ``"x-mcp-identity"`` when empty.
+  string identity_header = 1;
+
+  // JSON-RPC methods that bypass authentication entirely.
+  //
+  // ``"initialize"`` is always in this list regardless of configuration —
+  // the MCP handshake must be reachable before a session is authenticated.
+  //
+  // Example: ``["initialize", "ping"]``
+  repeated string allowed_unauthenticated_methods = 2;
+
+  // Deprecated: use ``method_policies`` instead.
+  //
+  // Any method whose name starts with this prefix is only accessible to
+  // sessions whose ``principal`` equals ``"admin"``. Ignored when
+  // ``method_policies`` is non-empty.
+  //
+  // Defaults to ``"admin/"`` when empty.
+  string admin_method_prefix = 3 [deprecated = true];
+
+  // Per-method access policies, evaluated in order; first match wins.
+  //
+  // When non-empty these rules replace ``admin_method_prefix`` entirely.
+  // Methods not matched by any rule are accessible to any authenticated principal.
+  //
+  // Example — restrict ``admin/*`` to ``"admin"`` and ``"ops"``, allow all
+  // authenticated principals for ``tools/*``, deny ``debug/*`` entirely:
+  //
+  // .. code-block:: yaml
+  //
+  //   method_policies:
+  //   - method_pattern: "admin/*"
+  //     allowed_principals: ["admin", "ops"]
+  //   - method_pattern: "tools/*"
+  //     allowed_principals: ["*"]
+  //   - method_pattern: "debug/*"
+  //     allowed_principals: []
+  repeated MethodPolicy method_policies = 4;
+}
