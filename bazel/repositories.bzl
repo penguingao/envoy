@@ -204,6 +204,7 @@ def envoy_dependencies(skip_targets = []):
     _cpp2sky()
     _hessian2_codec()
     _nlohmann_json()
+    _simdjson()
     _su_exec()
     _abseil_cpp()
     _googletest()
@@ -690,6 +691,12 @@ def _cpp2sky():
 def _nlohmann_json():
     external_http_archive(
         name = "nlohmann_json",
+    )
+
+def _simdjson():
+    external_http_archive(
+        name = "simdjson",
+        build_file = "@envoy//bazel/external:simdjson.BUILD",
     )
 
 def _hessian2_codec():

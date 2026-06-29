@@ -392,6 +392,11 @@ REPOSITORY_LOCATIONS_SPEC = dict(
         # This has replaced rapidJSON used in extensions and may also be a fast
         # replacement for protobuf JSON.
     ),
+    simdjson = dict(
+        version = "4.6.4",
+        sha256 = "ccd85a1f1f9e43485c5661742b52bebf4806d1c7aa617cdb658a56dfa356e5a7",
+        urls = ["https://github.com/simdjson/simdjson/releases/download/v{version}/singleheader.zip"],
+    ),
     # This is an external dependency needed while running the
     # envoy docker image. A bazel target has been created since
     # there is no binary package available for the utility on Ubuntu
