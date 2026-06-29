@@ -52,10 +52,6 @@ void AiProtocolManagerFilter::DecodeCallbacks::injectData(Buffer::Instance& data
   filter_.decoder_callbacks_->injectDecodedDataToFilterChain(data, end_stream);
 }
 
-void AiProtocolManagerFilter::DecodeCallbacks::continueIteration() {
-  filter_.decoder_callbacks_->continueDecoding();
-}
-
 void AiProtocolManagerFilter::DecodeCallbacks::onFailure(absl::Status status) {
   filter_.decoder_callbacks_->sendLocalReply(
       Http::Code::InternalServerError, absl::StrCat("External buffer error: ", status.message()),

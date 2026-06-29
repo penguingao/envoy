@@ -20,9 +20,8 @@ class AiProtocolManagerFilterTest : public testing::Test {
 public:
   AiProtocolManagerFilterTest() {
     ON_CALL(decoder_callbacks_, addUpstreamWatermarkCallbacks(_))
-        .WillByDefault(Invoke([this](Http::UpstreamWatermarkCallbacks& cb) {
-          upstream_watermark_callbacks_ = &cb;
-        }));
+        .WillByDefault(Invoke(
+            [this](Http::UpstreamWatermarkCallbacks& cb) { upstream_watermark_callbacks_ = &cb; }));
     ON_CALL(decoder_callbacks_, removeUpstreamWatermarkCallbacks(_))
         .WillByDefault(Invoke([this](Http::UpstreamWatermarkCallbacks& cb) {
           if (upstream_watermark_callbacks_ == &cb) {
@@ -68,7 +67,6 @@ TEST_F(AiProtocolManagerFilterTest, BufferMultipleChunksAndInject) {
     InSequence s;
     EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
     EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
-    EXPECT_CALL(decoder_callbacks_, continueDecoding());
   }
   EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_.decodeData(chunk1, false));
 
@@ -119,11 +117,10 @@ TEST_F(AiProtocolManagerFilterTest, DownstreamBackpressurePausesAndResumes) {
   // First chunk injection, during which we simulate next filters becoming backed up:
   EXPECT_CALL(decoder_callbacks_,
               injectDecodedDataToFilterChain(BufferString(std::string(1024, 'a')), false))
-      .WillOnce(
-          Invoke([this](Buffer::Instance&, bool) {
-            ASSERT_NE(upstream_watermark_callbacks_, nullptr);
-            upstream_watermark_callbacks_->onAboveWriteBufferHighWatermark();
-          }));
+      .WillOnce(Invoke([this](Buffer::Instance&, bool) {
+        ASSERT_NE(upstream_watermark_callbacks_, nullptr);
+        upstream_watermark_callbacks_->onAboveWriteBufferHighWatermark();
+      }));
 
   // Trigger decodeData. It should pause after the first chunk.
   EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_.decodeData(request_data, true));

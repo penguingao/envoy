@@ -36,11 +36,6 @@ public:
     virtual void injectData(Buffer::Instance& data, bool end_stream) = 0;
 
     /**
-     * Continues filter chain iteration.
-     */
-    virtual void continueIteration() = 0;
-
-    /**
      * Handles failure (e.g., sends local reply or resets stream).
      */
     virtual void onFailure(absl::Status status) = 0;

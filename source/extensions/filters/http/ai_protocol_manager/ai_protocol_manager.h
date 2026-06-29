@@ -28,7 +28,6 @@ private:
     void pauseSource() override;
     void resumeSource() override;
     void injectData(Buffer::Instance& data, bool end_stream) override;
-    void continueIteration() override;
     void onFailure(absl::Status status) override;
     Event::Dispatcher& dispatcher() override;
     AiProtocolManagerFilter& filter_;

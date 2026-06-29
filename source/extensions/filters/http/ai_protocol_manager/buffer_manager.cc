@@ -85,8 +85,6 @@ void BufferManager::onWriteCompleteInternal(absl::Status status) {
     callbacks_.resumeSource();
     if (seen_end_stream_) {
       startReadingBack();
-    } else {
-      callbacks_.continueIteration();
     }
   }
 }
