@@ -19,6 +19,8 @@ public:
   void onDestroy() override;
 
   // Http::StreamDecoderFilter
+  Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers,
+                                          bool end_stream) override;
   Http::FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) override;
   void setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) override;
 
@@ -36,6 +38,8 @@ private:
   DecodeCallbacks decode_callbacks_{*this};
   std::unique_ptr<BufferManager> decode_buffer_manager_;
   const uint64_t chunk_size_ = 1024; // 1KB chunks for streaming back
+
+  bool headers_paused_{false};
 };
 
 } // namespace AiProtocolManager

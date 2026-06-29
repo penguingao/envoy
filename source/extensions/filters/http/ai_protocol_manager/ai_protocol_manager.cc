@@ -35,8 +35,22 @@ void AiProtocolManagerFilter::setDecoderFilterCallbacks(
       });
 }
 
+Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap&,
+                                                                 bool end_stream) {
+  if (end_stream) {
+    return Http::FilterHeadersStatus::Continue;
+  }
+  headers_paused_ = true;
+  return Http::FilterHeadersStatus::StopIteration;
+}
+
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data,
                                                            bool end_stream) {
+  if (headers_paused_ && end_stream) {
+    headers_paused_ = false;
+    decoder_callbacks_->continueDecoding();
+  }
+
   return decode_buffer_manager_->onData(data, end_stream);
 }
 

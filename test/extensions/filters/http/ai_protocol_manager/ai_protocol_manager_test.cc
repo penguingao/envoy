@@ -40,15 +40,18 @@ public:
 
 TEST_F(AiProtocolManagerFilterTest, BufferSingleChunkAndInject) {
   Http::TestRequestHeaderMapImpl request_headers;
-  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
+            filter_.decodeHeaders(request_headers, false));
 
   Buffer::OwnedImpl request_data("hello world");
 
   // We expect:
-  // 1. High watermark triggered when write starts (pauses client).
-  // 2. Low watermark triggered when write completes (resumes client).
-  // 3. Data injected.
+  // 1. continueDecoding() called because of end_stream.
+  // 2. High watermark triggered when write starts (pauses client).
+  // 3. Low watermark triggered when write completes (resumes client).
+  // 4. Data injected.
   InSequence s;
+  EXPECT_CALL(decoder_callbacks_, continueDecoding());
   EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
   EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
   EXPECT_CALL(decoder_callbacks_,
@@ -59,7 +62,8 @@ TEST_F(AiProtocolManagerFilterTest, BufferSingleChunkAndInject) {
 
 TEST_F(AiProtocolManagerFilterTest, BufferMultipleChunksAndInject) {
   Http::TestRequestHeaderMapImpl request_headers;
-  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
+            filter_.decodeHeaders(request_headers, false));
 
   // Chunk 1:
   Buffer::OwnedImpl chunk1("hello ");
@@ -74,6 +78,7 @@ TEST_F(AiProtocolManagerFilterTest, BufferMultipleChunksAndInject) {
   Buffer::OwnedImpl chunk2("world");
   {
     InSequence s;
+    EXPECT_CALL(decoder_callbacks_, continueDecoding());
     EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
     EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
     EXPECT_CALL(decoder_callbacks_,
@@ -84,12 +89,14 @@ TEST_F(AiProtocolManagerFilterTest, BufferMultipleChunksAndInject) {
 
 TEST_F(AiProtocolManagerFilterTest, BufferLargePayloadAndInjectChunks) {
   Http::TestRequestHeaderMapImpl request_headers;
-  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
+            filter_.decodeHeaders(request_headers, false));
 
   std::string large_payload(2500, 'a');
   Buffer::OwnedImpl request_data(large_payload);
 
   InSequence s;
+  EXPECT_CALL(decoder_callbacks_, continueDecoding());
   EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
   EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
   EXPECT_CALL(decoder_callbacks_,
@@ -104,12 +111,14 @@ TEST_F(AiProtocolManagerFilterTest, BufferLargePayloadAndInjectChunks) {
 
 TEST_F(AiProtocolManagerFilterTest, DownstreamBackpressurePausesAndResumes) {
   Http::TestRequestHeaderMapImpl request_headers;
-  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
+            filter_.decodeHeaders(request_headers, false));
 
   std::string large_payload(2500, 'a');
   Buffer::OwnedImpl request_data(large_payload);
 
   InSequence s;
+  EXPECT_CALL(decoder_callbacks_, continueDecoding());
   // Flow control for client during write:
   EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
   EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
@@ -137,7 +146,8 @@ TEST_F(AiProtocolManagerFilterTest, DownstreamBackpressurePausesAndResumes) {
 
 TEST_F(AiProtocolManagerFilterTest, BackpressurePresentBeforeReadBack) {
   Http::TestRequestHeaderMapImpl request_headers;
-  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
+            filter_.decodeHeaders(request_headers, false));
 
   Buffer::OwnedImpl request_data("hello world");
 
@@ -147,6 +157,7 @@ TEST_F(AiProtocolManagerFilterTest, BackpressurePresentBeforeReadBack) {
 
   {
     InSequence s;
+    EXPECT_CALL(decoder_callbacks_, continueDecoding());
     // Flow control for client during write:
     EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
     EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
@@ -164,10 +175,12 @@ TEST_F(AiProtocolManagerFilterTest, BackpressurePresentBeforeReadBack) {
 
 TEST_F(AiProtocolManagerFilterTest, EmptyPayloadInjectsEmpty) {
   Http::TestRequestHeaderMapImpl request_headers;
-  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
+            filter_.decodeHeaders(request_headers, false));
 
   Buffer::OwnedImpl request_data("");
 
+  EXPECT_CALL(decoder_callbacks_, continueDecoding());
   EXPECT_CALL(decoder_callbacks_, injectDecodedDataToFilterChain(BufferString(""), true));
 
   EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_.decodeData(request_data, true));
