@@ -19,12 +19,23 @@ namespace AiProtocolManager {
 class AiProtocolManagerFilterTest : public testing::Test {
 public:
   AiProtocolManagerFilterTest() {
+    ON_CALL(decoder_callbacks_, addUpstreamWatermarkCallbacks(_))
+        .WillByDefault(Invoke([this](Http::UpstreamWatermarkCallbacks& cb) {
+          upstream_watermark_callbacks_ = &cb;
+        }));
+    ON_CALL(decoder_callbacks_, removeUpstreamWatermarkCallbacks(_))
+        .WillByDefault(Invoke([this](Http::UpstreamWatermarkCallbacks& cb) {
+          if (upstream_watermark_callbacks_ == &cb) {
+            upstream_watermark_callbacks_ = nullptr;
+          }
+        }));
     filter_.setDecoderFilterCallbacks(decoder_callbacks_);
     filter_.setEncoderFilterCallbacks(encoder_callbacks_);
   }
 
   NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks_;
   NiceMock<Http::MockStreamEncoderFilterCallbacks> encoder_callbacks_;
+  Http::UpstreamWatermarkCallbacks* upstream_watermark_callbacks_{nullptr};
   AiProtocolManagerFilter filter_;
 };
 
@@ -109,7 +120,10 @@ TEST_F(AiProtocolManagerFilterTest, DownstreamBackpressurePausesAndResumes) {
   EXPECT_CALL(decoder_callbacks_,
               injectDecodedDataToFilterChain(BufferString(std::string(1024, 'a')), false))
       .WillOnce(
-          Invoke([this](Buffer::Instance&, bool) { filter_.onAboveWriteBufferHighWatermark(); }));
+          Invoke([this](Buffer::Instance&, bool) {
+            ASSERT_NE(upstream_watermark_callbacks_, nullptr);
+            upstream_watermark_callbacks_->onAboveWriteBufferHighWatermark();
+          }));
 
   // Trigger decodeData. It should pause after the first chunk.
   EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_.decodeData(request_data, true));
@@ -120,7 +134,8 @@ TEST_F(AiProtocolManagerFilterTest, DownstreamBackpressurePausesAndResumes) {
   EXPECT_CALL(decoder_callbacks_,
               injectDecodedDataToFilterChain(BufferString(std::string(452, 'a')), true));
 
-  filter_.onBelowWriteBufferLowWatermark();
+  ASSERT_NE(upstream_watermark_callbacks_, nullptr);
+  upstream_watermark_callbacks_->onBelowWriteBufferLowWatermark();
 }
 
 TEST_F(AiProtocolManagerFilterTest, BackpressurePresentBeforeReadBack) {
@@ -130,7 +145,8 @@ TEST_F(AiProtocolManagerFilterTest, BackpressurePresentBeforeReadBack) {
   Buffer::OwnedImpl request_data("hello world");
 
   // Simulate next filters backed up.
-  filter_.onAboveWriteBufferHighWatermark();
+  ASSERT_NE(upstream_watermark_callbacks_, nullptr);
+  upstream_watermark_callbacks_->onAboveWriteBufferHighWatermark();
 
   {
     InSequence s;
@@ -145,7 +161,8 @@ TEST_F(AiProtocolManagerFilterTest, BackpressurePresentBeforeReadBack) {
   // Now resume, and expect the injection.
   EXPECT_CALL(decoder_callbacks_,
               injectDecodedDataToFilterChain(BufferString("hello world"), true));
-  filter_.onBelowWriteBufferLowWatermark();
+  ASSERT_NE(upstream_watermark_callbacks_, nullptr);
+  upstream_watermark_callbacks_->onBelowWriteBufferLowWatermark();
 }
 
 TEST_F(AiProtocolManagerFilterTest, EmptyPayloadInjectsEmpty) {

@@ -24,8 +24,14 @@ envoy_cc_library(
 
 envoy_cc_library(
     name = "ai_protocol_manager_lib",
-    srcs = ["ai_protocol_manager.cc"],
-    hdrs = ["ai_protocol_manager.h"],
+    srcs = [
+        "ai_protocol_manager.cc",
+        "buffer_manager.cc",
+    ],
+    hdrs = [
+        "ai_protocol_manager.h",
+        "buffer_manager.h",
+    ],
     deps = [
         ":ai_protocol_manager_buffer_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
