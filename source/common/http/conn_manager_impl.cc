@@ -2090,6 +2090,7 @@ void ConnectionManagerImpl::ActiveStream::onDecoderFilterBelowWriteBufferLowWate
   // teardown the codec will unwind any remaining read disable calls.
   if (!filter_manager_.destroyed()) {
     response_encoder_->getStream().readDisable(false);
+    filter_manager_.callLowUpstreamWatermarkCallbacks();
   }
   connection_manager_.stats_.named_.downstream_flow_control_resumed_reading_total_.inc();
 }
@@ -2097,6 +2098,7 @@ void ConnectionManagerImpl::ActiveStream::onDecoderFilterBelowWriteBufferLowWate
 void ConnectionManagerImpl::ActiveStream::onDecoderFilterAboveWriteBufferHighWatermark() {
   ENVOY_STREAM_LOG(debug, "Read-disabling downstream stream due to filter callbacks.", *this);
   response_encoder_->getStream().readDisable(true);
+  filter_manager_.callHighUpstreamWatermarkCallbacks();
   connection_manager_.stats_.named_.downstream_flow_control_paused_reading_total_.inc();
 }
 

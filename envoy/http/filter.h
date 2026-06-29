@@ -31,6 +31,16 @@ class RouteConfigProvider;
 namespace Http {
 
 /**
+ * Callbacks for upstream watermark limits.
+ */
+class UpstreamWatermarkCallbacks {
+public:
+  virtual ~UpstreamWatermarkCallbacks() = default;
+  virtual void onAboveWriteBufferHighWatermark() PURE;
+  virtual void onBelowWriteBufferLowWatermark() PURE;
+};
+
+/**
  * Return codes for encode/decode headers filter invocations. The connection manager bases further
  * filter invocations on the return code of the previous filter.
  */
@@ -838,6 +848,16 @@ public:
    * It is not safe to call this from under the stack of a DownstreamWatermarkCallbacks callback.
    */
   virtual void removeDownstreamWatermarkCallbacks(DownstreamWatermarkCallbacks& callbacks) PURE;
+
+  /**
+   * This routine can be called by a filter to subscribe to upstream watermark events.
+   */
+  virtual void addUpstreamWatermarkCallbacks(UpstreamWatermarkCallbacks& callbacks) PURE;
+
+  /**
+   * This routine can be called by a filter to stop subscribing to upstream watermark events.
+   */
+  virtual void removeUpstreamWatermarkCallbacks(UpstreamWatermarkCallbacks& callbacks) PURE;
 
   /**
    * @return the account, if any, used by this stream.

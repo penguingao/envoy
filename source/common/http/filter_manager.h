@@ -299,6 +299,8 @@ struct ActiveStreamDecoderFilter : public ActiveStreamFilterBase,
   void addDownstreamWatermarkCallbacks(DownstreamWatermarkCallbacks& watermark_callbacks) override;
   void
   removeDownstreamWatermarkCallbacks(DownstreamWatermarkCallbacks& watermark_callbacks) override;
+  void addUpstreamWatermarkCallbacks(UpstreamWatermarkCallbacks& watermark_callbacks) override;
+  void removeUpstreamWatermarkCallbacks(UpstreamWatermarkCallbacks& watermark_callbacks) override;
   bool recreateStream(const Http::ResponseHeaderMap* original_response_headers) override;
 
   void addUpstreamSocketOptions(const Network::Socket::OptionsSharedPtr& options) override;
@@ -839,6 +841,8 @@ public:
   // events for this stream and the downstream connection to the router filter.
   void callHighWatermarkCallbacks();
   void callLowWatermarkCallbacks();
+  void callHighUpstreamWatermarkCallbacks();
+  void callLowUpstreamWatermarkCallbacks();
 
   void requestHeadersInitialized() {
     if (Http::Headers::get().MethodValues.Head ==
@@ -1156,7 +1160,9 @@ private:
   Buffer::InstancePtr buffered_request_data_;
   uint64_t buffer_limit_{0};
   uint32_t high_watermark_count_{0};
+  uint32_t high_upstream_watermark_count_{0};
   std::list<DownstreamWatermarkCallbacks*> watermark_callbacks_;
+  std::list<UpstreamWatermarkCallbacks*> upstream_watermark_callbacks_;
   Network::Socket::OptionsSharedPtr upstream_options_ =
       std::make_shared<Network::Socket::Options>();
   Upstream::LoadBalancerContext::OverrideHost upstream_override_host_;
