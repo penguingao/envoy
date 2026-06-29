@@ -42,6 +42,14 @@ Http::FilterDataStatus BufferManager::onData(Buffer::Instance& data, bool end_st
   return Http::FilterDataStatus::StopIterationNoBuffer;
 }
 
+void BufferManager::setEndStream(bool has_trailers) {
+  seen_end_stream_ = true;
+  has_trailers_ = has_trailers;
+  if (!pending_write_ && write_queue_.length() == 0 && !reading_back_) {
+    startReadingBack();
+  }
+}
+
 void BufferManager::triggerWrite() {
   ASSERT(!pending_write_);
   if (write_queue_.length() == 0) {
@@ -96,7 +104,10 @@ void BufferManager::startReadingBack() {
 
   if (total_size_ == 0) {
     Buffer::OwnedImpl empty;
-    callbacks_.injectData(empty, true);
+    const bool end_stream = seen_end_stream_ && !has_trailers_;
+    callbacks_.injectData(empty, end_stream);
+    reading_back_ = false;
+    callbacks_.onDecodingComplete();
     return;
   }
 
@@ -140,17 +151,19 @@ void BufferManager::onReadCompleteInternal(absl::StatusOr<Buffer::InstancePtr> d
   uint64_t chunk_len = chunk->length();
   read_offset_ += chunk_len;
 
-  bool is_end_stream = (read_offset_ == total_size_);
+  const bool is_last_chunk = (read_offset_ == total_size_);
+  const bool end_stream = is_last_chunk && !has_trailers_;
 
-  callbacks_.injectData(*chunk, is_end_stream);
+  callbacks_.injectData(*chunk, end_stream);
 
-  if (!is_end_stream) {
+  if (is_last_chunk) {
+    reading_back_ = false;
+    callbacks_.onDecodingComplete();
+  } else {
     if (sink_backed_up_) {
       return;
     }
     readNextChunk();
-  } else {
-    reading_back_ = false;
   }
 }
 

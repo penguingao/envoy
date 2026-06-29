@@ -46,12 +46,13 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
 
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data,
                                                            bool end_stream) {
-  if (headers_paused_ && end_stream) {
-    headers_paused_ = false;
-    decoder_callbacks_->continueDecoding();
-  }
-
   return decode_buffer_manager_->onData(data, end_stream);
+}
+
+Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap&) {
+  has_trailers_ = true;
+  decode_buffer_manager_->setEndStream(true);
+  return Http::FilterTrailersStatus::StopIteration;
 }
 
 void AiProtocolManagerFilter::DecodeCallbacks::pauseSource() {
@@ -64,6 +65,12 @@ void AiProtocolManagerFilter::DecodeCallbacks::resumeSource() {
 
 void AiProtocolManagerFilter::DecodeCallbacks::injectData(Buffer::Instance& data, bool end_stream) {
   filter_.decoder_callbacks_->injectDecodedDataToFilterChain(data, end_stream);
+}
+
+void AiProtocolManagerFilter::DecodeCallbacks::onDecodingComplete() {
+  if (filter_.has_trailers_) {
+    filter_.decoder_callbacks_->continueDecoding();
+  }
 }
 
 void AiProtocolManagerFilter::DecodeCallbacks::onFailure(absl::Status status) {

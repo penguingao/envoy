@@ -22,6 +22,7 @@ public:
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers,
                                           bool end_stream) override;
   Http::FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) override;
+  Http::FilterTrailersStatus decodeTrailers(Http::RequestTrailerMap& trailers) override;
   void setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) override;
 
 private:
@@ -30,6 +31,7 @@ private:
     void pauseSource() override;
     void resumeSource() override;
     void injectData(Buffer::Instance& data, bool end_stream) override;
+    void onDecodingComplete() override;
     void onFailure(absl::Status status) override;
     Event::Dispatcher& dispatcher() override;
     AiProtocolManagerFilter& filter_;
@@ -40,6 +42,7 @@ private:
   const uint64_t chunk_size_ = 1024; // 1KB chunks for streaming back
 
   bool headers_paused_{false};
+  bool has_trailers_{false};
 };
 
 } // namespace AiProtocolManager

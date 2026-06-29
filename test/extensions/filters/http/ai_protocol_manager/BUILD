@@ -21,3 +21,17 @@ envoy_extension_cc_test(
         "//test/mocks/http:http_mocks",
     ],
 )
+
+envoy_extension_cc_test(
+    name = "ai_protocol_manager_integration_test",
+    size = "large",
+    srcs = ["ai_protocol_manager_integration_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:config",
+        "//test/integration:http_protocol_integration_lib",
+        "//test/mocks/http:http_mocks",
+        "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
+    ],
+)

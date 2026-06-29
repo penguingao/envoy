@@ -36,6 +36,11 @@ public:
     virtual void injectData(Buffer::Instance& data, bool end_stream) = 0;
 
     /**
+     * Called when all data has been injected.
+     */
+    virtual void onDecodingComplete() = 0;
+
+    /**
      * Handles failure (e.g., sends local reply or resets stream).
      */
     virtual void onFailure(absl::Status status) = 0;
@@ -54,6 +59,11 @@ public:
    * @return the filter data status.
    */
   Http::FilterDataStatus onData(Buffer::Instance& data, bool end_stream);
+
+  /**
+   * Called when the stream ends (either via data or trailers).
+   */
+  void setEndStream(bool has_trailers);
 
   /**
    * Called when the sink (next filters) is backed up.
@@ -103,6 +113,7 @@ private:
 
   bool pending_write_ = false;
   bool seen_end_stream_ = false;
+  bool has_trailers_ = false;
   bool sink_backed_up_ = false;
   bool reading_back_ = false;
 
