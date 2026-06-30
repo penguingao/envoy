@@ -35,14 +35,9 @@ Http::FilterDataStatus BufferManager::onData(Buffer::Instance& data, bool end_st
 
   if (data.length() > 0) {
     write_queue_.move(data);
-    if (!pending_write_) {
-      triggerWrite();
-    }
-  } else if (end_stream) {
-    if (!pending_write_) {
-      startReadingBack();
-    }
   }
+
+  maybeTriggerWrite();
 
   return Http::FilterDataStatus::StopIterationNoBuffer;
 }
@@ -50,19 +45,29 @@ Http::FilterDataStatus BufferManager::onData(Buffer::Instance& data, bool end_st
 void BufferManager::setEndStream(bool has_trailers) {
   seen_end_stream_ = true;
   has_trailers_ = has_trailers;
-  if (!pending_write_ && write_queue_.length() == 0 && !reading_back_) {
-    startReadingBack();
-  }
+  maybeTriggerWrite();
 }
 
-void BufferManager::triggerWrite() {
-  ASSERT(!pending_write_);
+void BufferManager::maybeTriggerWrite() {
+  if (pending_write_) {
+    return;
+  }
+
   if (write_queue_.length() == 0) {
     if (seen_end_stream_) {
       startReadingBack();
     }
     return;
   }
+
+  if (seen_end_stream_ || write_queue_.highWatermarkTriggered()) {
+    triggerWrite();
+  }
+}
+
+void BufferManager::triggerWrite() {
+  ASSERT(!pending_write_);
+  ASSERT(write_queue_.length() > 0);
 
   pending_write_ = true;
 
@@ -91,13 +96,7 @@ void BufferManager::onWriteCompleteInternal(absl::Status status) {
     return;
   }
 
-  if (write_queue_.length() > 0) {
-    triggerWrite();
-  } else {
-    if (seen_end_stream_) {
-      startReadingBack();
-    }
-  }
+  maybeTriggerWrite();
 }
 
 void BufferManager::startReadingBack() {

@@ -99,6 +99,7 @@ public:
   void onBelowWriteBufferLowWatermark() override;
 
 private:
+  void maybeTriggerWrite();
   void triggerWrite();
   void onWriteCompleteInternal(absl::Status status);
   void onReadCompleteInternal(absl::StatusOr<Buffer::InstancePtr> data);
