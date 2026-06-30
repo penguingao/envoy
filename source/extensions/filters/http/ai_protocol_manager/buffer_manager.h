@@ -105,9 +105,6 @@ private:
   void startReadingBack();
   void readNextChunk();
 
-  void onQueueBelowLowWatermark();
-  void onQueueAboveHighWatermark();
-
   ExternalBufferPtr buffer_;
   Callbacks& callbacks_;
   const uint64_t chunk_size_;

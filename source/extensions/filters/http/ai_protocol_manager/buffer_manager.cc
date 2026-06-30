@@ -8,8 +8,8 @@ namespace AiProtocolManager {
 BufferManager::BufferManager(ExternalBufferPtr buffer, Callbacks& callbacks, uint64_t chunk_size,
                              uint64_t buffer_limit)
     : buffer_(std::move(buffer)), callbacks_(callbacks), chunk_size_(chunk_size),
-      write_queue_([this]() { onQueueBelowLowWatermark(); },
-                   [this]() { onQueueAboveHighWatermark(); }, []() {}) {
+      write_queue_([this]() { callbacks_.resumeSource(); }, [this]() { callbacks_.pauseSource(); },
+                   []() {}) {
   write_queue_.setWatermarks(buffer_limit);
 }
 
@@ -182,10 +182,6 @@ void BufferManager::onSinkLowWatermark() {
 void BufferManager::onAboveWriteBufferHighWatermark() { onSinkHighWatermark(); }
 
 void BufferManager::onBelowWriteBufferLowWatermark() { onSinkLowWatermark(); }
-
-void BufferManager::onQueueBelowLowWatermark() { callbacks_.resumeSource(); }
-
-void BufferManager::onQueueAboveHighWatermark() { callbacks_.pauseSource(); }
 
 } // namespace AiProtocolManager
 } // namespace HttpFilters
