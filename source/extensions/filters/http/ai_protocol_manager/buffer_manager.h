@@ -1,8 +1,8 @@
 #pragma once
-
 #include "envoy/buffer/buffer.h"
 #include "envoy/http/filter.h"
 
+#include "source/common/buffer/watermark_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 
 #include "absl/status/status.h"
@@ -51,7 +51,8 @@ public:
     virtual Event::Dispatcher& dispatcher() = 0;
   };
 
-  BufferManager(ExternalBufferPtr buffer, Callbacks& callbacks, uint64_t chunk_size);
+  BufferManager(ExternalBufferPtr buffer, Callbacks& callbacks, uint64_t chunk_size,
+                uint64_t buffer_limit);
   ~BufferManager() override;
 
   /**
@@ -104,11 +105,14 @@ private:
   void startReadingBack();
   void readNextChunk();
 
+  void onQueueBelowLowWatermark();
+  void onQueueAboveHighWatermark();
+
   ExternalBufferPtr buffer_;
   Callbacks& callbacks_;
   const uint64_t chunk_size_;
 
-  Buffer::OwnedImpl write_queue_;
+  Buffer::WatermarkBuffer write_queue_;
   Buffer::InstancePtr active_write_chunk_;
 
   bool pending_write_ = false;

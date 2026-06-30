@@ -34,6 +34,7 @@ envoy_cc_library(
     ],
     deps = [
         ":ai_protocol_manager_buffer_lib",
+        "//source/common/buffer:watermark_buffer_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
         "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
     ],

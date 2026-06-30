@@ -9,9 +9,12 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-AiProtocolManagerFilter::AiProtocolManagerFilter() {
-  decode_buffer_manager_ = std::make_unique<BufferManager>(std::make_unique<InMemoryBuffer>(),
-                                                           decode_callbacks_, chunk_size_);
+AiProtocolManagerFilter::AiProtocolManagerFilter() : AiProtocolManagerFilter(1024 * 1024) {}
+
+AiProtocolManagerFilter::AiProtocolManagerFilter(uint64_t buffer_limit)
+    : buffer_limit_(buffer_limit) {
+  decode_buffer_manager_ = std::make_unique<BufferManager>(
+      std::make_unique<InMemoryBuffer>(), decode_callbacks_, chunk_size_, buffer_limit_);
 }
 
 AiProtocolManagerFilter::~AiProtocolManagerFilter() = default;

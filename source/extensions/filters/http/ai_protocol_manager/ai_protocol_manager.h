@@ -13,6 +13,7 @@ namespace AiProtocolManager {
 class AiProtocolManagerFilter : public Http::PassThroughFilter {
 public:
   AiProtocolManagerFilter();
+  AiProtocolManagerFilter(uint64_t buffer_limit);
   ~AiProtocolManagerFilter() override;
 
   // Http::StreamFilterBase
@@ -39,7 +40,8 @@ private:
 
   DecodeCallbacks decode_callbacks_{*this};
   std::unique_ptr<BufferManager> decode_buffer_manager_;
-  const uint64_t chunk_size_ = 1024; // 1KB chunks for streaming back
+  const uint64_t chunk_size_ = 1024;    // 1KB chunks for streaming back
+  uint64_t buffer_limit_ = 1024 * 1024; // 1MB default
 
   bool headers_paused_{false};
   bool has_trailers_{false};

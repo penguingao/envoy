@@ -5,8 +5,13 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-BufferManager::BufferManager(ExternalBufferPtr buffer, Callbacks& callbacks, uint64_t chunk_size)
-    : buffer_(std::move(buffer)), callbacks_(callbacks), chunk_size_(chunk_size) {}
+BufferManager::BufferManager(ExternalBufferPtr buffer, Callbacks& callbacks, uint64_t chunk_size,
+                             uint64_t buffer_limit)
+    : buffer_(std::move(buffer)), callbacks_(callbacks), chunk_size_(chunk_size),
+      write_queue_([this]() { onQueueBelowLowWatermark(); },
+                   [this]() { onQueueAboveHighWatermark(); }, []() {}) {
+  write_queue_.setWatermarks(buffer_limit);
+}
 
 BufferManager::~BufferManager() { *destroyed_ = true; }
 
@@ -60,7 +65,6 @@ void BufferManager::triggerWrite() {
   }
 
   pending_write_ = true;
-  callbacks_.pauseSource();
 
   active_write_chunk_ = std::make_unique<Buffer::OwnedImpl>();
   active_write_chunk_->move(write_queue_);
@@ -90,7 +94,6 @@ void BufferManager::onWriteCompleteInternal(absl::Status status) {
   if (write_queue_.length() > 0) {
     triggerWrite();
   } else {
-    callbacks_.resumeSource();
     if (seen_end_stream_) {
       startReadingBack();
     }
@@ -179,6 +182,10 @@ void BufferManager::onSinkLowWatermark() {
 void BufferManager::onAboveWriteBufferHighWatermark() { onSinkHighWatermark(); }
 
 void BufferManager::onBelowWriteBufferLowWatermark() { onSinkLowWatermark(); }
+
+void BufferManager::onQueueBelowLowWatermark() { callbacks_.resumeSource(); }
+
+void BufferManager::onQueueAboveHighWatermark() { callbacks_.pauseSource(); }
 
 } // namespace AiProtocolManager
 } // namespace HttpFilters

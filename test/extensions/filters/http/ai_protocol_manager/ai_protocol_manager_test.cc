@@ -45,13 +45,6 @@ TEST_F(AiProtocolManagerFilterTest, BufferSingleChunkAndInject) {
 
   Buffer::OwnedImpl request_data("hello world");
 
-  // We expect:
-  // 1. High watermark triggered when write starts (pauses client).
-  // 2. Low watermark triggered when write completes (resumes client).
-  // 3. Data injected.
-  InSequence s;
-  EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
-  EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
   EXPECT_CALL(decoder_callbacks_,
               injectDecodedDataToFilterChain(BufferString("hello world"), true));
 
@@ -65,22 +58,12 @@ TEST_F(AiProtocolManagerFilterTest, BufferMultipleChunksAndInject) {
 
   // Chunk 1:
   Buffer::OwnedImpl chunk1("hello ");
-  {
-    InSequence s;
-    EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
-    EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
-  }
   EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_.decodeData(chunk1, false));
 
   // Chunk 2:
   Buffer::OwnedImpl chunk2("world");
-  {
-    InSequence s;
-    EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
-    EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
-    EXPECT_CALL(decoder_callbacks_,
-                injectDecodedDataToFilterChain(BufferString("hello world"), true));
-  }
+  EXPECT_CALL(decoder_callbacks_,
+              injectDecodedDataToFilterChain(BufferString("hello world"), true));
   EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_.decodeData(chunk2, true));
 }
 
@@ -93,8 +76,6 @@ TEST_F(AiProtocolManagerFilterTest, BufferLargePayloadAndInjectChunks) {
   Buffer::OwnedImpl request_data(large_payload);
 
   InSequence s;
-  EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
-  EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
   EXPECT_CALL(decoder_callbacks_,
               injectDecodedDataToFilterChain(BufferString(std::string(1024, 'a')), false));
   EXPECT_CALL(decoder_callbacks_,
@@ -113,11 +94,6 @@ TEST_F(AiProtocolManagerFilterTest, DownstreamBackpressurePausesAndResumes) {
   std::string large_payload(2500, 'a');
   Buffer::OwnedImpl request_data(large_payload);
 
-  InSequence s;
-  // Flow control for client during write:
-  EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
-  EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
-
   // First chunk injection, during which we simulate next filters becoming backed up:
   EXPECT_CALL(decoder_callbacks_,
               injectDecodedDataToFilterChain(BufferString(std::string(1024, 'a')), false))
@@ -130,6 +106,7 @@ TEST_F(AiProtocolManagerFilterTest, DownstreamBackpressurePausesAndResumes) {
   EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_.decodeData(request_data, true));
 
   // Now resume, and expect the remaining chunks.
+  InSequence s;
   EXPECT_CALL(decoder_callbacks_,
               injectDecodedDataToFilterChain(BufferString(std::string(1024, 'a')), false));
   EXPECT_CALL(decoder_callbacks_,
@@ -149,13 +126,6 @@ TEST_F(AiProtocolManagerFilterTest, BackpressurePresentBeforeReadBack) {
   // Simulate next filters backed up.
   ASSERT_NE(upstream_watermark_callbacks_, nullptr);
   upstream_watermark_callbacks_->onAboveWriteBufferHighWatermark();
-
-  {
-    InSequence s;
-    // Flow control for client during write:
-    EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
-    EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
-  }
 
   // decodeData should NOT trigger injection.
   EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_.decodeData(request_data, true));
@@ -199,13 +169,9 @@ TEST_F(AiProtocolManagerFilterTest, RequestWithTrailers) {
             filter_.decodeHeaders(request_headers, false));
 
   // We expect:
-  // 1. High watermark triggered when write starts.
-  // 2. Low watermark triggered when write completes.
-  // 3. Data injected (with end_stream = false).
-  // 4. continueDecoding() called because we have trailers.
+  // 1. Data injected (with end_stream = false).
+  // 2. continueDecoding() called because we have trailers.
   InSequence s;
-  EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
-  EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
   EXPECT_CALL(decoder_callbacks_, injectDecodedDataToFilterChain(BufferString("hello"), false));
   EXPECT_CALL(decoder_callbacks_, continueDecoding());
 
@@ -214,6 +180,28 @@ TEST_F(AiProtocolManagerFilterTest, RequestWithTrailers) {
 
   Http::TestRequestTrailerMapImpl request_trailers;
   EXPECT_EQ(Http::FilterTrailersStatus::StopIteration, filter_.decodeTrailers(request_trailers));
+}
+
+TEST_F(AiProtocolManagerFilterTest, DownstreamFlowControl) {
+  // Construct a filter with a very small buffer limit (10 bytes).
+  AiProtocolManagerFilter filter(10);
+  filter.setDecoderFilterCallbacks(decoder_callbacks_);
+  filter.setEncoderFilterCallbacks(encoder_callbacks_);
+
+  Http::TestRequestHeaderMapImpl request_headers;
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter.decodeHeaders(request_headers, false));
+
+  // Sending 11 bytes should trigger high watermark (11 > 10).
+  // When the write is triggered, it moves data to active chunk,
+  // which clears the queue and should trigger low watermark.
+  InSequence s;
+  EXPECT_CALL(decoder_callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
+  EXPECT_CALL(decoder_callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
+  EXPECT_CALL(decoder_callbacks_,
+              injectDecodedDataToFilterChain(BufferString("hello world"), true));
+
+  Buffer::OwnedImpl request_data("hello world");
+  EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter.decodeData(request_data, true));
 }
 
 } // namespace AiProtocolManager
