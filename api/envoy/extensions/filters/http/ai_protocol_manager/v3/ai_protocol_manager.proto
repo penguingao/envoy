@@ -2,9 +2,13 @@ syntax = "proto3";
 
 package envoy.extensions.filters.http.ai_protocol_manager.v3;
 
+import "envoy/config/core/v3/extension.proto";
+import "envoy/extensions/common/async_files/v3/async_file_manager.proto";
+
 import "xds/annotations/v3/status.proto";
 
 import "udpa/annotations/status.proto";
+import "validate/validate.proto";
 
 option java_package = "io.envoyproxy.envoy.extensions.filters.http.ai_protocol_manager.v3";
 option java_outer_classname = "AiProtocolManagerProto";
@@ -20,4 +24,43 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 
 // Configuration for the AI Protocol Manager filter.
 message AiProtocolManager {
+  // The backing store the filter uses to offload the request payload while it is
+  // buffered and validated. The referenced extension must be an
+  // ``external_buffer`` implementation (for example
+  // :ref:`InMemoryBuffer <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.InMemoryBuffer>`
+  // or
+  // :ref:`FileSystemBuffer <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.FileSystemBuffer>`).
+  //
+  // If unset, an unbounded in-memory store is used, preserving the filter's
+  // original behavior.
+  config.core.v3.TypedExtensionConfig external_buffer = 1;
+}
+
+// Offloads the payload into a heap buffer. The resident footprint is unbounded;
+// this store is intended as a reference and for testing. Selected by referencing
+// this message from
+// :ref:`external_buffer <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager.external_buffer>`.
+message InMemoryBuffer {
+}
+
+// Offloads the payload into an anonymous file on the local filesystem, bounding
+// the resident memory footprint to the in-flight window. The file is unlinked on
+// creation and reclaimed automatically when the stream ends or the process exits.
+message FileSystemBuffer {
+  // Directory in which the anonymous scratch files are created (for example
+  // ``/tmp``). The path must be an existing directory on a filesystem that
+  // supports unlinked open files.
+  string buffer_path = 1 [(validate.rules).string = {min_len: 1}];
+
+  // Configuration for the shared, thread-pool-backed asynchronous file manager
+  // that performs the file I/O.
+  common.async_files.v3.AsyncFileManagerConfig manager_config = 2
+      [(validate.rules).message = {required: true}];
+
+  // The payload is buffered in memory and only spilled to a file once more than
+  // this many bytes have been offloaded. A request whose payload never exceeds
+  // this threshold is served entirely from memory, avoiding file I/O for small
+  // requests. If unset or zero, the payload is written to a file from the first
+  // byte.
+  uint64 memory_buffer_bytes = 3;
 }

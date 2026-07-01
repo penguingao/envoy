@@ -51,6 +51,61 @@ TEST(AiProtocolManagerConfigTest, CreatesStreamFilterFromEmptyProto) {
   cb(filter_callbacks);
 }
 
+// Referencing the in-memory store via external_buffer resolves the typed
+// extension and builds a working filter factory.
+TEST(AiProtocolManagerConfigTest, SelectsInMemoryBufferBackend) {
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+  auto& ext = *proto_config.mutable_external_buffer();
+  ext.set_name("in_memory");
+  ASSERT_TRUE(ext.mutable_typed_config()->PackFrom(
+      envoy::extensions::filters::http::ai_protocol_manager::v3::InMemoryBuffer()));
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+
+  AiProtocolManagerFilterConfigFactory factory;
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(proto_config, "stats", context).value();
+
+  Http::MockFilterChainFactoryCallbacks filter_callbacks;
+  EXPECT_CALL(filter_callbacks, addStreamFilter(_));
+  cb(filter_callbacks);
+}
+
+// Referencing the filesystem store resolves the typed extension, builds the
+// async file manager from the singleton manager, and yields a working factory.
+TEST(AiProtocolManagerConfigTest, SelectsFileSystemBufferBackend) {
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+  envoy::extensions::filters::http::ai_protocol_manager::v3::FileSystemBuffer fs;
+  fs.set_buffer_path("/tmp");
+  fs.mutable_manager_config()->mutable_thread_pool()->set_thread_count(1);
+  auto& ext = *proto_config.mutable_external_buffer();
+  ext.set_name("file_system");
+  ASSERT_TRUE(ext.mutable_typed_config()->PackFrom(fs));
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+
+  AiProtocolManagerFilterConfigFactory factory;
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(proto_config, "stats", context).value();
+
+  Http::MockFilterChainFactoryCallbacks filter_callbacks;
+  EXPECT_CALL(filter_callbacks, addStreamFilter(_));
+  cb(filter_callbacks);
+}
+
+// An external_buffer referencing an unregistered type is rejected.
+TEST(AiProtocolManagerConfigTest, RejectsUnknownExternalBuffer) {
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+  auto& ext = *proto_config.mutable_external_buffer();
+  ext.set_name("bogus");
+  // Pack an arbitrary message whose type is not a registered external buffer.
+  ASSERT_TRUE(ext.mutable_typed_config()->PackFrom(
+      envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager()));
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+
+  AiProtocolManagerFilterConfigFactory factory;
+  EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context).value(),
+               EnvoyException);
+}
+
 // The factory is registered under its well-known name and resolvable from the
 // HTTP filter factory registry.
 TEST(AiProtocolManagerConfigTest, IsRegistered) {

@@ -33,9 +33,12 @@ public:
     ON_CALL(callbacks_, removeUpstreamWatermarkCallbacks(testing::_))
         .WillByDefault(
             Invoke([this](Http::UpstreamWatermarkCallbacks&) { watermark_cb_ = nullptr; }));
-    // The manager creates a SchedulableCallback (to resume replay across event-loop
-    // iterations) when setDecoderFilterCallbacks() builds it; construct the mock
-    // first so it claims that call. The manager takes ownership of it.
+    // The manager creates two SchedulableCallbacks when setDecoderFilterCallbacks()
+    // builds it -- one to resume replay across event-loop iterations (first) and one
+    // to defer error teardown (second). Each mock claims one creation call,
+    // matched newest-first, so construct the error mock first to leave the replay
+    // mock's expectation newest for the first call. The manager takes ownership.
+    error_cb_ = new NiceMock<Event::MockSchedulableCallback>(&callbacks_.dispatcher_);
     replay_cb_ = new NiceMock<Event::MockSchedulableCallback>(&callbacks_.dispatcher_);
     filter_.setDecoderFilterCallbacks(callbacks_);
     // The in-memory buffer delivers completions via dispatcher.post(). Capture
@@ -74,6 +77,7 @@ public:
   // Owned by the manager the filter builds; present so createSchedulableCallback()
   // returns a usable callback during construction.
   NiceMock<Event::MockSchedulableCallback>* replay_cb_{nullptr};
+  NiceMock<Event::MockSchedulableCallback>* error_cb_{nullptr};
   AiProtocolManagerFilter filter_;
 
   Buffer::OwnedImpl injected_;

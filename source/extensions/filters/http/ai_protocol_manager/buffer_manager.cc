@@ -19,6 +19,7 @@ BufferManager::BufferManager(ExternalBufferFactory& buffer_factory, FilterChainB
   // (see maybeReadNextChunk).
   replay_cb_ =
       bridge_->dispatcher().createSchedulableCallback([this]() { onReplayContinuation(); });
+  error_cb_ = bridge_->dispatcher().createSchedulableCallback([this]() { failStream(); });
   // Subscribe to the path's replay watermarks so replay can be paced against
   // chain back-pressure. Note: subscribing may immediately deliver
   // high-watermark callbacks if the chain is already backed up; those only bump
@@ -267,6 +268,21 @@ void BufferManager::finishReplay() {
 
 void BufferManager::onExternalBufferError() {
   ENVOY_LOG(warn, "ai_protocol_manager: external buffer I/O error, failing stream");
+  // Tear the stream down off the current stack. A read()/write() may complete
+  // synchronously (ExternalBuffer contract), and that completion can be nested
+  // inside FilterManager::callUpstreamLowWatermarkCallbacks()'s fan-out (via
+  // onReplayBelowLowWatermark -> maybeReadNextChunk -> read). Calling
+  // sendLocalReply here would tear the stream down mid-fan-out -- erasing this
+  // bridge from the watermark-callback list being iterated and destroying the
+  // BufferManager whose read()/maybeReadNextChunk() is still on the stack.
+  // Deferring lets those frames unwind first.
+  error_cb_->scheduleCallbackCurrentIteration();
+}
+
+void BufferManager::failStream() {
+  if (destroyed_) {
+    return;
+  }
   bridge_->onUnrecoverableError();
 }
 

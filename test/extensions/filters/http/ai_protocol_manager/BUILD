@@ -24,6 +24,22 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "filesystem_external_buffer_test",
+    srcs = ["filesystem_external_buffer_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/common/singleton:manager_impl_lib",
+        "//source/extensions/common/async_files",
+        "//source/extensions/filters/http/ai_protocol_manager:filesystem_external_buffer_lib",
+        "//test/extensions/common/async_files:mocks",
+        "//test/test_common:environment_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "buffer_manager_test",
     srcs = ["buffer_manager_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],
@@ -84,7 +100,12 @@ envoy_extension_cc_test(
     rbe_pool = "6gig",
     shard_count = 4,
     deps = [
+        "//source/common/buffer:buffer_lib",
         "//source/extensions/filters/http/ai_protocol_manager:config",
+        "//source/extensions/filters/http/ai_protocol_manager:external_buffer_config_interface",
+        "//source/extensions/filters/http/ai_protocol_manager:external_buffer_interface",
+        "//test/common/memory:memory_test_utility_lib",
         "//test/integration:http_protocol_integration_lib",
+        "//test/test_common:environment_lib",
     ],
 )

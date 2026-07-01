@@ -196,12 +196,19 @@ public:
     manager_ = makeManager(factory_);
   }
 
-  // Builds a BufferManager backed by `factory`, wiring a fresh FakeBridge and a
-  // MockSchedulableCallback (which the manager creates for replay yielding and
-  // takes ownership of). Updates bridge_/replay_cb_ to point at the new ones.
+  // Builds a BufferManager backed by `factory`, wiring a fresh FakeBridge and the
+  // two MockSchedulableCallbacks the manager creates and takes ownership of (one for
+  // replay yielding, one for deferring error teardown). Updates bridge_/replay_cb_/
+  // error_cb_ to point at the new ones.
+  //
+  // Each MockSchedulableCallback registers a one-shot createSchedulableCallback_
+  // expectation, matched newest-first. The manager creates replay_cb_ first and
+  // error_cb_ second, so the error mock is constructed first here to leave the
+  // replay mock's expectation newest and satisfy the first creation call.
   BufferManagerPtr makeManager(ExternalBufferFactory& factory) {
     auto bridge = std::make_unique<FakeBridge>(dispatcher_);
     bridge_ = bridge.get();
+    error_cb_ = new NiceMock<Event::MockSchedulableCallback>(&dispatcher_);
     replay_cb_ = new NiceMock<Event::MockSchedulableCallback>(&dispatcher_);
     return std::make_unique<BufferManager>(factory, std::move(bridge));
   }
@@ -234,6 +241,9 @@ public:
   // iteration resuming replay after a per-iteration budget yield (or starting a
   // replay that was deferred because the offload was already durable).
   NiceMock<Event::MockSchedulableCallback>* replay_cb_{nullptr};
+  // Owned by manager_; the manager schedules this on an external-buffer error and
+  // fires it off-stack to fail the stream. Invoke it to drive that deferred teardown.
+  NiceMock<Event::MockSchedulableCallback>* error_cb_{nullptr};
   bool replay_done_{false};
   BufferManagerPtr manager_;
 };
@@ -633,8 +643,14 @@ TEST_F(BufferManagerTest, WriteErrorFailsStream) {
   // The failing completion is posted; nothing has happened yet.
   EXPECT_EQ(bridge_->error_calls_, 0);
 
+  // Draining delivers the failing write completion, which schedules (but does not
+  // yet run) the stream teardown off-stack.
   drain();
+  EXPECT_EQ(bridge_->error_calls_, 0);
+  ASSERT_TRUE(error_cb_->enabled());
 
+  // Firing the deferred callback fails the stream.
+  error_cb_->invokeCallback();
   EXPECT_EQ(bridge_->error_calls_, 1);
   EXPECT_EQ(bridge_->inject_calls_, 0);
   EXPECT_FALSE(replay_done_);
@@ -650,9 +666,14 @@ TEST_F(BufferManagerTest, ReadErrorFailsStream) {
   manager_->endStream();
   replayAll();
 
-  // Draining makes the write durable and starts replay, whose first read fails.
+  // Draining makes the write durable and starts replay, whose first read fails and
+  // schedules the teardown off-stack.
   drain();
+  EXPECT_EQ(bridge_->error_calls_, 0);
+  ASSERT_TRUE(error_cb_->enabled());
 
+  // Firing the deferred callback fails the stream.
+  error_cb_->invokeCallback();
   EXPECT_EQ(bridge_->error_calls_, 1);
   EXPECT_EQ(bridge_->inject_calls_, 0);
   EXPECT_FALSE(replay_done_);

@@ -37,11 +37,12 @@ void InMemoryExternalBuffer::read(uint64_t offset, uint64_t length, ReadCallback
 
   auto out = std::make_unique<Buffer::OwnedImpl>();
   // copyOut leaves the source buffer intact so the same bytes can be read
-  // again (the store is append-only, reads are non-destructive).
+  // again (the store is append-only, reads are non-destructive). Copy straight
+  // into the output buffer's reserved storage: a single copy, no scratch.
   if (length > 0) {
-    auto slice = std::make_unique<uint8_t[]>(length);
-    data_.copyOut(offset, length, slice.get());
-    out->add(slice.get(), length);
+    auto reservation = out->reserveSingleSlice(length);
+    data_.copyOut(offset, length, reservation.slice().mem_);
+    reservation.commit(length);
   }
 
   // No real I/O: the bytes are already in memory on the dispatcher thread, so the

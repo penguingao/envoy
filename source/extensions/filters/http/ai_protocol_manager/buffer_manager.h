@@ -162,8 +162,15 @@ private:
   void onReplayContinuation();
   // Completion handler for a read() issued during replay.
   void onReadComplete(ExternalBufferStatus status, Buffer::InstancePtr data);
-  // Fails the stream when an external-buffer operation errors out.
+  // Schedules stream teardown after an external-buffer operation errors out. The
+  // actual teardown (failStream) runs off the current stack: a store may complete
+  // an I/O synchronously, and that completion can be nested inside a watermark
+  // fan-out or an in-flight read()/write(); tearing the stream down there would
+  // sendLocalReply reentrantly and destroy state still on the stack. Deferring lets
+  // the current frame unwind first.
   void onExternalBufferError();
+  // Off-stack continuation of onExternalBufferError: actually fails the stream.
+  void failStream();
 
   // Size of each chunk streamed back to the filter chain during replay. Keeps
   // the replay footprint bounded regardless of total payload size.
@@ -195,6 +202,9 @@ private:
   // context) and resumes it on the next iteration once the per-iteration chunk
   // budget is spent, so a large replay cannot monopolize the worker.
   Event::SchedulableCallbackPtr replay_cb_;
+  // Runs failStream() off the current stack so an external-buffer error never tears
+  // the stream down reentrantly (see onExternalBufferError).
+  Event::SchedulableCallbackPtr error_cb_;
 
   // True once endStream() has been called; gates flushing the batched backlog (the
   // tail is written even if it is below WriteFlushThreshold).

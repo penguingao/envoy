@@ -31,6 +31,43 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "external_buffer_config_interface",
+    hdrs = ["external_buffer_config.h"],
+    deps = [
+        ":external_buffer_interface",
+        "//envoy/config:typed_config_interface",
+        "//envoy/server:factory_context_interface",
+        "//source/common/protobuf:utility_lib",
+    ],
+)
+
+envoy_cc_library(
+    name = "filesystem_external_buffer_lib",
+    srcs = ["filesystem_external_buffer.cc"],
+    hdrs = ["filesystem_external_buffer.h"],
+    deps = [
+        ":external_buffer_interface",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/common:assert_lib",
+        "//source/common/common:logger_lib",
+        "//source/extensions/common/async_files",
+    ],
+)
+
+envoy_cc_library(
+    name = "external_buffer_config_factories_lib",
+    srcs = ["external_buffer_config_factories.cc"],
+    deps = [
+        ":external_buffer_config_interface",
+        ":external_buffer_impl_lib",
+        ":filesystem_external_buffer_lib",
+        "//envoy/registry",
+        "//source/extensions/common/async_files",
+        "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
     name = "buffer_manager_lib",
     srcs = ["buffer_manager.cc"],
     hdrs = ["buffer_manager.h"],
@@ -71,9 +108,12 @@ envoy_cc_extension(
     srcs = ["config.cc"],
     hdrs = ["config.h"],
     deps = [
+        ":external_buffer_config_factories_lib",
+        ":external_buffer_config_interface",
         ":external_buffer_impl_lib",
         ":filter_lib",
         "//envoy/registry",
+        "//source/common/config:utility_lib",
         "//source/extensions/filters/http/common:factory_base_lib",
         "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
     ],
