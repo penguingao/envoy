@@ -83,14 +83,17 @@ TEST_P(AiProtocolManagerIntegrationTest, UpstreamHeaderOnly) {
 void AiProtocolManagerIntegrationTest::runHeaderAndBody() {
   initialize();
 
-  for (const uint64_t body_size : {0u, 1u, 16u, 1024u, 64u * 1024u, 1024u * 1024u}) {
+  for (const uint64_t body_size : {0u, 16u, 1024u, 64u * 1024u, 1024u * 1024u}) {
     codec_client_ = makeHttpConnection(lookupPort("http"));
-    const std::string body(body_size, 'a');
+    std::string body;
+    if (body_size > 0) {
+      body = "{\"data\":\"" + std::string(body_size, 'a') + "\"}";
+    }
     auto response = codec_client_->makeRequestWithBody(requestHeaders(), body);
 
     waitForNextUpstreamRequest();
     EXPECT_TRUE(upstream_request_->complete());
-    EXPECT_EQ(body_size, upstream_request_->bodyLength());
+    EXPECT_EQ(body.size(), upstream_request_->bodyLength());
     EXPECT_EQ(body, upstream_request_->body().toString());
 
     upstream_request_->encodeHeaders(default_response_headers_, true);
@@ -122,13 +125,13 @@ void AiProtocolManagerIntegrationTest::runHeaderAndBodyMultipleFrames() {
   request_encoder_ = &encoder_decoder.first;
   auto response = std::move(encoder_decoder.second);
 
-  codec_client_->sendData(*request_encoder_, "123", false);
-  codec_client_->sendData(*request_encoder_, "456", false);
-  codec_client_->sendData(*request_encoder_, "789", true);
+  codec_client_->sendData(*request_encoder_, "{\"data\":", false);
+  codec_client_->sendData(*request_encoder_, "\"123456", false);
+  codec_client_->sendData(*request_encoder_, "789\"}", true);
 
   waitForNextUpstreamRequest();
   EXPECT_TRUE(upstream_request_->complete());
-  EXPECT_EQ("123456789", upstream_request_->body().toString());
+  EXPECT_EQ("{\"data\":\"123456789\"}", upstream_request_->body().toString());
 
   upstream_request_->encodeHeaders(default_response_headers_, true);
   ASSERT_TRUE(response->waitForEndStream());
@@ -162,8 +165,9 @@ void AiProtocolManagerIntegrationTest::runHeaderAndBodyAndTrailers() {
     request_encoder_ = &encoder_decoder.first;
     auto response = std::move(encoder_decoder.second);
 
-    const std::string body(body_size, 'b');
+    std::string body;
     if (body_size > 0) {
+      body = "{\"data\":\"" + std::string(body_size, 'b') + "\"}";
       codec_client_->sendData(*request_encoder_, body, false);
     }
     Http::TestRequestTrailerMapImpl request_trailers{{"x-request-trailer", "trailer-value"}};
@@ -171,7 +175,7 @@ void AiProtocolManagerIntegrationTest::runHeaderAndBodyAndTrailers() {
 
     waitForNextUpstreamRequest();
     EXPECT_TRUE(upstream_request_->complete());
-    EXPECT_EQ(body_size, upstream_request_->bodyLength());
+    EXPECT_EQ(body.size(), upstream_request_->bodyLength());
     if (body_size > 0) {
       EXPECT_EQ(body, upstream_request_->body().toString());
     }
@@ -232,7 +236,7 @@ typed_config:
   // so the buffer filter trips the 413 on the first replayed chunk while later
   // chunks are still pending. That forces the manager to detach mid-range with reads
   // outstanding -- the path that must stop rather than read from the released buffer.
-  const std::string body(256u * 1024u, 'a');
+  const std::string body = "{\"data\":\"" + std::string(256u * 1024u, 'a') + "\"}";
   auto response = codec_client_->makeRequestWithBody(requestHeaders(), body);
 
   ASSERT_TRUE(response->waitForEndStream());
@@ -258,9 +262,9 @@ typed_config:
   // small body stays under the buffer filter's limit, so it replays and reaches
   // the upstream normally.
   codec_client_ = makeHttpConnection(lookupPort("http"));
-  auto ok_response = codec_client_->makeRequestWithBody(requestHeaders(), "small");
+  auto ok_response = codec_client_->makeRequestWithBody(requestHeaders(), "{\"small\":true}");
   waitForNextUpstreamRequest();
-  EXPECT_EQ("small", upstream_request_->body().toString());
+  EXPECT_EQ("{\"small\":true}", upstream_request_->body().toString());
   upstream_request_->encodeHeaders(default_response_headers_, true);
   ASSERT_TRUE(ok_response->waitForEndStream());
   EXPECT_EQ("200", ok_response->headers().getStatusValue());

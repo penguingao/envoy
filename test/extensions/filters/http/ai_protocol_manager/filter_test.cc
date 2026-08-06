@@ -165,7 +165,8 @@ TEST_F(AiProtocolManagerFilterTest, EmptyBody) {
 // A payload larger than the replay chunk size is streamed back in multiple
 // bounded frames and reassembles to the original bytes.
 TEST_F(AiProtocolManagerFilterTest, LargePayloadReplayedInChunks) {
-  const std::string big(200 * 1024, 'x'); // > ReadChunkSize (64KiB)
+  const std::string big =
+      "{\"data\":\"" + std::string(200 * 1024, 'x') + "\"}"; // > ReadChunkSize (64KiB)
   Buffer::OwnedImpl body(big);
   EXPECT_EQ(filter_.decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
@@ -178,7 +179,7 @@ TEST_F(AiProtocolManagerFilterTest, LargePayloadReplayedInChunks) {
 
 // Destroying the filter mid-flight cancels pending callbacks; no replay occurs.
 TEST_F(AiProtocolManagerFilterTest, DestroyBeforeReplay) {
-  Buffer::OwnedImpl body("payload");
+  Buffer::OwnedImpl body("{\"key\":\"payload\"}");
   EXPECT_EQ(filter_.decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   filter_.onDestroy();
   drain();
@@ -195,7 +196,8 @@ TEST_F(AiProtocolManagerFilterTest, RegistersUpstreamWatermarkCallbacks) {
 // When the downstream chain (toward upstream) is backed up before replay starts,
 // no data is injected until the back-pressure is released.
 TEST_F(AiProtocolManagerFilterTest, ReplayPausesUnderUpstreamBackPressure) {
-  const std::string big(200 * 1024, 'x'); // > ReadChunkSize, multiple chunks.
+  const std::string big =
+      "{\"data\":\"" + std::string(200 * 1024, 'x') + "\"}"; // > ReadChunkSize, multiple chunks.
   Buffer::OwnedImpl body(big);
   EXPECT_EQ(filter_.decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
 
@@ -224,7 +226,8 @@ TEST_F(AiProtocolManagerFilterTest, ReplayPausesUnderUpstreamBackPressure) {
 // Back-pressure arising mid-replay (the upstream fills as we inject) halts the
 // synchronous read loop, and replay resumes when it clears.
 TEST_F(AiProtocolManagerFilterTest, ReplayResumesMidStream) {
-  const std::string big(200 * 1024, 'x'); // 4 chunks of 64KiB + remainder.
+  const std::string big =
+      "{\"data\":\"" + std::string(200 * 1024, 'x') + "\"}"; // 4 chunks of 64KiB + remainder.
   // Upstream backs up right after the first replayed chunk; the loop must then
   // stop until it is released.
   raise_watermark_at_inject_ = 1;
@@ -252,7 +255,7 @@ TEST_F(AiProtocolManagerFilterTest, ReplayResumesMidStream) {
 // High watermark callbacks can nest (stream + connection); replay resumes only
 // after a matching number of low-watermark callbacks.
 TEST_F(AiProtocolManagerFilterTest, NestedWatermarksRequireBalancedRelease) {
-  const std::string big(200 * 1024, 'x');
+  const std::string big = "{\"data\":\"" + std::string(200 * 1024, 'x') + "\"}";
   Buffer::OwnedImpl body(big);
   EXPECT_EQ(filter_.decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
 
@@ -311,6 +314,77 @@ TEST_F(AiProtocolManagerFilterTest, TrailersWithoutBody) {
 
   EXPECT_EQ(inject_calls_, 0);
   EXPECT_EQ(continue_calls_, 0);
+}
+
+// The filter populates parsedDoc() with the structured JSON and offloads content fields.
+TEST_F(AiProtocolManagerFilterTest, PopulatesParsedDocOnValidJson) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat/completions"}};
+  EXPECT_EQ(filter_.decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({
+    "model": "gpt-4o",
+    "messages": [
+      {"role": "user", "content": "hello world"}
+    ]
+  })");
+  EXPECT_EQ(filter_.decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  const JsonWithExtBuf* doc = filter_.parsedDoc();
+  ASSERT_NE(doc, nullptr);
+  EXPECT_EQ(doc->json()["model"], "gpt-4o");
+  EXPECT_EQ(doc->json()["messages"][0]["role"], "user");
+  EXPECT_TRUE(JsonWithExtBuf::isOffloaded(doc->json()["messages"][0]["content"]));
+}
+
+// Invalid JSON triggers a 400 Bad Request local reply and stops iteration without replay.
+TEST_F(AiProtocolManagerFilterTest, RejectsMalformedJsonWithBadRequest) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_.decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
+  EXPECT_CALL(callbacks_,
+              sendLocalReply(Http::Code::BadRequest, testing::HasSubstr("Invalid JSON payload"),
+                             testing::_, testing::_, testing::_));
+
+  Buffer::OwnedImpl bad_body("{ invalid json");
+  EXPECT_EQ(filter_.decodeData(bad_body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(inject_calls_, 0);
+  EXPECT_EQ(filter_.parsedDoc(), nullptr);
+}
+
+// Duplicate JSON keys trigger a 400 Bad Request local reply.
+TEST_F(AiProtocolManagerFilterTest, RejectsDuplicateJsonKeysWithBadRequest) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_.decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
+  EXPECT_CALL(callbacks_,
+              sendLocalReply(Http::Code::BadRequest, testing::HasSubstr("duplicate key"),
+                             testing::_, testing::_, testing::_));
+
+  Buffer::OwnedImpl dup_body(R"({"model": "gpt-4", "model": "gpt-3.5"})");
+  EXPECT_EQ(filter_.decodeData(dup_body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+// Incomplete JSON on end_stream triggers a 400 Bad Request local reply.
+TEST_F(AiProtocolManagerFilterTest, RejectsIncompleteJsonOnEndStream) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_.decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
+  EXPECT_CALL(callbacks_,
+              sendLocalReply(Http::Code::BadRequest, testing::HasSubstr("Invalid JSON payload"),
+                             testing::_, testing::_, testing::_));
+
+  Buffer::OwnedImpl incomplete_body(R"({"model": "gpt-4", "messages": )");
+  EXPECT_EQ(filter_.decodeData(incomplete_body, true),
+            Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(inject_calls_, 0);
 }
 
 } // namespace

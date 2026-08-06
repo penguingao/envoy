@@ -3,6 +3,7 @@
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 namespace Envoy {
@@ -29,10 +30,6 @@ namespace AiProtocolManager {
 // FilterChainBridge (filter_chain_bridge.h). Today only the decode (request) path
 // is wired; the encode path will construct a second BufferManager with the
 // encoder bridge.
-//
-// The offload/replay plumbing is in place today; streaming JSON parsing and
-// validation, and an AI-specific extension chain to store, manipulate, and
-// rewrite the payload before replay, will be layered on in later changes.
 class AiProtocolManagerFilter : public Http::PassThroughFilter,
                                 public Logger::Loggable<Logger::Id::filter> {
 public:
@@ -49,9 +46,15 @@ public:
   Http::FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) override;
   Http::FilterTrailersStatus decodeTrailers(Http::RequestTrailerMap& trailers) override;
 
+  // Returns the parsed JSON document, populated once validation completes at end_stream.
+  const JsonWithExtBuf* parsedDoc() const { return parsed_doc_.get(); }
+
 private:
   ExternalBufferFactory& buffer_factory_;
   BufferManagerPtr decode_manager_;
+  std::unique_ptr<JsonWithExtBufParser> json_parser_;
+  std::unique_ptr<JsonWithExtBuf> parsed_doc_;
+  bool parsing_failed_{false};
 };
 
 } // namespace AiProtocolManager

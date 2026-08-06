@@ -24,6 +24,16 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "json_with_ext_buf_test",
+    srcs = ["json_with_ext_buf_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "buffer_manager_test",
     srcs = ["buffer_manager_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],

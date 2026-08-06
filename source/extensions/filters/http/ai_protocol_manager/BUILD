@@ -32,6 +32,21 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "json_with_ext_buf_lib",
+    srcs = ["json_with_ext_buf.cc"],
+    hdrs = ["json_with_ext_buf.h"],
+    deps = [
+        ":external_buffer_interface",
+        "//source/common/json/wuffs_json:wuffs_json_cursor_lib",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
+    ],
+)
+
+envoy_cc_library(
     name = "buffer_manager_lib",
     srcs = ["buffer_manager.cc"],
     hdrs = ["buffer_manager.h"],
@@ -66,8 +81,10 @@ envoy_cc_library(
         ":buffer_manager_lib",
         ":external_buffer_interface",
         ":filter_chain_bridge_lib",
+        ":json_with_ext_buf_lib",
         "//source/common/common:logger_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
+        "@abseil-cpp//absl/strings",
     ],
 )
 

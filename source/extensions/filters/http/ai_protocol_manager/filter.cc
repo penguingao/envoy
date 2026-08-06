@@ -5,6 +5,8 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
 
+#include "absl/strings/str_cat.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
@@ -22,6 +24,8 @@ void AiProtocolManagerFilter::setDecoderFilterCallbacks(
 }
 
 void AiProtocolManagerFilter::onDestroy() {
+  json_parser_.reset();
+  parsed_doc_.reset();
   if (decode_manager_ != nullptr) {
     // Detach the manager (releases the external buffer and unsubscribes from
     // watermarks) but do NOT free it here. onDestroy() can run synchronously while
@@ -50,34 +54,120 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // the BufferManager keeps offloading; the held headers are released when replay
   // injects the first body frame (or, for an empty/trailer-only body, when the
   // BufferManager continues iteration).
+  json_parser_ = std::make_unique<JsonWithExtBufParser>(
+      /*ext_buf=*/nullptr, [](absl::string_view key, int /*depth*/, size_t /*token_start*/) {
+        return key == "content";
+      });
+  parsed_doc_.reset();
+  parsing_failed_ = false;
+
   ENVOY_LOG(trace, "ai_protocol_manager: holding headers until payload is offloaded");
   return Http::FilterHeadersStatus::StopIteration;
 }
 
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data,
                                                            bool end_stream) {
+  if (parsing_failed_) {
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }
+
+  if (json_parser_ == nullptr) {
+    json_parser_ = std::make_unique<JsonWithExtBufParser>(
+        /*ext_buf=*/nullptr, [](absl::string_view key, int /*depth*/, size_t /*token_start*/) {
+          return key == "content";
+        });
+    parsed_doc_.reset();
+    parsing_failed_ = false;
+  }
+
+  for (const Buffer::RawSlice& slice : data.getRawSlices()) {
+    if (slice.len_ == 0) {
+      continue;
+    }
+    absl::string_view chunk(static_cast<const char*>(slice.mem_), slice.len_);
+    absl::Status status = json_parser_->feed(chunk, /*is_last=*/false);
+    if (!status.ok()) {
+      ENVOY_LOG(debug, "ai_protocol_manager: JSON parse error: {}", status.message());
+      parsing_failed_ = true;
+      decoder_callbacks_->sendLocalReply(Http::Code::BadRequest,
+                                         absl::StrCat("Invalid JSON payload: ", status.message()),
+                                         nullptr, absl::nullopt, "bad_json_payload");
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
+  }
+
   decode_manager_->onData(data);
+
   if (end_stream) {
-    // The full body has been offloaded. The filter owns replay and end-of-stream:
-    // a future change will assemble and inspect the request here (and may replay
-    // sub-ranges); for now replay the whole body, then emit the terminal frame.
+    if (decode_manager_->empty()) {
+      decode_manager_->endStream();
+      decode_manager_->replay(0, decode_manager_->length(), [this]() {
+        Buffer::OwnedImpl end_marker;
+        decoder_callbacks_->injectDecodedDataToFilterChain(end_marker, /*end_stream=*/true);
+      });
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
+
+    absl::Status status = json_parser_->feed("", /*is_last=*/true);
+    if (!status.ok()) {
+      ENVOY_LOG(debug, "ai_protocol_manager: JSON parse error on end_stream: {}", status.message());
+      parsing_failed_ = true;
+      decoder_callbacks_->sendLocalReply(Http::Code::BadRequest,
+                                         absl::StrCat("Invalid JSON payload: ", status.message()),
+                                         nullptr, absl::nullopt, "bad_json_payload");
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
+    auto doc_or = json_parser_->finalize();
+    if (!doc_or.ok()) {
+      ENVOY_LOG(debug, "ai_protocol_manager: JSON finalize error: {}", doc_or.status().message());
+      parsing_failed_ = true;
+      decoder_callbacks_->sendLocalReply(
+          Http::Code::BadRequest, absl::StrCat("Invalid JSON payload: ", doc_or.status().message()),
+          nullptr, absl::nullopt, "bad_json_payload");
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
+    parsed_doc_ = std::move(*doc_or);
+
     decode_manager_->endStream();
     decode_manager_->replay(0, decode_manager_->length(), [this]() {
-      // Terminate the stream with an empty end_stream data frame after the replayed
-      // body (also releases the held headers when the body was empty).
       Buffer::OwnedImpl end_marker;
       decoder_callbacks_->injectDecodedDataToFilterChain(end_marker, /*end_stream=*/true);
     });
   }
-  // Hold the chain here; the BufferManager replays the payload once told to.
+
   return Http::FilterDataStatus::StopIterationNoBuffer;
 }
 
 Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap&) {
+  if (parsing_failed_) {
+    return Http::FilterTrailersStatus::StopIteration;
+  }
+
   // A trailer-only request (no body) has nothing to replay; let the trailers flow.
   if (decode_manager_->empty()) {
     return Http::FilterTrailersStatus::Continue;
   }
+
+  if (json_parser_ != nullptr && !parsed_doc_) {
+    absl::Status status = json_parser_->feed("", /*is_last=*/true);
+    if (!status.ok()) {
+      parsing_failed_ = true;
+      decoder_callbacks_->sendLocalReply(Http::Code::BadRequest,
+                                         absl::StrCat("Invalid JSON payload: ", status.message()),
+                                         nullptr, absl::nullopt, "bad_json_payload");
+      return Http::FilterTrailersStatus::StopIteration;
+    }
+    auto doc_or = json_parser_->finalize();
+    if (!doc_or.ok()) {
+      parsing_failed_ = true;
+      decoder_callbacks_->sendLocalReply(
+          Http::Code::BadRequest, absl::StrCat("Invalid JSON payload: ", doc_or.status().message()),
+          nullptr, absl::nullopt, "bad_json_payload");
+      return Http::FilterTrailersStatus::StopIteration;
+    }
+    parsed_doc_ = std::move(*doc_or);
+  }
+
   // The body ended without end_stream on a data frame; the trailers carry it.
   decode_manager_->endStream();
   decode_manager_->replay(0, decode_manager_->length(), [this]() {
