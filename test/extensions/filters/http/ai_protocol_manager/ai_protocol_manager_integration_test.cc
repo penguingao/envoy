@@ -16,13 +16,15 @@ namespace {
 // downstream HTTP filter chain and once in the upstream (cluster) filter chain.
 class AiProtocolManagerIntegrationTest : public HttpProtocolIntegrationTest {
 protected:
-  void prependFilter(bool downstream = true) {
-    config_helper_.prependFilter(R"EOF(
+  void prependFilter(bool downstream = true, bool best_effort = true) {
+    std::string config = absl::StrFormat(R"EOF(
 name: envoy.filters.http.ai_protocol_manager
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+  best_effort_parsing: %s
 )EOF",
-                                 downstream);
+                                         best_effort ? "true" : "false");
+    config_helper_.prependFilter(config, downstream);
   }
 
   Http::TestRequestHeaderMapImpl requestHeaders() {

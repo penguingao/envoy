@@ -2,6 +2,7 @@
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.validate.h"
 
 #include "source/extensions/filters/http/ai_protocol_manager/config.h"
+#include "source/extensions/filters/http/ai_protocol_manager/filter.h"
 
 #include "test/mocks/server/factory_context.h"
 
@@ -87,6 +88,52 @@ TEST(AiProtocolManagerConfigTest, CreatesStreamFilterFromUpstreamContext) {
   Http::MockFilterChainFactoryCallbacks filter_callbacks;
   EXPECT_CALL(filter_callbacks, addStreamFilter(_));
   cb(filter_callbacks);
+}
+
+// The factory creates per-route configuration from AiProtocolManagerPerRoute proto.
+TEST(AiProtocolManagerConfigTest, CreatesRouteSpecificFilterConfigFromProto) {
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto_config;
+  proto_config.set_target_schema("openai_chat");
+  proto_config.set_normalize(true);
+
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+
+  AiProtocolManagerFilterConfigFactory factory;
+  auto route_config = factory
+                          .createRouteSpecificFilterConfig(proto_config, context,
+                                                           context.messageValidationVisitor())
+                          .value();
+  ASSERT_NE(route_config, nullptr);
+
+  const auto* typed_config =
+      dynamic_cast<const AiProtocolManagerPerRouteConfig*>(route_config.get());
+  ASSERT_NE(typed_config, nullptr);
+  EXPECT_EQ(typed_config->targetSchema(), "openai_chat");
+  EXPECT_TRUE(typed_config->normalize());
+}
+
+// The empty route config proto produced by the factory yields a working per-route config.
+TEST(AiProtocolManagerConfigTest, CreatesRouteSpecificFilterConfigFromEmptyProto) {
+  AiProtocolManagerFilterConfigFactory factory;
+  auto empty_proto = factory.createEmptyRouteConfigProto();
+  ASSERT_NE(empty_proto, nullptr);
+  const auto& proto_config = *Envoy::Protobuf::DynamicCastMessage<
+      envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute>(
+      empty_proto.get());
+
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+
+  auto route_config = factory
+                          .createRouteSpecificFilterConfig(proto_config, context,
+                                                           context.messageValidationVisitor())
+                          .value();
+  ASSERT_NE(route_config, nullptr);
+
+  const auto* typed_config =
+      dynamic_cast<const AiProtocolManagerPerRouteConfig*>(route_config.get());
+  ASSERT_NE(typed_config, nullptr);
+  EXPECT_EQ(typed_config->targetSchema(), "");
+  EXPECT_FALSE(typed_config->normalize());
 }
 
 } // namespace

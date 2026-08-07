@@ -82,9 +82,12 @@ envoy_cc_library(
         ":external_buffer_interface",
         ":filter_chain_bridge_lib",
         ":json_with_ext_buf_lib",
+        "//envoy/router:router_interface",
         "//source/common/common:logger_lib",
+        "//source/common/http:utility_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
         "@abseil-cpp//absl/strings",
+        "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
     ],
 )
 

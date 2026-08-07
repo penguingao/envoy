@@ -20,4 +20,26 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 
 // Configuration for the AI Protocol Manager filter.
 message AiProtocolManager {
+  // If true and no route-specific configuration is matched, the filter performs
+  // best-effort JSON parsing on the request payload to make the parsed JSON DOM
+  // available to subsequent filters, without rejecting the request if parsing fails.
+  // If false (default) and no route-specific configuration is matched, the filter
+  // does not parse the payload and simply passes it through.
+  bool best_effort_parsing = 1;
+}
+
+// Route-specific configuration for the AI Protocol Manager filter.
+// This is intended to be configured on routes matching specific REST endpoints
+// (e.g. "/chat/completions").
+message AiProtocolManagerPerRoute {
+  // The target schema that describes what the JSON payload format is and what it contains
+  // (e.g., "openai_chat", "anthropic_messages", "gemini_generate_content").
+  // Note: The detailed schema definition will be expanded in a future change.
+  string target_schema = 1;
+
+  // Whether to normalize / transcode the payload to the canonical schema.
+  // If false (default), this is a pass-through endpoint where the payload is parsed
+  // according to the target schema without transcoding.
+  // If true, the payload is normalized/transcoded to the canonical schema.
+  bool normalize = 2;
 }
