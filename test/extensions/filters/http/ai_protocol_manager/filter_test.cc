@@ -109,6 +109,26 @@ TEST_F(AiProtocolManagerFilterTest, PassesHeadersOnlyRequest) {
   EXPECT_EQ(filter_->decodeHeaders(headers, true), Http::FilterHeadersStatus::Continue);
 }
 
+// Bodyless HTTP methods (GET, HEAD, OPTIONS, DELETE) flow immediately without holding
+// or parsing, even if end_stream is false (multi-frame) and a route config is matched.
+TEST_F(AiProtocolManagerFilterTest, PassesBodylessMethodsWithRouteConfigEvenIfEndStreamFalse) {
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto;
+  proto.set_target_schema(envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
+  AiProtocolManagerPerRouteConfig route_config(proto);
+  ON_CALL(callbacks_, mostSpecificPerFilterConfig()).WillByDefault(testing::Return(&route_config));
+
+  for (const std::string& method : {"GET", "HEAD", "OPTIONS", "DELETE"}) {
+    Http::TestRequestHeaderMapImpl headers{{":method", method}, {":path", "/v1/models"}};
+    EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+              Http::FilterHeadersStatus::Continue);
+
+    // Any subsequent empty data frame also flows directly through.
+    Buffer::OwnedImpl empty_body;
+    EXPECT_EQ(filter_->decodeData(empty_body, /*end_stream=*/true),
+              Http::FilterDataStatus::Continue);
+  }
+}
+
 // Headers held during decodeHeaders() are released when replay begins: the body
 // is offloaded while iteration is paused, then injected back to the chain.
 TEST_F(AiProtocolManagerFilterTest, ReleasesHeldHeadersOnReplay) {
@@ -127,6 +147,9 @@ TEST_F(AiProtocolManagerFilterTest, ReleasesHeldHeadersOnReplay) {
 // The body is offloaded chunk-by-chunk and replayed verbatim once end_stream is
 // seen, with end_stream propagated on the final injected frame.
 TEST_F(AiProtocolManagerFilterTest, OffloadsAndReplaysBody) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
   Buffer::OwnedImpl chunk1("{\"messages\":");
   EXPECT_EQ(filter_->decodeData(chunk1, false), Http::FilterDataStatus::StopIterationNoBuffer);
   Buffer::OwnedImpl chunk2("[\"hi\"]}");
@@ -144,6 +167,9 @@ TEST_F(AiProtocolManagerFilterTest, OffloadsAndReplaysBody) {
 
 // A body that arrives in a single end_stream frame is still round-tripped.
 TEST_F(AiProtocolManagerFilterTest, SingleFrameBody) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
   Buffer::OwnedImpl body("{}");
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
@@ -156,6 +182,9 @@ TEST_F(AiProtocolManagerFilterTest, SingleFrameBody) {
 // issues no write, so replay is scheduled (not started reentrantly from
 // decodeData) and runs on the next event-loop iteration.
 TEST_F(AiProtocolManagerFilterTest, EmptyBody) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
   Buffer::OwnedImpl empty;
   EXPECT_EQ(filter_->decodeData(empty, true), Http::FilterDataStatus::StopIterationNoBuffer);
 
@@ -171,6 +200,9 @@ TEST_F(AiProtocolManagerFilterTest, EmptyBody) {
 // A payload larger than the replay chunk size is streamed back in multiple
 // bounded frames and reassembles to the original bytes.
 TEST_F(AiProtocolManagerFilterTest, LargePayloadReplayedInChunks) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
   const std::string big =
       "{\"data\":\"" + std::string(200 * 1024, 'x') + "\"}"; // > ReadChunkSize (64KiB)
   Buffer::OwnedImpl body(big);
@@ -185,6 +217,9 @@ TEST_F(AiProtocolManagerFilterTest, LargePayloadReplayedInChunks) {
 
 // Destroying the filter mid-flight cancels pending callbacks; no replay occurs.
 TEST_F(AiProtocolManagerFilterTest, DestroyBeforeReplay) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
   Buffer::OwnedImpl body("{\"key\":\"payload\"}");
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   filter_->onDestroy();
@@ -202,6 +237,9 @@ TEST_F(AiProtocolManagerFilterTest, RegistersUpstreamWatermarkCallbacks) {
 // When the downstream chain (toward upstream) is backed up before replay starts,
 // no data is injected until the back-pressure is released.
 TEST_F(AiProtocolManagerFilterTest, ReplayPausesUnderUpstreamBackPressure) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
   const std::string big =
       "{\"data\":\"" + std::string(200 * 1024, 'x') + "\"}"; // > ReadChunkSize, multiple chunks.
   Buffer::OwnedImpl body(big);
@@ -232,6 +270,9 @@ TEST_F(AiProtocolManagerFilterTest, ReplayPausesUnderUpstreamBackPressure) {
 // Back-pressure arising mid-replay (the upstream fills as we inject) halts the
 // synchronous read loop, and replay resumes when it clears.
 TEST_F(AiProtocolManagerFilterTest, ReplayResumesMidStream) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
   const std::string big =
       "{\"data\":\"" + std::string(200 * 1024, 'x') + "\"}"; // 4 chunks of 64KiB + remainder.
   // Upstream backs up right after the first replayed chunk; the loop must then
@@ -261,6 +302,9 @@ TEST_F(AiProtocolManagerFilterTest, ReplayResumesMidStream) {
 // High watermark callbacks can nest (stream + connection); replay resumes only
 // after a matching number of low-watermark callbacks.
 TEST_F(AiProtocolManagerFilterTest, NestedWatermarksRequireBalancedRelease) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
   const std::string big = "{\"data\":\"" + std::string(200 * 1024, 'x') + "\"}";
   Buffer::OwnedImpl body(big);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
@@ -292,6 +336,9 @@ TEST_F(AiProtocolManagerFilterTest, NestedWatermarksRequireBalancedRelease) {
 // replayed (final frame end_stream=false) and the held trailers are released
 // via continueDecoding() once the body has been injected.
 TEST_F(AiProtocolManagerFilterTest, TrailerTerminatedStream) {
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
+
   Buffer::OwnedImpl body("{\"messages\":[\"hi\"]}");
   EXPECT_EQ(filter_->decodeData(body, false), Http::FilterDataStatus::StopIterationNoBuffer);
   Http::TestRequestTrailerMapImpl trailers{{"x-trailer", "1"}};
@@ -343,7 +390,6 @@ TEST_F(AiProtocolManagerFilterTest, DefaultBehaviorPassesThroughWithoutParsingOr
 
   // No replay injection was needed since data was not drained/offloaded.
   EXPECT_EQ(inject_calls_, 0);
-  EXPECT_EQ(default_filter.parsedDoc(), nullptr);
 
   Http::TestRequestTrailerMapImpl trailers;
   EXPECT_EQ(default_filter.decodeTrailers(trailers), Http::FilterTrailersStatus::Continue);
@@ -351,36 +397,35 @@ TEST_F(AiProtocolManagerFilterTest, DefaultBehaviorPassesThroughWithoutParsingOr
   default_filter.onDestroy();
 }
 
-// When route config is present, the filter populates parsedDoc() with structured JSON.
-TEST_F(AiProtocolManagerFilterTest, PopulatesParsedDocOnValidJsonWithRouteConfig) {
+// When route config is present, valid JSON payload is offloaded and replayed to downstream.
+TEST_F(AiProtocolManagerFilterTest, OffloadsAndReplaysOnValidJsonWithRouteConfig) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto;
-  proto.set_target_schema("openai_chat");
+  proto.set_target_schema(envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
   AiProtocolManagerPerRouteConfig route_config(proto);
   ON_CALL(callbacks_, mostSpecificPerFilterConfig()).WillByDefault(testing::Return(&route_config));
 
   Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/v1/chat/completions"}};
   EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
 
-  Buffer::OwnedImpl body(R"({
+  const std::string valid_json = R"({
     "model": "gpt-4o",
     "messages": [
       {"role": "user", "content": "hello world"}
     ]
-  })");
+  })";
+  Buffer::OwnedImpl body(valid_json);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
-  const JsonWithExtBuf* doc = filter_->parsedDoc();
-  ASSERT_NE(doc, nullptr);
-  EXPECT_EQ(doc->json()["model"], "gpt-4o");
-  EXPECT_EQ(doc->json()["messages"][0]["role"], "user");
-  EXPECT_TRUE(JsonWithExtBuf::isOffloaded(doc->json()["messages"][0]["content"]));
+  EXPECT_GE(inject_calls_, 1);
+  EXPECT_TRUE(injected_end_stream_);
+  EXPECT_EQ(injected_.toString(), valid_json);
 }
 
 // When route config is present, invalid JSON triggers a 400 Bad Request local reply.
 TEST_F(AiProtocolManagerFilterTest, RejectsMalformedJsonWithBadRequestWhenRouteConfigured) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto;
-  proto.set_target_schema("openai_chat");
+  proto.set_target_schema(envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
   AiProtocolManagerPerRouteConfig route_config(proto);
   ON_CALL(callbacks_, mostSpecificPerFilterConfig()).WillByDefault(testing::Return(&route_config));
 
@@ -396,13 +441,12 @@ TEST_F(AiProtocolManagerFilterTest, RejectsMalformedJsonWithBadRequestWhenRouteC
   drain();
 
   EXPECT_EQ(inject_calls_, 0);
-  EXPECT_EQ(filter_->parsedDoc(), nullptr);
 }
 
 // When route config is present, duplicate JSON keys trigger a 400 Bad Request local reply.
 TEST_F(AiProtocolManagerFilterTest, RejectsDuplicateJsonKeysWithBadRequestWhenRouteConfigured) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto;
-  proto.set_target_schema("openai_chat");
+  proto.set_target_schema(envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
   AiProtocolManagerPerRouteConfig route_config(proto);
   ON_CALL(callbacks_, mostSpecificPerFilterConfig()).WillByDefault(testing::Return(&route_config));
 
@@ -424,7 +468,7 @@ TEST_F(AiProtocolManagerFilterTest, RejectsDuplicateJsonKeysWithBadRequestWhenRo
 // reply.
 TEST_F(AiProtocolManagerFilterTest, RejectsIncompleteJsonOnEndStreamWhenRouteConfigured) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto;
-  proto.set_target_schema("openai_chat");
+  proto.set_target_schema(envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
   AiProtocolManagerPerRouteConfig route_config(proto);
   ON_CALL(callbacks_, mostSpecificPerFilterConfig()).WillByDefault(testing::Return(&route_config));
 
@@ -444,10 +488,10 @@ TEST_F(AiProtocolManagerFilterTest, RejectsIncompleteJsonOnEndStreamWhenRouteCon
 }
 
 // When route-specific configuration is matched (e.g. for /chat/completions), the filter
-// stores the route config and strictly validates the JSON payload.
+// parses and replays the payload.
 TEST_F(AiProtocolManagerFilterTest, RouteSpecificConfigMatchedPassThrough) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto;
-  proto.set_target_schema("openai_chat");
+  proto.set_target_schema(envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
   proto.set_normalize(false);
   AiProtocolManagerPerRouteConfig route_config(proto);
 
@@ -456,21 +500,20 @@ TEST_F(AiProtocolManagerFilterTest, RouteSpecificConfigMatchedPassThrough) {
   Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/chat/completions"}};
   EXPECT_EQ(filter_->decodeHeaders(headers, false), Http::FilterHeadersStatus::StopIteration);
 
-  Buffer::OwnedImpl body(R"({"model":"gpt-4","messages":[{"role":"user","content":"hello"}]})");
+  const std::string body_str =
+      R"({"model":"gpt-4","messages":[{"role":"user","content":"hello"}]})";
+  Buffer::OwnedImpl body(body_str);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
-  ASSERT_NE(filter_->routeConfig(), nullptr);
-  EXPECT_EQ(filter_->routeConfig()->targetSchema(), "openai_chat");
-  EXPECT_FALSE(filter_->routeConfig()->normalize());
-  ASSERT_NE(filter_->parsedDoc(), nullptr);
-  EXPECT_EQ(filter_->parsedDoc()->json()["model"], "gpt-4");
   EXPECT_GE(inject_calls_, 1);
+  EXPECT_TRUE(injected_end_stream_);
+  EXPECT_EQ(injected_.toString(), body_str);
 }
 
 TEST_F(AiProtocolManagerFilterTest, RouteSpecificConfigWithNormalize) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto;
-  proto.set_target_schema("openai_chat");
+  proto.set_target_schema(envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
   proto.set_normalize(true);
   AiProtocolManagerPerRouteConfig route_config(proto);
 
@@ -483,14 +526,14 @@ TEST_F(AiProtocolManagerFilterTest, RouteSpecificConfigWithNormalize) {
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
-  ASSERT_NE(filter_->routeConfig(), nullptr);
-  EXPECT_EQ(filter_->routeConfig()->targetSchema(), "openai_chat");
-  EXPECT_TRUE(filter_->routeConfig()->normalize());
+  EXPECT_GE(inject_calls_, 1);
+  EXPECT_TRUE(injected_end_stream_);
+  EXPECT_EQ(injected_.toString(), R"({"model":"gpt-4"})");
 }
 
 TEST_F(AiProtocolManagerFilterTest, RouteSpecificConfigRejectsMalformedJson) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto;
-  proto.set_target_schema("openai_chat");
+  proto.set_target_schema(envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
   proto.set_normalize(false);
   AiProtocolManagerPerRouteConfig route_config(proto);
 
@@ -508,7 +551,6 @@ TEST_F(AiProtocolManagerFilterTest, RouteSpecificConfigRejectsMalformedJson) {
   drain();
 
   EXPECT_EQ(inject_calls_, 0);
-  EXPECT_EQ(filter_->parsedDoc(), nullptr);
 }
 
 // When best_effort_parsing is enabled and no route-specific config is matched,
@@ -537,13 +579,12 @@ TEST_F(AiProtocolManagerFilterTest, BestEffortParsingPassesThroughMalformedJson)
   EXPECT_GE(inject_calls_, 1);
   EXPECT_TRUE(injected_end_stream_);
   EXPECT_EQ(injected_.toString(), "plain text not json");
-  EXPECT_EQ(best_effort_filter.parsedDoc(), nullptr);
 
   best_effort_filter.onDestroy();
 }
 
-// When best_effort_parsing is enabled and JSON is valid, the parsed doc is populated.
-TEST_F(AiProtocolManagerFilterTest, BestEffortParsingPopulatesValidJson) {
+// When best_effort_parsing is enabled and JSON is valid, the stream replays successfully.
+TEST_F(AiProtocolManagerFilterTest, BestEffortParsingPassesThroughValidJson) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto;
   proto.set_best_effort_parsing(true);
   auto filter_config = std::make_shared<AiProtocolManagerFilterConfig>(proto);
@@ -562,8 +603,8 @@ TEST_F(AiProtocolManagerFilterTest, BestEffortParsingPopulatesValidJson) {
   drain();
 
   EXPECT_GE(inject_calls_, 1);
-  ASSERT_NE(best_effort_filter.parsedDoc(), nullptr);
-  EXPECT_EQ(best_effort_filter.parsedDoc()->json()["status"], "ok");
+  EXPECT_TRUE(injected_end_stream_);
+  EXPECT_EQ(injected_.toString(), R"({"status":"ok"})");
 
   best_effort_filter.onDestroy();
 }

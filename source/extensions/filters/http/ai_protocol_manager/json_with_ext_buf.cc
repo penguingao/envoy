@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "source/common/common/assert.h"
+
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
@@ -19,10 +21,10 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-nlohmann::json ExtBufLocation::toBinary(const ExtBufLocation& loc, uint8_t subtype) {
+nlohmann::json ExtBufLocation::toBinary(const ExtBufLocation& loc) {
   std::vector<uint8_t> bytes(sizeof(ExtBufLocation));
   std::memcpy(bytes.data(), &loc, sizeof(ExtBufLocation));
-  return nlohmann::json::binary(std::move(bytes), subtype);
+  return nlohmann::json::binary(std::move(bytes), kSubtypeOffloaded);
 }
 
 std::optional<ExtBufLocation> ExtBufLocation::fromBinary(const nlohmann::json& j) {
@@ -30,60 +32,37 @@ std::optional<ExtBufLocation> ExtBufLocation::fromBinary(const nlohmann::json& j
     return std::nullopt;
   }
   const auto& bin = j.get_binary();
+  if (!bin.has_subtype() || bin.subtype() != kSubtypeOffloaded) {
+    return std::nullopt;
+  }
   if (bin.size() < sizeof(ExtBufLocation)) {
     return std::nullopt;
   }
   ExtBufLocation loc;
   std::memcpy(&loc, bin.data(), sizeof(ExtBufLocation));
-  if (bin.has_subtype()) {
-    loc.subtype = bin.subtype();
-  }
   return loc;
 }
-
-JsonWithExtBuf::JsonWithExtBuf(nlohmann::json root, std::shared_ptr<ExternalBuffer> ext_buf)
-    : root_(std::move(root)), external_buffer_(std::move(ext_buf)) {}
 
 bool JsonWithExtBuf::isOffloaded(const nlohmann::json& node) {
   if (!node.is_binary()) {
     return false;
   }
   const auto& bin = node.get_binary();
-  if (!bin.has_subtype()) {
-    return false;
-  }
-  uint8_t sub = bin.subtype();
-  return sub == ExtBufLocation::kSubtypeOffloadedString ||
-         sub == ExtBufLocation::kSubtypeOffloadedRawJson ||
-         sub == ExtBufLocation::kSubtypeOffloadedBinary;
+  return bin.has_subtype() && bin.subtype() == ExtBufLocation::kSubtypeOffloaded;
 }
 
 std::optional<ExtBufLocation> JsonWithExtBuf::getExtBufLocation(const nlohmann::json& node) {
+  ASSERT(isOffloaded(node));
   return ExtBufLocation::fromBinary(node);
 }
 
-nlohmann::json JsonWithExtBuf::makeOffloadedRef(uint64_t token_offset, uint64_t token_length,
-                                                uint64_t content_offset, uint64_t content_length,
-                                                uint8_t subtype) {
-  ExtBufLocation loc{token_offset, token_length, content_offset, content_length, subtype};
-  return ExtBufLocation::toBinary(loc, subtype);
+nlohmann::json JsonWithExtBuf::makeOffloadedRef(uint64_t offset, uint64_t length) {
+  ExtBufLocation loc{offset, length};
+  return ExtBufLocation::toBinary(loc);
 }
 
-absl::StatusOr<std::unique_ptr<JsonWithExtBuf>>
-JsonWithExtBuf::parse(absl::string_view json_data, std::shared_ptr<ExternalBuffer> ext_buf,
-                      OffloadPredicate offload_predicate) {
-  JsonWithExtBufParser parser(std::move(ext_buf), std::move(offload_predicate));
-  auto status = parser.feed(json_data, /*is_last=*/true);
-  if (!status.ok()) {
-    return status;
-  }
-  return parser.finalize();
-}
-
-JsonWithExtBufParser::JsonWithExtBufParser(std::shared_ptr<ExternalBuffer> ext_buf,
-                                           OffloadPredicate offload_predicate, bool track_paths)
-    : external_buffer_(std::move(ext_buf)), offload_predicate_(std::move(offload_predicate)),
-      cursor_(*this, track_paths) {}
+JsonWithExtBufParser::JsonWithExtBufParser(JsonWithExtBufParserConfig config)
+    : config_(std::move(config)), cursor_(*this, config_.track_paths) {}
 
 absl::Status JsonWithExtBufParser::feed(absl::string_view chunk, bool is_last) {
   if (finalized_) {
@@ -97,7 +76,7 @@ absl::StatusOr<std::unique_ptr<JsonWithExtBuf>> JsonWithExtBufParser::finalize()
     return absl::InvalidArgumentError("Unbalanced JSON document: unclosed containers remaining");
   }
   finalized_ = true;
-  return std::make_unique<JsonWithExtBuf>(std::move(root_), external_buffer_);
+  return std::make_unique<JsonWithExtBuf>(std::move(root_));
 }
 
 void JsonWithExtBufParser::attachValue(nlohmann::json val) {
@@ -118,13 +97,20 @@ bool JsonWithExtBufParser::openStringCapture(absl::string_view key, int depth, s
   current_token_start_ = token_start;
   current_string_buffer_.clear();
 
-  if (offload_predicate_ && offload_predicate_(key, depth, token_start)) {
-    offloading_current_string_ = true;
-    return false; // Skip unescaping/accumulating chunks in memory
+  if (config_.should_offload_key && config_.should_offload_key(key, depth)) {
+    if (config_.min_cutoff_size == 0) {
+      offloading_current_string_ = true;
+      offload_candidate_ = false;
+      return false; // Skip unescaping/accumulating chunks in memory
+    }
+    offloading_current_string_ = false;
+    offload_candidate_ = true;
+    return true; // Accumulate string in memory to check cutoff at end
   }
 
   offloading_current_string_ = false;
-  return true; // Accumulate unescaped chunks
+  offload_candidate_ = false;
+  return true; // Inlined string
 }
 
 bool JsonWithExtBufParser::onStringChunk(absl::string_view /*key*/, int /*depth*/,
@@ -135,20 +121,23 @@ bool JsonWithExtBufParser::onStringChunk(absl::string_view /*key*/, int /*depth*
 
 void JsonWithExtBufParser::closeStringCapture(absl::string_view /*key*/, int /*depth*/,
                                               size_t token_end) {
-  if (offloading_current_string_) {
-    uint64_t token_length =
-        (token_end >= current_token_start_) ? (token_end - current_token_start_) : 0;
+  size_t token_length =
+      (token_end >= current_token_start_) ? (token_end - current_token_start_) : 0;
+  bool should_offload =
+      offloading_current_string_ || (offload_candidate_ && token_length >= config_.min_cutoff_size);
+
+  if (should_offload) {
     // token_start is opening quote, token_end is after closing quote.
     uint64_t content_offset = current_token_start_ + 1;
     uint64_t content_length = (token_length >= 2) ? (token_length - 2) : 0;
-
-    ExtBufLocation loc{current_token_start_, token_length, content_offset, content_length,
-                       ExtBufLocation::kSubtypeOffloadedString};
-    attachValue(ExtBufLocation::toBinary(loc, loc.subtype));
+    attachValue(JsonWithExtBuf::makeOffloadedRef(content_offset, content_length));
   } else {
     attachValue(nlohmann::json(current_string_buffer_));
-    current_string_buffer_.clear();
   }
+
+  offloading_current_string_ = false;
+  offload_candidate_ = false;
+  current_string_buffer_.clear();
 }
 
 absl::Status JsonWithExtBufParser::onKey(absl::string_view key, int /*depth*/,

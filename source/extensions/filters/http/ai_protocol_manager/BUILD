@@ -36,7 +36,7 @@ envoy_cc_library(
     srcs = ["json_with_ext_buf.cc"],
     hdrs = ["json_with_ext_buf.h"],
     deps = [
-        ":external_buffer_interface",
+        "//source/common/common:assert_lib",
         "//source/common/json/wuffs_json:wuffs_json_cursor_lib",
         "@abseil-cpp//absl/functional:any_invocable",
         "@abseil-cpp//absl/status",

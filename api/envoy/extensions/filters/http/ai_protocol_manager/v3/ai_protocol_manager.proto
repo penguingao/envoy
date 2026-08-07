@@ -28,14 +28,19 @@ message AiProtocolManager {
   bool best_effort_parsing = 1;
 }
 
+// Target schema for the JSON payload.
+enum TargetSchema {
+  TARGET_SCHEMA_UNSPECIFIED = 0;
+  OPENAI_CHAT = 1;
+}
+
 // Route-specific configuration for the AI Protocol Manager filter.
 // This is intended to be configured on routes matching specific REST endpoints
 // (e.g. "/chat/completions").
 message AiProtocolManagerPerRoute {
   // The target schema that describes what the JSON payload format is and what it contains
-  // (e.g., "openai_chat", "anthropic_messages", "gemini_generate_content").
-  // Note: The detailed schema definition will be expanded in a future change.
-  string target_schema = 1;
+  // (e.g., OPENAI_CHAT).
+  TargetSchema target_schema = 1;
 
   // Whether to normalize / transcode the payload to the canonical schema.
   // If false (default), this is a pass-through endpoint where the payload is parsed

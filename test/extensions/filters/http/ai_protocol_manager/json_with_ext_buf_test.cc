@@ -30,12 +30,13 @@ TEST(JsonWithExtBufTest, InlinesSmallFieldsAndOffloadsTargetStrings) {
     ]
   })";
 
-  // Policy: offload any string under key "content"
-  auto offload_policy = [](absl::string_view key, int /*depth*/, size_t /*token_start*/) {
-    return key == "content";
-  };
+  JsonWithExtBufParserConfig config;
+  config.should_offload_key = [](absl::string_view key, int /*depth*/) { return key == "content"; };
 
-  auto result = JsonWithExtBuf::parse(raw_json, /*ext_buf=*/nullptr, offload_policy);
+  JsonWithExtBufParser parser(std::move(config));
+  ASSERT_TRUE(parser.feed(raw_json, /*is_last=*/true).ok());
+
+  auto result = parser.finalize();
   ASSERT_TRUE(result.ok()) << result.status().message();
 
   std::unique_ptr<JsonWithExtBuf> doc = std::move(*result);
@@ -61,10 +62,9 @@ TEST(JsonWithExtBufTest, InlinesSmallFieldsAndOffloadsTargetStrings) {
 
   auto sys_loc = JsonWithExtBuf::getExtBufLocation(sys_content);
   ASSERT_TRUE(sys_loc.has_value());
-  EXPECT_EQ(sys_loc->subtype, ExtBufLocation::kSubtypeOffloadedString);
 
   // Extract the content from raw_json using the location and verify slice match
-  std::string extracted_sys(raw_json.data() + sys_loc->content_offset, sys_loc->content_length);
+  std::string extracted_sys(raw_json.data() + sys_loc->offset, sys_loc->length);
   EXPECT_EQ(extracted_sys, "You are a helpful assistant.");
 
   const nlohmann::json& user_content = j["messages"][1]["content"];
@@ -72,7 +72,7 @@ TEST(JsonWithExtBufTest, InlinesSmallFieldsAndOffloadsTargetStrings) {
 
   auto user_loc = JsonWithExtBuf::getExtBufLocation(user_content);
   ASSERT_TRUE(user_loc.has_value());
-  std::string extracted_user(raw_json.data() + user_loc->content_offset, user_loc->content_length);
+  std::string extracted_user(raw_json.data() + user_loc->offset, user_loc->length);
   EXPECT_EQ(extracted_user, "Analyze this 50-page document for security vulnerabilities...");
 }
 
@@ -80,8 +80,9 @@ TEST(JsonWithExtBufTest, IncrementalChunkedFeed) {
   const std::string chunk1 = "{\"model\": \"gpt-4\", \"messages\": [{\"role\": \"user\", \"con";
   const std::string chunk2 = "tent\": \"hello world\"}]}";
 
-  JsonWithExtBufParser parser(/*ext_buf=*/nullptr,
-                              [](absl::string_view key, int, size_t) { return key == "content"; });
+  JsonWithExtBufParserConfig config;
+  config.should_offload_key = [](absl::string_view key, int) { return key == "content"; };
+  JsonWithExtBufParser parser(std::move(config));
 
   EXPECT_TRUE(parser.feed(chunk1, /*is_last=*/false).ok());
   EXPECT_TRUE(parser.feed(chunk2, /*is_last=*/true).ok());
@@ -92,6 +93,45 @@ TEST(JsonWithExtBufTest, IncrementalChunkedFeed) {
   auto doc = std::move(*result);
   EXPECT_EQ(doc->json()["model"], "gpt-4");
   EXPECT_TRUE(JsonWithExtBuf::isOffloaded(doc->json()["messages"][0]["content"]));
+}
+
+TEST(JsonWithExtBufTest, CutoffSizeControlsOffloadVsInline) {
+  const std::string raw_json = R"({
+    "short_msg": "hi",
+    "long_msg": "this is a much longer string payload that exceeds cutoff"
+  })";
+
+  JsonWithExtBufParserConfig config;
+  config.min_cutoff_size = 20; // 20 bytes token cutoff
+  config.should_offload_key = [](absl::string_view key, int) {
+    return key == "short_msg" || key == "long_msg";
+  };
+  JsonWithExtBufParser parser(std::move(config));
+
+  ASSERT_TRUE(parser.feed(raw_json, /*is_last=*/true).ok());
+  auto result = parser.finalize();
+  ASSERT_TRUE(result.ok());
+
+  auto doc = std::move(*result);
+  // "short_msg" ("hi" with quotes is 4 bytes < 20) -> inlined
+  EXPECT_FALSE(JsonWithExtBuf::isOffloaded(doc->json()["short_msg"]));
+  EXPECT_EQ(doc->json()["short_msg"], "hi");
+
+  // "long_msg" (> 20 bytes) -> offloaded
+  EXPECT_TRUE(JsonWithExtBuf::isOffloaded(doc->json()["long_msg"]));
+  auto loc = JsonWithExtBuf::getExtBufLocation(doc->json()["long_msg"]);
+  ASSERT_TRUE(loc.has_value());
+  std::string extracted(raw_json.data() + loc->offset, loc->length);
+  EXPECT_EQ(extracted, "this is a much longer string payload that exceeds cutoff");
+}
+
+TEST(JsonWithExtBufTest, FromBinaryRejectsWrongSubtype) {
+  // Binary node with a different subtype (0x02 instead of 0x01)
+  std::vector<uint8_t> dummy(sizeof(ExtBufLocation), 0);
+  nlohmann::json invalid_sub = nlohmann::json::binary(dummy, /*subtype=*/0x02);
+
+  EXPECT_FALSE(JsonWithExtBuf::isOffloaded(invalid_sub));
+  EXPECT_FALSE(ExtBufLocation::fromBinary(invalid_sub).has_value());
 }
 
 } // namespace

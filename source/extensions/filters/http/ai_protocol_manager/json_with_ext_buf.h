@@ -7,8 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "source/common/common/assert.h"
 #include "source/common/json/wuffs_json/wuffs_json_cursor.h"
-#include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
@@ -23,52 +23,38 @@ namespace AiProtocolManager {
 
 /**
  * Metadata stored in nlohmann::json binary subtype fields to locate offloaded
- * buffer chunks within an ExternalBuffer.
+ * buffer chunks within the payload buffer.
  */
 struct ExtBufLocation {
-  // Byte offset of the full token in the ExternalBuffer (including surrounding quotes for strings).
-  uint64_t token_offset{0};
-  // Byte length of the full token in the ExternalBuffer.
-  uint64_t token_length{0};
-  // Byte offset of the payload/inner content in the ExternalBuffer (excluding quotes for strings).
-  uint64_t content_offset{0};
-  // Byte length of the inner content.
-  uint64_t content_length{0};
-  // Subtype identifying the category of offloaded payload.
-  uint8_t subtype{kSubtypeOffloadedString};
+  // Byte offset of the content in the payload buffer.
+  uint64_t offset{0};
+  // Byte length of the content in the payload buffer.
+  uint64_t length{0};
 
-  // Subtype constants
-  static constexpr uint8_t kSubtypeOffloadedString = 0x01;
-  static constexpr uint8_t kSubtypeOffloadedRawJson = 0x02;
-  static constexpr uint8_t kSubtypeOffloadedBinary = 0x03;
+  static constexpr uint8_t kSubtypeOffloaded = 0x01;
 
   /**
-   * Serializes an ExtBufLocation into a binary nlohmann::json node with the given subtype.
+   * Serializes an ExtBufLocation into a binary nlohmann::json node.
    */
-  static nlohmann::json toBinary(const ExtBufLocation& loc,
-                                 uint8_t subtype = kSubtypeOffloadedString);
+  static nlohmann::json toBinary(const ExtBufLocation& loc);
 
   /**
    * Deserializes an ExtBufLocation from a binary nlohmann::json node if valid.
+   * If the binary subtype does not match kSubtypeOffloaded, returns nullopt immediately
+   * without parsing.
    */
   static std::optional<ExtBufLocation> fromBinary(const nlohmann::json& j);
 };
 
 /**
  * Base class for structured JSON documents that reference large payloads offloaded
- * to an ExternalBuffer.
+ * to an external buffer.
  */
 class JsonWithExtBuf {
 public:
   JsonWithExtBuf() = default;
-  explicit JsonWithExtBuf(nlohmann::json root, std::shared_ptr<ExternalBuffer> ext_buf = nullptr);
+  explicit JsonWithExtBuf(nlohmann::json root) : root_(std::move(root)) {}
   virtual ~JsonWithExtBuf() = default;
-
-  // External buffer access
-  std::shared_ptr<ExternalBuffer> externalBuffer() const { return external_buffer_; }
-  void setExternalBuffer(std::shared_ptr<ExternalBuffer> ext_buf) {
-    external_buffer_ = std::move(ext_buf);
-  }
 
   // DOM access
   nlohmann::json& json() { return root_; }
@@ -84,33 +70,34 @@ public:
 
   /**
    * Extracts location metadata from an offloaded binary JSON node.
+   * Asserts that the node is an offloaded node.
    */
   static std::optional<ExtBufLocation> getExtBufLocation(const nlohmann::json& node);
 
   /**
-   * Constructs an offloaded binary JSON node pointing to an external buffer location.
+   * Constructs an offloaded binary JSON node pointing to a buffer location.
    */
-  static nlohmann::json makeOffloadedRef(uint64_t token_offset, uint64_t token_length,
-                                         uint64_t content_offset = 0, uint64_t content_length = 0,
-                                         uint8_t subtype = ExtBufLocation::kSubtypeOffloadedString);
-
-  /**
-   * Predicate callback to determine if a string at (key, depth, token_start) should be
-   * offloaded to ExternalBuffer or inlined into the JSON DOM.
-   */
-  using OffloadPredicate =
-      absl::AnyInvocable<bool(absl::string_view key, int depth, size_t token_start) const>;
-
-  /**
-   * Parses complete JSON data into a JsonWithExtBuf using WuffsJsonCursor.
-   */
-  static absl::StatusOr<std::unique_ptr<JsonWithExtBuf>>
-  parse(absl::string_view json_data, std::shared_ptr<ExternalBuffer> ext_buf = nullptr,
-        OffloadPredicate offload_predicate = nullptr);
+  static nlohmann::json makeOffloadedRef(uint64_t offset, uint64_t length);
 
 protected:
   nlohmann::json root_{nlohmann::json::object()};
-  std::shared_ptr<ExternalBuffer> external_buffer_;
+};
+
+/**
+ * Configuration options for the streaming JSON parser.
+ */
+struct JsonWithExtBufParserConfig {
+  // Minimum token length (in raw JSON bytes) required to trigger offloading.
+  // String tokens shorter than this cutoff are inlined into the JSON DOM.
+  // A cutoff of 0 means all matching strings are offloaded.
+  size_t min_cutoff_size{0};
+
+  // Predicate callback to determine if a string under key at depth should be considered for
+  // offloading.
+  using KeyFilter = absl::AnyInvocable<bool(absl::string_view key, int depth) const>;
+  KeyFilter should_offload_key;
+
+  bool track_paths{false};
 };
 
 /**
@@ -119,11 +106,7 @@ protected:
  */
 class JsonWithExtBufParser : public Json::Wuffs::WuffsJsonCursor::Handler {
 public:
-  using OffloadPredicate = JsonWithExtBuf::OffloadPredicate;
-
-  explicit JsonWithExtBufParser(std::shared_ptr<ExternalBuffer> ext_buf = nullptr,
-                                OffloadPredicate offload_predicate = nullptr,
-                                bool track_paths = false);
+  explicit JsonWithExtBufParser(JsonWithExtBufParserConfig config = {});
   ~JsonWithExtBufParser() override = default;
 
   /**
@@ -158,14 +141,14 @@ private:
 
   void attachValue(nlohmann::json val);
 
-  std::shared_ptr<ExternalBuffer> external_buffer_;
-  OffloadPredicate offload_predicate_;
+  JsonWithExtBufParserConfig config_;
   Json::Wuffs::WuffsJsonCursor cursor_;
 
   nlohmann::json root_{nullptr};
   std::vector<StackFrame> stack_;
 
   bool offloading_current_string_{false};
+  bool offload_candidate_{false};
   size_t current_token_start_{0};
   std::string current_string_buffer_;
   bool finalized_{false};

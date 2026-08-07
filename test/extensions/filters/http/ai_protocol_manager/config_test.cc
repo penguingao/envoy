@@ -93,7 +93,8 @@ TEST(AiProtocolManagerConfigTest, CreatesStreamFilterFromUpstreamContext) {
 // The factory creates per-route configuration from AiProtocolManagerPerRoute proto.
 TEST(AiProtocolManagerConfigTest, CreatesRouteSpecificFilterConfigFromProto) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute proto_config;
-  proto_config.set_target_schema("openai_chat");
+  proto_config.set_target_schema(
+      envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
   proto_config.set_normalize(true);
 
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
@@ -108,7 +109,8 @@ TEST(AiProtocolManagerConfigTest, CreatesRouteSpecificFilterConfigFromProto) {
   const auto* typed_config =
       dynamic_cast<const AiProtocolManagerPerRouteConfig*>(route_config.get());
   ASSERT_NE(typed_config, nullptr);
-  EXPECT_EQ(typed_config->targetSchema(), "openai_chat");
+  EXPECT_EQ(typed_config->targetSchema(),
+            envoy::extensions::filters::http::ai_protocol_manager::v3::OPENAI_CHAT);
   EXPECT_TRUE(typed_config->normalize());
 }
 
@@ -132,7 +134,8 @@ TEST(AiProtocolManagerConfigTest, CreatesRouteSpecificFilterConfigFromEmptyProto
   const auto* typed_config =
       dynamic_cast<const AiProtocolManagerPerRouteConfig*>(route_config.get());
   ASSERT_NE(typed_config, nullptr);
-  EXPECT_EQ(typed_config->targetSchema(), "");
+  EXPECT_EQ(typed_config->targetSchema(),
+            envoy::extensions::filters::http::ai_protocol_manager::v3::TARGET_SCHEMA_UNSPECIFIED);
   EXPECT_FALSE(typed_config->normalize());
 }
 

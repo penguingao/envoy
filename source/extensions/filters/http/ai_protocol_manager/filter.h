@@ -9,6 +9,8 @@
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
+#include "absl/types/optional.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
@@ -42,11 +44,14 @@ public:
           proto_config)
       : target_schema_(proto_config.target_schema()), normalize_(proto_config.normalize()) {}
 
-  const std::string& targetSchema() const { return target_schema_; }
+  envoy::extensions::filters::http::ai_protocol_manager::v3::TargetSchema targetSchema() const {
+    return target_schema_;
+  }
   bool normalize() const { return normalize_; }
 
 private:
-  std::string target_schema_;
+  envoy::extensions::filters::http::ai_protocol_manager::v3::TargetSchema target_schema_{
+      envoy::extensions::filters::http::ai_protocol_manager::v3::TARGET_SCHEMA_UNSPECIFIED};
   bool normalize_{false};
 };
 
@@ -72,11 +77,15 @@ using AiProtocolManagerPerRouteConfigConstSharedPtr =
 // FilterChainBridge (filter_chain_bridge.h). Today only the decode (request) path
 // is wired; the encode path will construct a second BufferManager with the
 // encoder bridge.
+//
+// The offload/replay plumbing is in place today; streaming JSON parsing and
+// validation, and an AI-specific extension chain to store, manipulate, and
+// rewrite the payload before replay, will be layered on in later changes.
 class AiProtocolManagerFilter : public Http::PassThroughFilter,
                                 public Logger::Loggable<Logger::Id::filter> {
 public:
-  explicit AiProtocolManagerFilter(ExternalBufferFactory& buffer_factory,
-                                   AiProtocolManagerFilterConfigSharedPtr config = nullptr)
+  AiProtocolManagerFilter(ExternalBufferFactory& buffer_factory,
+                          AiProtocolManagerFilterConfigSharedPtr config)
       : buffer_factory_(buffer_factory), config_(std::move(config)) {}
 
   // Http::StreamFilterBase
@@ -89,24 +98,22 @@ public:
   Http::FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) override;
   Http::FilterTrailersStatus decodeTrailers(Http::RequestTrailerMap& trailers) override;
 
-  // Returns the parsed JSON document, populated once validation completes at end_stream.
-  const JsonWithExtBuf* parsedDoc() const { return parsed_doc_.get(); }
-
-  // Returns the route-specific config matched for this stream, if any.
-  const AiProtocolManagerPerRouteConfig* routeConfig() const { return route_config_; }
-
-  // Returns the filter-level config, if configured.
-  const AiProtocolManagerFilterConfig* filterConfig() const { return config_.get(); }
-
 private:
-  bool shouldParseJson() const;
-  bool shouldFailOnBadJson() const;
+  bool finalizeParsing();
+  void replayBufferedBody(bool from_trailers);
 
   ExternalBufferFactory& buffer_factory_;
   AiProtocolManagerFilterConfigSharedPtr config_;
-  const AiProtocolManagerPerRouteConfig* route_config_{nullptr};
+
+  // Per-stream state resolved in decodeHeaders
+  bool should_parse_{false};
+  bool strict_parsing_{false};
+  envoy::extensions::filters::http::ai_protocol_manager::v3::TargetSchema target_schema_{
+      envoy::extensions::filters::http::ai_protocol_manager::v3::TARGET_SCHEMA_UNSPECIFIED};
+  bool normalize_{false};
+
   BufferManagerPtr decode_manager_;
-  std::unique_ptr<JsonWithExtBufParser> json_parser_;
+  absl::optional<JsonWithExtBufParser> json_parser_;
   std::unique_ptr<JsonWithExtBuf> parsed_doc_;
   bool parsing_failed_{false};
 };
