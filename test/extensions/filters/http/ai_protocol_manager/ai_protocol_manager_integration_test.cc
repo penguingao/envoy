@@ -1,5 +1,8 @@
 #include <string>
 
+#include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
+#include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
+
 #include "test/integration/http_protocol_integration.h"
 
 namespace Envoy {
@@ -28,6 +31,25 @@ typed_config:
 )EOF",
                                              best_effort_parsing),
                                  downstream);
+  }
+
+  // Declares the route an AI endpoint whose payload follows the OpenAI Chat
+  // Completions schema, which is what puts the payload under validation. A route
+  // carrying this is held to the schema regardless of the filter-level
+  // best-effort setting.
+  void setRouteSchema() {
+    config_helper_.addConfigModifier(
+        [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+               hcm) {
+          envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute
+              per_route;
+          per_route.set_schema(envoy::extensions::filters::http::ai_protocol_manager::v3::
+                                   AiProtocolManagerPerRoute::OPENAI_CHAT_COMPLETIONS);
+          auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
+          ASSERT_TRUE(
+              (*route->mutable_typed_per_filter_config())["envoy.filters.http.ai_protocol_manager"]
+                  .PackFrom(per_route));
+        });
   }
 
   Http::TestRequestHeaderMapImpl requestHeaders() {
@@ -347,6 +369,56 @@ TEST_P(AiProtocolManagerIntegrationTest, HeaderAndTrailersNoBody) {
 TEST_P(AiProtocolManagerIntegrationTest, UpstreamHeaderAndTrailersNoBody) {
   prependFilter(/*downstream=*/false);
   runHeaderAndTrailersNoBody();
+}
+
+// A declared AI endpoint whose payload satisfies the schema reaches the upstream
+// byte for byte. The prompt is large enough to be left in the external buffer, so
+// this exercises the offload, the reference-carrying DOM and the schema's
+// acceptance of an offloaded value together -- at a size where the DOM genuinely
+// does not hold the prompt.
+//
+// Downstream chain only: the same case in an upstream chain would additionally be
+// testing per-route config resolution for upstream filter chains, which is a
+// separate question from schema validation.
+TEST_P(AiProtocolManagerIntegrationTest, SchemaValidRequestReachesUpstream) {
+  prependFilter(/*downstream=*/true, /*best_effort_parsing=*/false);
+  setRouteSchema();
+  initialize();
+
+  const std::string prompt(1024 * 1024, 'p');
+  const std::string body =
+      absl::StrCat(R"({"model":"gpt-4","messages":[{"role":"user","content":")", prompt,
+                   R"("}],"stream":false})");
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeRequestWithBody(requestHeaders(), body);
+
+  waitForNextUpstreamRequest();
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_EQ(body.size(), upstream_request_->bodyLength());
+  EXPECT_EQ(body, upstream_request_->body().toString());
+
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// A payload that parses but violates the declared schema is answered here, with a
+// body naming the offending field, and never reaches the upstream.
+TEST_P(AiProtocolManagerIntegrationTest, SchemaViolationIsRejectedWith400) {
+  prependFilter(/*downstream=*/true, /*best_effort_parsing=*/false);
+  setRouteSchema();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeRequestWithBody(
+      requestHeaders(), R"({"model":"gpt-4","messages":[{"role":"wizard","content":"hi"}]})");
+
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("400", response->headers().getStatusValue());
+  EXPECT_EQ("messages[0].role: value not permitted", response->body());
 }
 
 } // namespace

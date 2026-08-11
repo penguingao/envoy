@@ -35,11 +35,18 @@ than after the whole upload. Oversized string values are left in the external
 buffer and referenced by offset, so a large prompt does not reappear in
 per-stream memory.
 
+Once the body has been received in full it is validated against the schema the
+route declared, and a payload that does not conform is rejected. See `Request
+validation`_ below.
+
 .. note::
 
   Only the request (decode) path is wired today, and the body is offloaded to an
-  in-memory store. Schema validation and transcoding are not implemented yet;
-  the parsed payload is not consumed by anything downstream so far.
+  in-memory store. Transcoding to the canonical schema is not implemented yet, so
+  :ref:`normalize
+  <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute.normalize>`
+  is accepted and has no effect, and the response payload has no schema of its
+  own yet.
 
 The filter is a dual filter: besides the downstream HTTP filter chain shown
 below, it can also be placed in a cluster's upstream HTTP filter chain via
@@ -72,9 +79,10 @@ Which routes are AI endpoints is declared per route, with
 <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute>`.
 A route that carries one names the :ref:`schema
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute.schema>`
-its payload follows, and its payload is parsed strictly: a malformed body is
-rejected with a 400. This is normally attached to a route matching the
-provider's REST path, such as ``/chat/completions``:
+its payload follows, and its payload is parsed and validated strictly: a body
+that is malformed or does not conform to that schema is rejected with a 400. This
+is normally attached to a route matching the provider's REST path, such as
+``/chat/completions``:
 
 .. code-block:: yaml
 
@@ -109,4 +117,52 @@ does not parse is forwarded unchanged.
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
       best_effort_parsing: true
+
+Request validation
+------------------
+
+A declared AI endpoint's payload is checked against the schema its route named,
+once the body has been received in full.
+
+**Only declared fields are constrained.** Any other field is forwarded untouched,
+so a request using a provider field newer than this Envoy is not rejected for it.
+The schemas also deliberately leave fast-moving values unconstrained -- the type
+of ``service_tier`` is checked, for example, but not which value it holds --
+because a proxy that rejects a request the upstream would have accepted is worse
+than one that forwards a request the upstream rejects itself. Caller-authored JSON
+Schema (``tools[].function.parameters``,
+``response_format.json_schema.schema``) is carried through without being
+interpreted at all.
+
+A payload that violates the schema is answered with a 400 whose
+``response_code_details`` is ``ai_protocol_manager_schema_violation`` --
+distinct from the ``ai_protocol_manager_invalid_json`` a malformed body gets, so
+the two are separable in stats and access logs. The response body names the
+offending field and what was expected of it, for example:
+
+.. code-block:: text
+
+  messages[0].role: value not permitted
+
+That message never echoes the value the client sent, so prompt content cannot
+reach a response, an access log, or a stat.
+
+A string value large enough to have been left in the external buffer has its type
+checked but not its contents. This does not weaken anything the schemas
+constrain: a field with a restricted set of values is never one that may be
+offloaded, so such a value is always available to check.
+
+A route that is not a declared AI endpoint is never validated, including under
+:ref:`best_effort_parsing
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager.best_effort_parsing>`:
+it named no schema, so there is nothing to hold its payload to.
+
+Limitations
+-----------
+
+JSON nesting deeper than 8 levels is rejected as malformed before validation
+runs, and is reported as ``ai_protocol_manager_invalid_json`` rather than as a
+depth problem. A deeply nested ``tools[].function.parameters`` JSON Schema can
+reach that limit -- a tool argument that is itself an object of objects is close
+to it -- so this is worth knowing before fronting tool-calling traffic.
 

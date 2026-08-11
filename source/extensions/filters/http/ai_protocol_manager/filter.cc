@@ -43,6 +43,8 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
       route_config != nullptr) {
     schema_ = route_config->schema();
     normalize_ = route_config->normalize();
+    // Resolved here, not at validation time, so the hot path is a pointer test.
+    request_schema_ = requestSchemaFor(schema_);
     ENVOY_LOG(debug, "ai_protocol_manager: route declares schema {}{}",
               PerRouteProto::Schema_Name(schema_), normalize_ ? ", normalizing" : "");
   }
@@ -113,16 +115,37 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
   if (end_stream) {
     request_json_ = request_parser_->takeDocument();
     request_parser_.reset();
+    // Only a declared endpoint has a schema; a best-effort route named none, so
+    // there is nothing to hold its payload to -- the same reason its parse
+    // failures are not fatal.
+    if (request_schema_ != nullptr) {
+      if (const absl::Status status = request_schema_->validate(request_json_.json());
+          !status.ok()) {
+        rejectSchemaViolation(status);
+        return false;
+      }
+    }
   }
   return true;
 }
 
-void AiProtocolManagerFilter::rejectInvalidPayload(const absl::Status& status) {
+void AiProtocolManagerFilter::rejectPayload(const absl::Status& status, absl::string_view body,
+                                            absl::string_view details) {
   ENVOY_LOG(debug, "ai_protocol_manager: rejecting request: {}", status.message());
   payload_rejected_ = true;
   request_parser_.reset();
-  decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, "invalid JSON payload", nullptr,
-                                     std::nullopt, "ai_protocol_manager_invalid_json");
+  decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, body, nullptr, std::nullopt, details);
+}
+
+void AiProtocolManagerFilter::rejectInvalidPayload(const absl::Status& status) {
+  // A fixed body: a parse error message can quote the offending payload bytes.
+  rejectPayload(status, "invalid JSON payload", "ai_protocol_manager_invalid_json");
+}
+
+void AiProtocolManagerFilter::rejectSchemaViolation(const absl::Status& status) {
+  // "<path>: <reason>", which names the field and the schema's expectation and
+  // never the value (schema/schema_validator.h), so it is safe to hand back.
+  rejectPayload(status, status.message(), "ai_protocol_manager_schema_violation");
 }
 
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data,
@@ -151,9 +174,10 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
 
   decode_manager_->onData(data);
   if (end_stream) {
-    // The full body has been offloaded. The filter owns replay and end-of-stream:
-    // a future change will assemble and inspect the request here (and may replay
-    // sub-ranges); for now replay the whole body, then emit the terminal frame.
+    // The full body has been offloaded and, on a declared endpoint, parsed and
+    // validated by feedParser() above. The filter owns replay and end-of-stream: a
+    // future change may replay sub-ranges (to stream the offloaded fields in the
+    // schema's order); for now replay the whole body, then emit the terminal frame.
     decode_manager_->endStream();
     decode_manager_->replay(0, decode_manager_->length(), [this]() {
       // Terminate the stream with an empty end_stream data frame after the replayed

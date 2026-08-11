@@ -112,9 +112,11 @@ envoy_extension_cc_test(
     rbe_pool = "6gig",
     shard_count = 4,
     deps = [
+        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
         "//source/extensions/filters/http/ai_protocol_manager:config",
         # A downstream buffer filter is used to trip a local reply during replay.
         "//source/extensions/filters/http/buffer:config",
         "//test/integration:http_protocol_integration_lib",
+        "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
     ],
 )

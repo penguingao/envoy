@@ -11,6 +11,8 @@
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
+#include "source/extensions/filters/http/ai_protocol_manager/schema/payload_schema.h"
+#include "source/extensions/filters/http/ai_protocol_manager/schema/schema_registry.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 #include "absl/status/status.h"
@@ -20,11 +22,8 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-using PerRouteProto =
-    envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute;
-// The schema a route declares its payload follows. UNSPECIFIED means the route
-// declared nothing, i.e. it is not an AI endpoint.
-using Schema = PerRouteProto::Schema;
+// PerRouteProto and Schema are declared by schema_registry.h, which needs them to
+// name what it resolves.
 
 // Filter-level configuration, shared by every stream on the chain.
 class FilterConfig {
@@ -41,8 +40,8 @@ private:
 using FilterConfigSharedPtr = std::shared_ptr<const FilterConfig>;
 
 // Per-route configuration. Its presence declares the route an AI endpoint: the
-// payload is parsed strictly and, once schemas land, validated against schema()
-// and transcoded to the canonical schema when normalize() is set.
+// payload is parsed strictly and validated against schema(), and -- once
+// transcoding lands -- normalized to the canonical schema when normalize() is set.
 class RouteConfig : public Router::RouteSpecificFilterConfig {
 public:
   explicit RouteConfig(const PerRouteProto& proto)
@@ -98,8 +97,14 @@ private:
 // compatibility with chains that want a parsed body on ordinary routes, never a
 // reason to fail a request -- and is otherwise untouched.
 //
-// The schema is not acted on yet: validation against it and transcoding to the
-// canonical schema when the route asks to normalize both come later.
+// Once the document is complete it is validated against the schema the route
+// declared (schema/payload_schema.h), and a payload that violates it is rejected
+// with a 400 naming the offending field. Only a declared endpoint is validated: a
+// best-effort route named no schema, so there is nothing to hold its payload to.
+//
+// Transcoding to the canonical schema when the route asks to normalize still
+// comes later; today a normalizing route is validated in its declared schema and
+// forwarded in it.
 class AiProtocolManagerFilter : public Http::PassThroughFilter,
                                 public Logger::Loggable<Logger::Id::filter> {
 public:
@@ -121,8 +126,19 @@ private:
   // it; a best-effort parse that fails abandons parsing and returns true.
   bool feedParser(const Buffer::Instance& data, bool end_stream);
 
+  // Terminates the stream with a 400. `body` and `details` are the whole of what
+  // the client sees, and neither may carry any part of the payload -- which is why
+  // the two callers below differ: a parse error message can quote payload bytes
+  // (an unrepresentable number literal, say), while a schema violation message is
+  // value-free by construction (schema/schema_validator.h).
+  void rejectPayload(const absl::Status& status, absl::string_view body, absl::string_view details);
+
   // Terminates the stream with a 400 for a payload that failed to parse.
   void rejectInvalidPayload(const absl::Status& status);
+
+  // Terminates the stream with a 400 for a payload that parsed but does not
+  // conform to the schema the route declared.
+  void rejectSchemaViolation(const absl::Status& status);
 
   // Whether the route declared itself an AI endpoint, which is also what makes a
   // parse failure fatal.
@@ -142,8 +158,18 @@ private:
   Schema schema_{PerRouteProto::UNSPECIFIED};
   bool normalize_{false};
 
+  // The schema the payload is held to, resolved once from schema_. Non-null
+  // exactly when the route is a declared AI endpoint this binary has a table for,
+  // so it is the single condition the validation hook tests -- "not an AI
+  // endpoint" and "no table for that schema" collapse into the same null.
+  //
+  // Unlike the route configuration this is safe to cache for the stream: it points
+  // at a process-lifetime singleton (schema/schema_registry.h), so re-resolving the
+  // route mid-stream cannot leave it dangling.
+  const PayloadSchema* request_schema_{nullptr};
+
   // The parsed payload. Populated once the body has been fully received and
-  // parsed; nothing consumes it yet.
+  // parsed, and validated against request_schema_ at that point.
   JsonWithExtBuf request_json_;
   // Cleared once parsing is done with, whether it completed, was abandoned, or
   // failed the request.

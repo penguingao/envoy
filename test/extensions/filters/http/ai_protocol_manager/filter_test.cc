@@ -56,13 +56,16 @@ public:
     // Capture continueDecoding() so trailer-terminated streams can assert the
     // held trailers are released after the replayed body.
     ON_CALL(callbacks_, continueDecoding()).WillByDefault(Invoke([this]() { ++continue_calls_; }));
-    // Capture local replies so rejection tests can assert code and details.
+    // Capture local replies so rejection tests can assert code, body and details.
+    // The body matters: a schema violation names the offending field there, and it
+    // must never carry any of the payload.
     ON_CALL(callbacks_, sendLocalReply(testing::_, testing::_, testing::_, testing::_, testing::_))
-        .WillByDefault(Invoke([this](Http::Code code, absl::string_view,
+        .WillByDefault(Invoke([this](Http::Code code, absl::string_view body,
                                      std::function<void(Http::ResponseHeaderMap&)>,
                                      const std::optional<Grpc::Status::GrpcStatus>,
                                      absl::string_view details) {
           local_reply_code_ = code;
+          local_reply_body_ = std::string(body);
           local_reply_details_ = std::string(details);
           ++local_reply_calls_;
         }));
@@ -143,8 +146,15 @@ public:
   int raise_watermark_at_inject_{0}; // 0 = never.
   int local_reply_calls_{0};
   std::optional<Http::Code> local_reply_code_;
+  std::string local_reply_body_;
   std::string local_reply_details_;
 };
+
+// A payload that satisfies the OpenAI Chat Completions schema. Tests about the
+// offload/replay machinery rather than about validation use this, so that a
+// declared endpoint's body is not rejected for reasons they are not testing.
+constexpr absl::string_view kValidPayload =
+    R"({"model":"gpt-4","messages":[{"role":"user","content":"hi"}]})";
 
 // With a payload to inspect, iteration pauses so the rest of the chain does not
 // see the headers until it is offloaded.
@@ -384,7 +394,8 @@ TEST_F(AiProtocolManagerFilterTest, ParsesDeclaredEndpointPayloadAndReplaysItVer
   setRouteConfig();
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
-  const std::string payload = R"({"model":"gpt-4","stream":true,"max_tokens":256})";
+  const std::string payload =
+      R"({"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true})";
   Buffer::OwnedImpl body(payload);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
@@ -441,6 +452,11 @@ TEST_F(AiProtocolManagerFilterTest, RejectsTruncatedJson) {
 // with only the terminating chunk, or an empty terminal DATA frame -- carries no
 // payload to validate, so it passes through just like a request that ended on
 // its headers. A GET reaches the filter this way.
+//
+// Note the asymmetry this leaves: a body of "{}" is now rejected for a missing
+// `model`, while a body of zero bytes is not validated at all. There is no
+// document in the second case, and treating a request with no body as a schema
+// violation would break the GET above.
 TEST_F(AiProtocolManagerFilterTest, EmptyBodyOnDeclaredEndpointIsPassedThrough) {
   setRouteConfig();
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
@@ -499,16 +515,16 @@ TEST_F(AiProtocolManagerFilterTest, ChunkedBodyWithEmptyTerminalFrame) {
   setRouteConfig();
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
-  Buffer::OwnedImpl chunk1(R"({"model":"gpt)");
+  Buffer::OwnedImpl chunk1(R"({"model":"gpt-4","messages":[{"role":"user",)");
   EXPECT_EQ(filter_->decodeData(chunk1, false), Http::FilterDataStatus::StopIterationNoBuffer);
-  Buffer::OwnedImpl chunk2(R"(-4"})");
+  Buffer::OwnedImpl chunk2(R"("content":"hi"}]})");
   EXPECT_EQ(filter_->decodeData(chunk2, false), Http::FilterDataStatus::StopIterationNoBuffer);
   Buffer::OwnedImpl terminal;
   EXPECT_EQ(filter_->decodeData(terminal, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_EQ(injected_.toString(), R"({"model":"gpt-4"})");
+  EXPECT_EQ(injected_.toString(), kValidPayload);
 }
 
 // With trailers, no data frame carries end_stream, so the trailers close it.
@@ -516,14 +532,14 @@ TEST_F(AiProtocolManagerFilterTest, TrailerTerminatedJsonIsParsed) {
   setRouteConfig();
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
-  Buffer::OwnedImpl body(R"({"model":"gpt-4"})");
+  Buffer::OwnedImpl body(kValidPayload);
   EXPECT_EQ(filter_->decodeData(body, false), Http::FilterDataStatus::StopIterationNoBuffer);
   Http::TestRequestTrailerMapImpl trailers{{"x-trailer", "1"}};
   EXPECT_EQ(filter_->decodeTrailers(trailers), Http::FilterTrailersStatus::StopIteration);
   drain();
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_EQ(injected_.toString(), R"({"model":"gpt-4"})");
+  EXPECT_EQ(injected_.toString(), kValidPayload);
   EXPECT_EQ(continue_calls_, 1);
 }
 
@@ -679,12 +695,184 @@ TEST_F(AiProtocolManagerFilterTest, PassThroughEndpointIsParsedAndForwarded) {
   setRouteConfig(/*normalize=*/false);
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
-  Buffer::OwnedImpl body(R"({"model":"gpt-4"})");
+  Buffer::OwnedImpl body(kValidPayload);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_EQ(injected_.toString(), R"({"model":"gpt-4"})");
+  EXPECT_EQ(injected_.toString(), kValidPayload);
+}
+
+// A payload that parses but does not match the declared schema is answered with a
+// 400 naming the offending field, and never reaches the upstream.
+TEST_F(AiProtocolManagerFilterTest, RejectsSchemaViolation) {
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({"model":"gpt-4","messages":[{"role":"wizard","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_code_, Http::Code::BadRequest);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_schema_violation");
+  EXPECT_EQ(local_reply_body_, "messages[0].role: value not permitted");
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, RejectsMissingRequiredField) {
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({"messages":[{"role":"user","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_body_, "model: required field is missing");
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+// Well-formed JSON of the wrong shape entirely. Before schemas this was forwarded.
+TEST_F(AiProtocolManagerFilterTest, RejectsNonObjectPayload) {
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body("[1,2,3]");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_body_, "payload: expected an object");
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+// The reply names the field and the schema's expectation, and nothing the client
+// sent -- prompt content must not come back in a response or reach an access log.
+TEST_F(AiProtocolManagerFilterTest, SchemaViolationDoesNotEchoThePayload) {
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(
+      R"({"model":"gpt-4","messages":[{"role":"user","content":"SUPERSECRETPROMPT"}],)"
+      R"("temperature":"SUPERSECRETPROMPT"})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_body_, "temperature: expected a number");
+  EXPECT_THAT(local_reply_body_, testing::Not(testing::HasSubstr("SUPERSECRET")));
+  EXPECT_THAT(local_reply_details_, testing::Not(testing::HasSubstr("SUPERSECRET")));
+}
+
+// The two rejection reasons stay separable in stats and access logs, so a
+// refactor cannot quietly collapse them into one.
+TEST_F(AiProtocolManagerFilterTest, SchemaViolationDetailDiffersFromInvalidJson) {
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  Buffer::OwnedImpl malformed(R"({"model" "gpt-4"})");
+  EXPECT_EQ(filter_->decodeData(malformed, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+  const std::string parse_details = local_reply_details_;
+  // A parse failure must not hand back the parser's message, which can quote
+  // payload bytes.
+  EXPECT_EQ(local_reply_body_, "invalid JSON payload");
+
+  createFilter();
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  Buffer::OwnedImpl violating(R"({"messages":[{"role":"user","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(violating, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(parse_details, "ai_protocol_manager_invalid_json");
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_schema_violation");
+  EXPECT_NE(parse_details, local_reply_details_);
+}
+
+// Earlier frames of a multi-frame body were already offloaded, but replay only
+// starts at end of stream -- which the rejection returns before -- so a violating
+// payload still reaches nothing downstream.
+TEST_F(AiProtocolManagerFilterTest, SchemaViolationOnMultiFrameBodyInjectsNothing) {
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl chunk1(R"({"model":"gpt-4","messages":)");
+  EXPECT_EQ(filter_->decodeData(chunk1, false), Http::FilterDataStatus::StopIterationNoBuffer);
+  Buffer::OwnedImpl chunk2(R"([{"role":"wizard"}]})");
+  EXPECT_EQ(filter_->decodeData(chunk2, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_body_, "messages[0].role: value not permitted");
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+// The second place a document is closed: no data frame carried end_stream, so the
+// trailers did. Validation has to happen on that path too.
+TEST_F(AiProtocolManagerFilterTest, SchemaViolationOnTrailerTerminatedStream) {
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({"model":"gpt-4","messages":[]})");
+  EXPECT_EQ(filter_->decodeData(body, false), Http::FilterDataStatus::StopIterationNoBuffer);
+  Http::TestRequestTrailerMapImpl trailers{{"x-trailer", "1"}};
+  EXPECT_EQ(filter_->decodeTrailers(trailers), Http::FilterTrailersStatus::StopIteration);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_schema_violation");
+  EXPECT_EQ(local_reply_body_, "messages: must not be empty");
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+// A best-effort route declared no schema, so there is nothing to hold its payload
+// to: a body that would violate the OpenAI schema is forwarded untouched.
+TEST_F(AiProtocolManagerFilterTest, BestEffortRouteIsNotValidated) {
+  createFilter(/*best_effort_parsing=*/true);
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  const std::string payload = R"({"model":123,"messages":[]})";
+  Buffer::OwnedImpl body(payload);
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  EXPECT_EQ(injected_.toString(), payload);
+}
+
+// The filter-level best-effort setting does not soften a declared endpoint.
+TEST_F(AiProtocolManagerFilterTest, DeclaredEndpointIsValidatedEvenWithBestEffortConfigured) {
+  createFilter(/*best_effort_parsing=*/true);
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({"model":"gpt-4","messages":[]})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_schema_violation");
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+// A prompt above the parser's inline threshold is left in the external buffer, so
+// validation meets a reference where a string is declared. Accepting it is the
+// whole point of tying the schema to the offload design -- rejecting it would make
+// every large prompt a false 400.
+TEST_F(AiProtocolManagerFilterTest, OffloadedPromptIsNotASchemaViolation) {
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  const std::string prompt(4096, 'p');
+  const std::string payload =
+      R"({"model":"gpt-4","messages":[{"role":"user","content":")" + prompt + R"("}]})";
+  Buffer::OwnedImpl body(payload);
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  EXPECT_EQ(injected_.toString(), payload);
 }
 
 } // namespace

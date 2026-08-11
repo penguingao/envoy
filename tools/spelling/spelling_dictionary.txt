@@ -1190,11 +1190,13 @@ oauth
 observability
 observations
 ocagent
+offloadable
 offsetof
 oneof
 oneway
 oob
 opcode
+openai
 openid
 openssl
 OpenAI
@@ -1256,6 +1258,7 @@ pre
 preallocate
 preallocating
 preallocation
+prebuilt
 precalculated
 precompile
 precompiled
