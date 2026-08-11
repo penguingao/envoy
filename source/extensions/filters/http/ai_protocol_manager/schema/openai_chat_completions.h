@@ -1,10 +1,6 @@
 #pragma once
 
-#include <vector>
-
 #include "source/extensions/filters/http/ai_protocol_manager/schema/field_schema.h"
-
-#include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -14,9 +10,6 @@ namespace AiProtocolManager {
 // The OpenAI Chat Completions request schema. Also the canonical request schema
 // for now, so normalizing an OpenAI payload is an identity transform.
 const FieldSchema* buildOpenAiChatCompletionsRequestSchema(SchemaBuilder& builder);
-
-// The order the offloadable fields of that schema stream in. See OffloadPlan.
-std::vector<absl::string_view> openAiChatCompletionsStreamOrder();
 
 // The OpenAI Chat Completions response schema.
 //

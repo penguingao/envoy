@@ -45,7 +45,6 @@ TEST(SchemaRegistryTest, OpenAiChatCompletionsResolvesAndIsNamed) {
   const PayloadSchema* request = requestSchemaFor(PerRouteProto::OPENAI_CHAT_COMPLETIONS);
   ASSERT_NE(request, nullptr);
   EXPECT_EQ(request->name(), "openai_chat_completions");
-  EXPECT_FALSE(request->offloadPlan().streamOrder().empty());
 }
 
 // Canonical is the OpenAI shape for now, so normalization is an identity

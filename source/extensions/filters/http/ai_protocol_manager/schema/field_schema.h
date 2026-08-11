@@ -53,7 +53,14 @@ struct FieldSchema {
   FieldKind kind{FieldKind::AnyJson};
 
   // String only: whether the value may be left in the external buffer instead of
-  // materialized in the DOM. See offload_plan.h.
+  // materialized in the DOM.
+  //
+  // Declared here but not acted on yet: the parser still offloads any string over
+  // its inline threshold, whatever the schema says.
+  // TODO(penguingao): have the parser consult this, so a field something needs to
+  // read stays in the DOM and one nothing reads can leave it regardless of size.
+  // That needs a path-keyed projection of the tree, since the parser decides per
+  // value from the cursor's pattern path rather than from a node.
   bool offloadable{false};
 
   // Number/Int: inclusive bounds; unset means unbounded. Not named min/max, which

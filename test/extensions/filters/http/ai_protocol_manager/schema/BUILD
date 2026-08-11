@@ -41,22 +41,6 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
-    name = "offload_plan_test",
-    srcs = ["offload_plan_test.cc"],
-    extension_names = ["envoy.filters.http.ai_protocol_manager"],
-    rbe_pool = "6gig",
-    deps = [
-        # The cursor is here so the derived paths can be asserted against the
-        # very strings the parser will look them up with.
-        "//source/common/json/wuffs_json:wuffs_json_cursor_lib",
-        "//source/extensions/filters/http/ai_protocol_manager/schema:field_schema_lib",
-        "//source/extensions/filters/http/ai_protocol_manager/schema:offload_plan_lib",
-        "//test/test_common:status_utility_lib",
-        "//test/test_common:utility_lib",
-    ],
-)
-
-envoy_extension_cc_test(
     name = "schema_validator_test",
     srcs = ["schema_validator_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],

@@ -26,19 +26,6 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "offload_plan_lib",
-    srcs = ["offload_plan.cc"],
-    hdrs = ["offload_plan.h"],
-    deps = [
-        ":field_schema_lib",
-        "@abseil-cpp//absl/container:flat_hash_map",
-        "@abseil-cpp//absl/container:flat_hash_set",
-        "@abseil-cpp//absl/strings",
-        "@abseil-cpp//absl/types:span",
-    ],
-)
-
-envoy_cc_library(
     name = "schema_validator_lib",
     srcs = ["schema_validator.cc"],
     hdrs = ["schema_validator.h"],
@@ -56,7 +43,6 @@ envoy_cc_library(
     name = "payload_schema_interface",
     hdrs = ["payload_schema.h"],
     deps = [
-        ":offload_plan_lib",
         "//envoy/common:pure_lib",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/strings",
@@ -91,7 +77,6 @@ envoy_cc_library(
     hdrs = ["tree_payload_schema.h"],
     deps = [
         ":field_schema_lib",
-        ":offload_plan_lib",
         ":payload_schema_interface",
         ":schema_validator_lib",
         "@abseil-cpp//absl/status",

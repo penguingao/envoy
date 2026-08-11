@@ -19,8 +19,9 @@ namespace AiProtocolManager {
 // tool-calling assistant one; tool_call_id is required only for role: tool;
 // logit_bias values are bounded -100..100.
 //
-// Offloadable fields are only the free text. Everything else stays inline so a
-// later filter can read it.
+// Fields marked offloadable are only the free text; everything else is declared to
+// stay inline so a later filter can read it. Nothing acts on that yet -- see
+// FieldSchema::offloadable.
 
 const FieldSchema* buildOpenAiChatCompletionsRequestSchema(SchemaBuilder& b) {
   // Bottom-up: a parent needs its children's pointers. Shared subtrees are
@@ -140,21 +141,6 @@ const FieldSchema* buildOpenAiChatCompletionsRequestSchema(SchemaBuilder& b) {
       {"service_tier", b.str()},
       {"reasoning_effort", b.str()},
   });
-}
-
-std::vector<absl::string_view> openAiChatCompletionsStreamOrder() {
-  // Prompts first, then tool payloads. Every path here must be a declared
-  // offloadable field, which OffloadPlan asserts.
-  return {
-      "messages[].content",
-      "messages[].content[].text",
-      "messages[].content[].image_url.url",
-      "prediction.content",
-      "prediction.content[].text",
-      "prediction.content[].image_url.url",
-      "messages[].tool_calls[].function.arguments",
-      "tools[].function.description",
-  };
 }
 
 const FieldSchema* buildOpenAiChatCompletionsResponseSchema(SchemaBuilder& b) {

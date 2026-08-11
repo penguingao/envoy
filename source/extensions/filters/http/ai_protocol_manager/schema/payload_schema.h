@@ -2,8 +2,6 @@
 
 #include "envoy/common/pure.h"
 
-#include "source/extensions/filters/http/ai_protocol_manager/schema/offload_plan.h"
-
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "nlohmann/json.hpp"
@@ -33,10 +31,6 @@ public:
   // reaches the client and the access log, and prompt content must reach neither.
   // See schema_validator.h for how the tree implementation guarantees it.
   virtual absl::Status validate(const nlohmann::json& payload) const PURE;
-
-  // Which of this schema's string fields may be left in the external buffer
-  // rather than materialized in the DOM, and in what order they stream.
-  virtual const OffloadPlan& offloadPlan() const PURE;
 };
 
 } // namespace AiProtocolManager
