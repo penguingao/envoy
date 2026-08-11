@@ -141,9 +141,8 @@ TEST_F(SchemaValidatorTest, OptionalFieldNullMeansUnset) {
       {"b", b_.boolean()},
       {"o", b_.anyObject()},
       {"a", b_.array(b_.str())},
-      {"e", b_.str({"only"})},
   });
-  EXPECT_OK(check(R"({"s":null,"n":null,"i":null,"b":null,"o":null,"a":null,"e":null})", *schema));
+  EXPECT_OK(check(R"({"s":null,"n":null,"i":null,"b":null,"o":null,"a":null})", *schema));
 }
 
 // The null rule belongs to the field edge, not to the value: an array element is
@@ -151,15 +150,6 @@ TEST_F(SchemaValidatorTest, OptionalFieldNullMeansUnset) {
 TEST_F(SchemaValidatorTest, NullArrayElementIsAViolation) {
   const FieldSchema* schema = b_.object({{"f", b_.array(b_.str())}});
   EXPECT_EQ(message(R"({"f":[null]})", *schema), "f[0]: expected a string");
-}
-
-TEST_F(SchemaValidatorTest, EnumConstraint) {
-  const FieldSchema* schema = b_.object({{"f", b_.str({"a", "b"})}});
-  EXPECT_OK(check(R"({"f":"a"})", *schema));
-  EXPECT_OK(check(R"({"f":"b"})", *schema));
-  EXPECT_EQ(message(R"({"f":"c"})", *schema), "f: value not permitted");
-  // A prefix of a permitted value is not a permitted value.
-  EXPECT_EQ(message(R"({"f":"ab"})", *schema), "f: value not permitted");
 }
 
 // Bounds are inclusive at both ends, and the message quotes the schema's own
@@ -235,15 +225,15 @@ TEST_F(SchemaValidatorTest, AnyJsonAcceptsEverything) {
 }
 
 TEST_F(SchemaValidatorTest, PathsAreBuiltForNestedShapes) {
-  const FieldSchema* role = b_.object({{"role", b_.str({"user"})}});
+  const FieldSchema* role = b_.object({{"role", b_.str()}});
   const FieldSchema* schema = b_.object({
       {"messages", b_.array(role)},
       {"a", b_.object({{"b", b_.object({{"c", b_.str()}})}})},
       {"grid", b_.array(b_.array(b_.str()))},
   });
 
-  EXPECT_EQ(message(R"({"messages":[{"role":"user"},{"role":"user"},{"role":"wizard"}]})", *schema),
-            "messages[2].role: value not permitted");
+  EXPECT_EQ(message(R"({"messages":[{"role":"user"},{"role":"user"},{"role":123}]})", *schema),
+            "messages[2].role: expected a string");
   EXPECT_EQ(message(R"({"a":{"b":{"c":1}}})", *schema), "a.b.c: expected a string");
   EXPECT_EQ(message(R"({"grid":[["a"],[1]]})", *schema), "grid[1][0]: expected a string");
 }
@@ -262,7 +252,6 @@ TEST_F(SchemaValidatorTest, ViolationMessageNeverEchoesThePayload) {
   constexpr absl::string_view kSecret = "SUPERSECRETPROMPT";
   const FieldSchema* schema = b_.object({
       {"typed", b_.integer()},
-      {"enumerated", b_.str({"permitted"})},
       {"bounded", b_.number(0.0, 1.0)},
       {"required_field", Required, b_.str()},
       {"nested", b_.object({{"inner", b_.str()}})},
@@ -271,8 +260,6 @@ TEST_F(SchemaValidatorTest, ViolationMessageNeverEchoesThePayload) {
   const std::string bodies[] = {
       // Wrong type, value is the secret.
       R"({"typed":"SUPERSECRETPROMPT","required_field":"x"})",
-      // Enum non-match, value is the secret.
-      R"({"enumerated":"SUPERSECRETPROMPT","required_field":"x"})",
       // Out of range, rendered as a number.
       R"({"bounded":999.5,"required_field":"x"})",
       // Missing required field, with the secret as an undeclared key AND value.
@@ -295,24 +282,15 @@ TEST_F(SchemaValidatorTest, ViolationMessageNeverEchoesThePayload) {
 // An oversized string is not in the DOM at all -- it is a binary node holding an
 // ExternalRef -- so a string check has to recognize that shape as a string.
 TEST_F(SchemaValidatorTest, ExternalRefSatisfiesAStringField) {
-  const FieldSchema* schema = b_.object({{"content", b_.offloadableStr(StreamOrder::Prompt)}});
+  const FieldSchema* offloadable = b_.object({{"content", b_.offloadableStr()}});
+  // Also where the field was not marked offloadable: no string constraint depends
+  // on the contents, so the type check is all there is either way.
+  const FieldSchema* plain = b_.object({{"content", b_.str()}});
   nlohmann::json payload = nlohmann::json::object();
   payload["content"] = JsonWithExtBuf::makeExternalRef({/*offset=*/10, /*length=*/4096});
 
-  EXPECT_OK(validate(payload, *schema));
-}
-
-// A value the proxy has to compare against a list is one the proxy has to be able
-// to read. An offloaded value is longer than the inline threshold and every
-// permitted value is far shorter, so it matches none of them -- decided without
-// reading the buffer. A schema never marks an enum field offloadable, so this is
-// a defensive branch rather than a reachable one.
-TEST_F(SchemaValidatorTest, ExternalRefCannotSatisfyAnEnum) {
-  const FieldSchema* schema = b_.object({{"role", b_.str({"user", "assistant"})}});
-  nlohmann::json payload = nlohmann::json::object();
-  payload["role"] = JsonWithExtBuf::makeExternalRef({/*offset=*/0, /*length=*/2048});
-
-  EXPECT_EQ(std::string(validate(payload, *schema).message()), "role: value not permitted");
+  EXPECT_OK(validate(payload, *offloadable));
+  EXPECT_OK(validate(payload, *plain));
 }
 
 TEST_F(SchemaValidatorTest, ExternalRefIsNotANumberObjectOrArray) {

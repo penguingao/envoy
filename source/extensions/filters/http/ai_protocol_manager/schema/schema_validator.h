@@ -10,42 +10,32 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-// Validates a parsed payload against a schema tree by walking the two together.
+// Validates a parsed payload against a schema tree.
 //
-// OK if `payload` conforms. On a violation, InvalidArgument whose message is
-// "<path>: <reason>":
+// On a violation, InvalidArgument whose message is "<path>: <reason>", e.g.
+// "messages[2].role: expected a string" or "model: required field is missing".
 //
-//   messages[2].role: value not permitted
-//   temperature: value must be at most 2
-//   model: required field is missing
-//   payload: expected an object
+// The message never contains any part of the payload: every path segment comes
+// from the schema declaration or is an array index, and every reason is a literal,
+// optionally with the schema's own numeric bounds. It reaches the client and the
+// access log, and prompt content must reach neither. A test pins this.
 //
-// The message NEVER contains any part of the payload. Every path segment is
-// either a field name taken from the schema declaration (a string literal) or an
-// array index, and every reason is a literal, optionally carrying the schema's
-// own numeric bounds. This message reaches the client and the access log, and
-// prompt content must reach neither -- that is the property, and a test pins it.
+// Only the first violation is reported -- a proxy needs a reason to reject, not an
+// audit report.
 //
-// Only the first violation is reported: a proxy needs a reason to reject, not an
-// audit report, and stopping early bounds the work an adversarial payload can
-// cause.
+// An oversized string is not in the DOM: it is a binary node holding an
+// ExternalRef (json_with_ext_buf.h), so FieldKind::String accepts
+// `is_string() || isExternalRef()`. No schema constrains a string's contents, so
+// nothing is skipped by not reading the buffer.
+// TODO(penguingao): a future string constraint (length, pattern) could not be
+// checked on an offloaded value; it would need the reference resolved against the
+// external buffer during validation.
 //
-// OFFLOADED STRINGS: a string whose decoded content exceeds the parser's inline
-// threshold is not in the DOM at all -- it is a binary node carrying an
-// ExternalRef (json_with_ext_buf.h). FieldKind::String therefore accepts
-// `is_string() || JsonWithExtBuf::isExternalRef()`.
-//
-// An enum constraint on such a value is still decided, and decided against it:
-// the value is by definition longer than the inline threshold, every permitted
-// value is at most FieldSchema::kMaxEnumValueBytes, and the threshold is far
-// larger -- so it cannot match any of them. Nothing has to be read out of the
-// buffer to know that. In practice the case does not arise, because a schema
-// marks only free text offloadable and never marks an enum-constrained field so.
-//
-// TODO(penguingao): a string constraint that is not an enum -- a length bound, a
-// pattern -- cannot be decided this way. Resolving the reference against the
-// external buffer during validation is the general fix; until then such a
-// constraint must not be added.
+// TODO(penguingao): validate as the Wuffs parser goes rather than walking the
+// finished DOM. The parser already reports the path and depth of each value, so a
+// violation could fail the request at the offending byte -- as a parse error
+// already does -- instead of after the whole upload, and would not need the DOM to
+// be complete first.
 absl::Status validate(const nlohmann::json& payload, const FieldSchema& schema);
 
 } // namespace AiProtocolManager

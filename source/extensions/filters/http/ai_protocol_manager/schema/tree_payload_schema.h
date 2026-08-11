@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "source/extensions/filters/http/ai_protocol_manager/schema/field_schema.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema/offload_plan.h"
@@ -15,30 +16,33 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-// Builds a schema tree into `builder` and returns its root. A schema is written
-// as one of these (openai_chat_completions.h) rather than as a value, so the
-// nodes are interned in the builder that will outlive them.
+// Builds a schema tree into `builder` and returns its root. A schema is written as
+// one of these rather than as a value, so its nodes are interned in the builder
+// that outlives them.
 using SchemaBuildFn = const FieldSchema* (*)(SchemaBuilder&);
+// The order that schema's offloadable fields stream in; null means no preference.
+using StreamOrderFn = std::vector<absl::string_view> (*)();
 
 // A PayloadSchema backed by a FieldSchema tree.
 //
-// LIFETIME: `builder_` is declared before the members that point into it and is
-// default-constructed in place -- never moved, never assigned -- so member
-// initialization order makes root_ and plan_ correct by construction rather than
-// by an argument about what a move does to interior pointers. That is also why the
-// constructor takes a build function instead of a prebuilt tree: there is no way
-// to hand it nodes owned by an arena it does not own.
+// LIFETIME: `builder_` is declared before the members pointing into it and is
+// default-constructed in place -- never moved -- so member initialization order
+// makes root_ and plan_ correct by construction. That is also why the constructor
+// takes a build function rather than a prebuilt tree.
 class TreePayloadSchema : public PayloadSchema {
 public:
-  TreePayloadSchema(absl::string_view name, SchemaBuildFn build)
-      : name_(name), root_(build(builder_)), plan_(*root_) {}
+  TreePayloadSchema(absl::string_view name, SchemaBuildFn build,
+                    StreamOrderFn stream_order = nullptr)
+      : name_(name), root_(build(builder_)),
+        stream_order_(stream_order == nullptr ? std::vector<absl::string_view>{} : stream_order()),
+        plan_(*root_, stream_order_) {}
 
   // PayloadSchema
   absl::string_view name() const override { return name_; }
   absl::Status validate(const nlohmann::json& payload) const override;
   const OffloadPlan& offloadPlan() const override { return plan_; }
 
-  // The tree itself, for tests and for a future transcoder that has to walk it.
+  // For tests, and for a future transcoder that has to walk the tree.
   const FieldSchema& root() const { return *root_; }
 
 private:
@@ -46,6 +50,7 @@ private:
   // Owns every node root_ and plan_ refer to. Must stay declared first.
   SchemaBuilder builder_;
   const FieldSchema* root_;
+  const std::vector<absl::string_view> stream_order_;
   const OffloadPlan plan_;
 };
 

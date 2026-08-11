@@ -1,8 +1,8 @@
 #include "source/extensions/filters/http/ai_protocol_manager/schema/offload_plan.h"
 
 #include <algorithm>
-#include <tuple>
-#include <utility>
+
+#include "source/common/common/assert.h"
 
 #include "absl/strings/str_cat.h"
 
@@ -12,33 +12,26 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 namespace {
 
-// Extends `parent` with an object field, matching buildPatternPath(): the
-// separator is omitted at the root, where there is nothing to separate from.
+// Extends `parent`, matching buildPatternPath(): no separator at the root.
 std::string fieldPath(absl::string_view parent, absl::string_view name) {
   return parent.empty() ? std::string(name) : absl::StrCat(parent, ".", name);
 }
 
-// Walks the tree collecting the path of every declared string field.
+// Collects the path of every declared string field.
 //
 // A shared node is visited once per parent that reaches it, which is the point:
-// the content-part schema reached from messages[].content[] and from
-// prediction.content[] is one node describing two distinct paths.
+// one content-part schema describes both messages[].content[].text and
+// prediction.content[].text.
 //
-// Only String nodes are collected. A number or boolean is never offloaded, so its
-// path would change no decision, and an AnyJson subtree is deliberately left out
-// -- strings inside a caller's tool schema are undeclared, hence offloadable,
-// which is what keeps a large tool description out of the DOM.
+// Only String nodes count. A number is never offloaded, and an AnyJson subtree is
+// deliberately skipped so strings inside a caller's tool schema read as
+// undeclared, hence offloadable.
 void collect(const FieldSchema& schema, absl::string_view path,
-             std::vector<OffloadSpec>& offloadable, absl::flat_hash_set<std::string>& inline_only) {
+             absl::flat_hash_set<std::string>& offloadable,
+             absl::flat_hash_set<std::string>& inline_only) {
   switch (schema.kind) {
   case FieldKind::String:
-    if (schema.offloadable) {
-      // A path reachable as both offloadable and inline-only resolves to
-      // inline-only below: the field that has to be read wins.
-      offloadable.push_back(OffloadSpec{std::string(path), schema.stream_order});
-    } else {
-      inline_only.insert(std::string(path));
-    }
+    (schema.offloadable ? offloadable : inline_only).insert(std::string(path));
     return;
   case FieldKind::Object:
     for (const auto& [name, field] : schema.fields) {
@@ -51,8 +44,8 @@ void collect(const FieldSchema& schema, absl::string_view path,
     }
     return;
   case FieldKind::OneOf:
-    // Every alternative sits at the same path, which is exactly why the string
-    // and the parts-array forms of messages[].content both end up described.
+    // Alternatives share the path, which is why both the string and parts-array
+    // forms of a content field end up described.
     for (const FieldSchema* alternative : schema.alternatives) {
       collect(*alternative, path, offloadable, inline_only);
     }
@@ -67,39 +60,36 @@ void collect(const FieldSchema& schema, absl::string_view path,
 
 } // namespace
 
-OffloadPlan::OffloadPlan(const FieldSchema& root) {
-  std::vector<OffloadSpec> offloadable;
-  collect(root, /*path=*/"", offloadable, inline_only_paths_);
+OffloadPlan::OffloadPlan(const FieldSchema& root,
+                         absl::Span<const absl::string_view> stream_order) {
+  collect(root, /*path=*/"", offloadable_paths_, inline_only_paths_);
 
-  // A field something has to read wins over one that may be offloaded, so a path
-  // declared both ways stays inline.
-  for (OffloadSpec& spec : offloadable) {
-    if (!inline_only_paths_.contains(spec.pattern_path)) {
-      specs_.push_back(std::move(spec));
+  // A field reachable as both keeps the stricter answer: something may need to
+  // read it.
+  for (const std::string& path : inline_only_paths_) {
+    offloadable_paths_.erase(path);
+  }
+
+  for (const absl::string_view path : stream_order) {
+    RELEASE_ASSERT(offloadable_paths_.contains(path),
+                   absl::StrCat("schema: stream order names '", path,
+                                "', which is not a declared offloadable field"));
+    stream_order_.emplace_back(path);
+  }
+
+  // Offloadable fields the order does not name go after it, sorted so the result
+  // does not depend on hash iteration.
+  std::vector<std::string> unlisted;
+  for (const std::string& path : offloadable_paths_) {
+    if (std::find(stream_order_.begin(), stream_order_.end(), path) == stream_order_.end()) {
+      unlisted.push_back(path);
     }
   }
-
-  // Streaming order, with the path breaking ties so the order does not depend on
-  // hash iteration.
-  std::sort(specs_.begin(), specs_.end(), [](const OffloadSpec& a, const OffloadSpec& b) {
-    return std::tie(a.stream_order, a.pattern_path) < std::tie(b.stream_order, b.pattern_path);
-  });
-
-  by_path_.reserve(specs_.size());
-  for (const OffloadSpec& spec : specs_) {
-    by_path_.emplace(spec.pattern_path, &spec);
-  }
-}
-
-const OffloadSpec* OffloadPlan::find(absl::string_view pattern_path) const {
-  const auto it = by_path_.find(pattern_path);
-  return it == by_path_.end() ? nullptr : it->second;
+  std::sort(unlisted.begin(), unlisted.end());
+  stream_order_.insert(stream_order_.end(), unlisted.begin(), unlisted.end());
 }
 
 bool OffloadPlan::isOffloadable(absl::string_view pattern_path) const {
-  if (by_path_.contains(pattern_path)) {
-    return true;
-  }
   // Undeclared paths fall through to true; only a declared inline-only field is
   // held back.
   return !inline_only_paths_.contains(pattern_path);

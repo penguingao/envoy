@@ -116,8 +116,7 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
     request_json_ = request_parser_->takeDocument();
     request_parser_.reset();
     // Only a declared endpoint has a schema; a best-effort route named none, so
-    // there is nothing to hold its payload to -- the same reason its parse
-    // failures are not fatal.
+    // there is nothing to hold its payload to.
     if (request_schema_ != nullptr) {
       if (const absl::Status status = request_schema_->validate(request_json_.json());
           !status.ok()) {

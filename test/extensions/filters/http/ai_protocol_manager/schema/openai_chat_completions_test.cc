@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,7 +28,8 @@ using ::Envoy::StatusHelpers::HasStatusCode;
 class OpenAiChatCompletionsTest : public testing::Test {
 public:
   OpenAiChatCompletionsTest()
-      : request_("openai_chat_completions", buildOpenAiChatCompletionsRequestSchema),
+      : request_("openai_chat_completions", buildOpenAiChatCompletionsRequestSchema,
+                 openAiChatCompletionsStreamOrder),
         response_("openai_chat_completions_response", buildOpenAiChatCompletionsResponseSchema) {}
 
   absl::Status check(absl::string_view body) {
@@ -165,8 +168,6 @@ TEST_F(OpenAiChatCompletionsTest, RejectionMessages) {
       {R"({"model":"m"})", "messages: required field is missing"},
       {R"({"model":"m","messages":[]})", "messages: must not be empty"},
       {R"({"model":123,"messages":[{"role":"user","content":"x"}]})", "model: expected a string"},
-      {R"({"model":"m","messages":[{"role":"wizard","content":"x"}]})",
-       "messages[0].role: value not permitted"},
       {R"({"model":"m","messages":[{"content":"x"}]})",
        "messages[0].role: required field is missing"},
       {R"({"model":"m","messages":"not an array"})", "messages: expected an array"},
@@ -180,11 +181,6 @@ TEST_F(OpenAiChatCompletionsTest, RejectionMessages) {
        "top_logprobs: value must be at most 20"},
       {R"({"model":"m","messages":[{"role":"user","content":"x"}],"stream":"true"})",
        "stream: expected a boolean"},
-      {R"({"model":"m","messages":[{"role":"user","content":"x"}],"tool_choice":"sometimes"})",
-       "tool_choice: value does not match any permitted form"},
-      {R"({"model":"m","messages":[{"role":"user","content":"x"}],
-        "response_format":{"type":"yaml"}})",
-       "response_format.type: value not permitted"},
       {R"({"model":"m","messages":[{"role":"user","content":"x"}],"max_tokens":1.5})",
        "max_tokens: expected an integer"},
       {"[1,2,3]", "payload: expected an object"},
@@ -289,20 +285,27 @@ TEST_F(OpenAiChatCompletionsTest, OffloadPlanCoversOnlyFreeText) {
   EXPECT_FALSE(plan.isOffloadable("tools[].function.name"));
 }
 
-// Prompts stream before tools.
+// Prompts stream before tool payloads. The order is the declared list verbatim,
+// and every path in it having survived OffloadPlan's assertion is itself proof
+// that each names a real offloadable field.
 TEST_F(OpenAiChatCompletionsTest, PromptsStreamBeforeTools) {
-  const OffloadPlan& plan = request_.offloadPlan();
-  ASSERT_FALSE(plan.streamOrder().empty());
+  const absl::Span<const std::string> order = request_.offloadPlan().streamOrder();
 
-  bool seen_tool = false;
-  for (const OffloadSpec& spec : plan.streamOrder()) {
-    if (spec.stream_order == StreamOrder::Tool) {
-      seen_tool = true;
-    } else if (spec.stream_order == StreamOrder::Prompt) {
-      EXPECT_FALSE(seen_tool) << "a prompt field streams after a tool field: " << spec.pattern_path;
-    }
-  }
-  EXPECT_TRUE(seen_tool);
+  const auto index_of = [&order](absl::string_view path) {
+    const auto it = std::find(order.begin(), order.end(), path);
+    EXPECT_NE(it, order.end()) << path;
+    return std::distance(order.begin(), it);
+  };
+
+  EXPECT_LT(index_of("messages[].content"), index_of("messages[].tool_calls[].function.arguments"));
+  EXPECT_LT(index_of("messages[].content[].text"), index_of("tools[].function.description"));
+  EXPECT_LT(index_of("prediction.content"), index_of("tools[].function.description"));
+}
+
+// The declared order names every offloadable field, so none of them is left to
+// fall to the end by omission.
+TEST_F(OpenAiChatCompletionsTest, StreamOrderNamesEveryOffloadableField) {
+  EXPECT_EQ(request_.offloadPlan().streamOrder().size(), openAiChatCompletionsStreamOrder().size());
 }
 
 // The response schema is deliberately empty, but not dead: it still says the

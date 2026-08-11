@@ -54,7 +54,8 @@ private:
   // relied on to catch a new value -- schema_registry_test.cc drives
   // Schema_descriptor() to enforce completeness instead.
   const TreePayloadSchema openai_chat_completions_request_{"openai_chat_completions",
-                                                           buildOpenAiChatCompletionsRequestSchema};
+                                                           buildOpenAiChatCompletionsRequestSchema,
+                                                           openAiChatCompletionsStreamOrder};
   const TreePayloadSchema openai_chat_completions_response_{
       "openai_chat_completions_response", buildOpenAiChatCompletionsResponseSchema};
 };

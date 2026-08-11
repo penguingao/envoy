@@ -17,9 +17,8 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 namespace {
 
-// Appends one segment to the walk's path for the duration of a scope, so the walk
-// carries a single string rather than building a path per node. Only the failing
-// path is ever read.
+// Appends one segment for the duration of a scope, so the walk carries one string
+// and only the failing path is ever read.
 class PathScope {
 public:
   PathScope(std::string& path, absl::string_view field) : path_(path), saved_(path.size()) {
@@ -46,14 +45,13 @@ public:
   absl::Status validateNode(const nlohmann::json& value, const FieldSchema& schema);
 
 private:
-  // Every reason passed here is a literal, optionally carrying the schema's own
-  // bounds; no caller may pass anything derived from the payload.
+  // Every reason is a literal, optionally with the schema's own bounds. No caller
+  // may pass anything derived from the payload.
   absl::Status violation(absl::string_view reason) const {
     return absl::InvalidArgumentError(absl::StrCat(
         path_.empty() ? absl::string_view("payload") : absl::string_view(path_), ": ", reason));
   }
 
-  absl::Status validateString(const nlohmann::json& value, const FieldSchema& schema) const;
   absl::Status validateNumber(const nlohmann::json& value, const FieldSchema& schema) const;
   absl::Status validateObject(const nlohmann::json& value, const FieldSchema& schema);
   absl::Status validateArray(const nlohmann::json& value, const FieldSchema& schema);
@@ -62,43 +60,18 @@ private:
   std::string path_;
 };
 
-absl::Status Validator::validateString(const nlohmann::json& value,
-                                       const FieldSchema& schema) const {
-  // An offloaded string is a binary node, not a string node; see the header.
-  const bool offloaded = JsonWithExtBuf::isExternalRef(value);
-  if (!value.is_string() && !offloaded) {
-    return violation("expected a string");
-  }
-  if (schema.enum_values.empty()) {
-    return absl::OkStatus();
-  }
-  if (offloaded) {
-    // Longer than the inline threshold, hence longer than any permitted value.
-    return violation("value not permitted");
-  }
-  const std::string& text = value.get_ref<const std::string&>();
-  for (const absl::string_view permitted : schema.enum_values) {
-    if (text == permitted) {
-      return absl::OkStatus();
-    }
-  }
-  return violation("value not permitted");
-}
-
 absl::Status Validator::validateNumber(const nlohmann::json& value,
                                        const FieldSchema& schema) const {
+  const bool is_int = schema.kind == FieldKind::Int;
   if (!value.is_number()) {
-    return violation(schema.kind == FieldKind::Int ? "expected an integer" : "expected a number");
+    return violation(is_int ? "expected an integer" : "expected a number");
   }
   const double number = value.get<double>();
-  if (schema.kind == FieldKind::Int && !value.is_number_integer()) {
-    // A client sending 1024.0 where an integer belongs is not something to reject
-    // when the upstream would accept it; 1.5 still is.
-    if (std::trunc(number) != number) {
-      return violation("expected an integer");
-    }
+  // 1024.0 where an integer belongs is not worth rejecting when the upstream would
+  // accept it; 1.5 is.
+  if (is_int && std::trunc(number) != number) {
+    return violation("expected an integer");
   }
-  // Bounds come from the schema, so quoting them leaks nothing.
   if (schema.min_value.has_value() && number < *schema.min_value) {
     return violation(absl::StrCat("value must be at least ", *schema.min_value));
   }
@@ -113,21 +86,19 @@ absl::Status Validator::validateObject(const nlohmann::json& value, const FieldS
     return violation("expected an object");
   }
 
-  // Walking the payload rather than the schema is both cheaper and more correct.
-  // Unknown fields pass, so the schema is a lookup table; probing it costs one
-  // hash of a string already in the DOM, whereas walking the schema would need a
-  // std::string per declared name to look up in nlohmann's std::map-backed object
-  // (which has no transparent comparator).
+  // Walking the payload, not the schema: unknown fields pass, so the schema is a
+  // lookup table. Probing it costs one hash of a string already in the DOM,
+  // whereas walking the schema would need a std::string per declared name to look
+  // up in nlohmann's std::map-backed object.
   std::size_t required_seen = 0;
   for (const auto& entry : value.items()) {
     const auto it = schema.fields.find(entry.key());
     if (it == schema.fields.end()) {
-      // Undeclared: forwarded untouched.
-      continue;
+      continue; // Undeclared: forwarded untouched.
     }
     const ObjectField& field = it->second;
-    // The segment is the schema's key, not the payload's, so the emitted path is
-    // provably schema text.
+    // The segment is the schema's key, not the payload's, so the path is provably
+    // schema text.
     PathScope scope(path_, it->first);
     if (field.required) {
       ++required_seen;
@@ -136,14 +107,12 @@ absl::Status Validator::validateObject(const nlohmann::json& value, const FieldS
       }
     } else if (entry.value().is_null()) {
       // An explicit null on an optional field means "unset" across the OpenAI
-      // surface ("stop": null, "max_tokens": null, and a tool-calling assistant
-      // message's "content": null), so it satisfies the field without reaching
-      // its kind check. A required field is the only place null is a violation,
-      // which needs no per-field flag and gives the right answer everywhere.
+      // surface ("stop": null, a tool-calling assistant's "content": null), so it
+      // satisfies the field without reaching its kind check.
       //
-      // Deliberately applied here, at the field edge where `required` is known,
-      // and not inside validateNode(): an array element is not an optional
-      // field, so "messages": [null] must still be a violation.
+      // Applied here, at the field edge where `required` is known, and not in
+      // validateNode(): an array element is not an optional field, so
+      // "messages": [null] is still a violation.
       continue;
     }
     RETURN_IF_NOT_OK(validateNode(entry.value(), *field.schema));
@@ -182,24 +151,23 @@ absl::Status Validator::validateArray(const nlohmann::json& value, const FieldSc
 
 absl::Status Validator::validateOneOf(const nlohmann::json& value, const FieldSchema& schema) {
   for (const FieldSchema* alternative : schema.alternatives) {
-    // Each attempt starts from the same path; a failed alternative's sub-status
-    // is discarded, so whatever it appended must not survive. PathScope already
-    // guarantees that, and validateNode() adds nothing at this level.
     if (validateNode(value, *alternative).ok()) {
       return absl::OkStatus();
     }
   }
-  // The alternatives' own reasons are deliberately dropped: a wall of them is
-  // noise, and the client's fix is to read the schema.
+  // The alternatives' own reasons are dropped: a wall of them is noise, and the
+  // client's fix is to read the schema.
   return violation("value does not match any permitted form");
 }
 
 absl::Status Validator::validateNode(const nlohmann::json& value, const FieldSchema& schema) {
-  // Recursion is bounded: the parser's cursor caps nesting well before this, so
-  // an adversarial payload cannot grow the stack here.
+  // Recursion is bounded: the parser's cursor caps nesting well before this.
   switch (schema.kind) {
   case FieldKind::String:
-    return validateString(value, schema);
+    // An offloaded string is a binary node, not a string node; see the header.
+    return value.is_string() || JsonWithExtBuf::isExternalRef(value)
+               ? absl::OkStatus()
+               : violation("expected a string");
   case FieldKind::Number:
   case FieldKind::Int:
     return validateNumber(value, schema);
@@ -210,7 +178,6 @@ absl::Status Validator::validateNode(const nlohmann::json& value, const FieldSch
   case FieldKind::Array:
     return validateArray(value, schema);
   case FieldKind::AnyJson:
-    // Any well-formed JSON, and never descended into.
     return absl::OkStatus();
   case FieldKind::OneOf:
     return validateOneOf(value, schema);

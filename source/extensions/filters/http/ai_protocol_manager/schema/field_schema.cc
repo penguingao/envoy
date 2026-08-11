@@ -4,17 +4,13 @@
 
 #include "source/common/common/assert.h"
 
-#include "absl/container/flat_hash_set.h"
-
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-// The assertions below guard a hand-written table against typos. They run when a
-// schema is first built -- once per process, from the registry -- so they cost
-// nothing per request, and a mistake fails loudly at that point rather than
-// silently validating traffic against the wrong shape.
+// The assertions here guard a hand-written table against typos. They run once per
+// process, when the registry first builds a schema.
 
 const FieldSchema* SchemaBuilder::intern(FieldSchema&& node) {
   nodes_.push_back(std::make_unique<FieldSchema>(std::move(node)));
@@ -27,31 +23,10 @@ const FieldSchema* SchemaBuilder::str() {
   return intern(std::move(node));
 }
 
-const FieldSchema* SchemaBuilder::str(std::vector<absl::string_view> enum_values) {
-  RELEASE_ASSERT(!enum_values.empty(), "schema: an enum-constrained string needs permitted values");
-  absl::flat_hash_set<absl::string_view> seen;
-  for (const absl::string_view value : enum_values) {
-    RELEASE_ASSERT(!value.empty(), "schema: an enum value must not be empty");
-    // The validator concludes that an offloaded string matches no permitted
-    // value from its length alone, which only holds while the values are short.
-    RELEASE_ASSERT(value.size() <= FieldSchema::kMaxEnumValueBytes,
-                   "schema: enum value exceeds kMaxEnumValueBytes");
-    RELEASE_ASSERT(seen.insert(value).second, "schema: duplicate enum value");
-  }
-
-  FieldSchema node;
-  node.kind = FieldKind::String;
-  node.enum_values = std::move(enum_values);
-  return intern(std::move(node));
-}
-
-const FieldSchema* SchemaBuilder::offloadableStr(std::uint32_t stream_order) {
+const FieldSchema* SchemaBuilder::offloadableStr() {
   FieldSchema node;
   node.kind = FieldKind::String;
   node.offloadable = true;
-  node.stream_order = stream_order;
-  // No enum values by construction here; the mutual exclusion is the invariant
-  // that lets the validator trust that a constrained value is always readable.
   return intern(std::move(node));
 }
 
@@ -106,7 +81,7 @@ const FieldSchema* SchemaBuilder::object(std::initializer_list<FieldDecl> fields
 }
 
 const FieldSchema* SchemaBuilder::array(const FieldSchema* element, std::size_t min_items) {
-  // A null element is legal and means the elements are unconstrained.
+  // A null element is legal: the elements are unconstrained.
   FieldSchema node;
   node.kind = FieldKind::Array;
   node.element = element;

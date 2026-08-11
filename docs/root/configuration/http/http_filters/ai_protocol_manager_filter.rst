@@ -126,13 +126,12 @@ once the body has been received in full.
 
 **Only declared fields are constrained.** Any other field is forwarded untouched,
 so a request using a provider field newer than this Envoy is not rejected for it.
-The schemas also deliberately leave fast-moving values unconstrained -- the type
-of ``service_tier`` is checked, for example, but not which value it holds --
-because a proxy that rejects a request the upstream would have accepted is worse
-than one that forwards a request the upstream rejects itself. Caller-authored JSON
-Schema (``tools[].function.parameters``,
+
+What is checked is a field's type, whether it is required, array bounds, and the
+numeric ranges the provider documents as hard (``temperature`` must be 0..2, for
+example). Caller-authored JSON Schema (``tools[].function.parameters``,
 ``response_format.json_schema.schema``) is carried through without being
-interpreted at all.
+interpreted.
 
 A payload that violates the schema is answered with a 400 whose
 ``response_code_details`` is ``ai_protocol_manager_schema_violation`` --
@@ -142,15 +141,10 @@ offending field and what was expected of it, for example:
 
 .. code-block:: text
 
-  messages[0].role: value not permitted
+  messages[0].role: expected a string
 
 That message never echoes the value the client sent, so prompt content cannot
 reach a response, an access log, or a stat.
-
-A string value large enough to have been left in the external buffer has its type
-checked but not its contents. This does not weaken anything the schemas
-constrain: a field with a restricted set of values is never one that may be
-offloaded, so such a value is always available to check.
 
 A route that is not a declared AI endpoint is never validated, including under
 :ref:`best_effort_parsing

@@ -98,13 +98,11 @@ private:
 // reason to fail a request -- and is otherwise untouched.
 //
 // Once the document is complete it is validated against the schema the route
-// declared (schema/payload_schema.h), and a payload that violates it is rejected
-// with a 400 naming the offending field. Only a declared endpoint is validated: a
-// best-effort route named no schema, so there is nothing to hold its payload to.
+// declared, and a violating payload is rejected with a 400 naming the offending
+// field. Only a declared endpoint is validated -- a best-effort route named no
+// schema, so there is nothing to hold its payload to.
 //
-// Transcoding to the canonical schema when the route asks to normalize still
-// comes later; today a normalizing route is validated in its declared schema and
-// forwarded in it.
+// Transcoding to the canonical schema when a route asks to normalize comes later.
 class AiProtocolManagerFilter : public Http::PassThroughFilter,
                                 public Logger::Loggable<Logger::Id::filter> {
 public:
@@ -126,18 +124,16 @@ private:
   // it; a best-effort parse that fails abandons parsing and returns true.
   bool feedParser(const Buffer::Instance& data, bool end_stream);
 
-  // Terminates the stream with a 400. `body` and `details` are the whole of what
-  // the client sees, and neither may carry any part of the payload -- which is why
-  // the two callers below differ: a parse error message can quote payload bytes
-  // (an unrepresentable number literal, say), while a schema violation message is
-  // value-free by construction (schema/schema_validator.h).
+  // Terminates the stream with a 400. `body` and `details` are all the client
+  // sees, and neither may carry any part of the payload -- which is why the two
+  // callers differ: a parse error can quote payload bytes, a schema violation
+  // cannot (schema/schema_validator.h).
   void rejectPayload(const absl::Status& status, absl::string_view body, absl::string_view details);
 
-  // Terminates the stream with a 400 for a payload that failed to parse.
+  // A payload that failed to parse.
   void rejectInvalidPayload(const absl::Status& status);
 
-  // Terminates the stream with a 400 for a payload that parsed but does not
-  // conform to the schema the route declared.
+  // A payload that parsed but does not match the route's schema.
   void rejectSchemaViolation(const absl::Status& status);
 
   // Whether the route declared itself an AI endpoint, which is also what makes a
@@ -160,12 +156,10 @@ private:
 
   // The schema the payload is held to, resolved once from schema_. Non-null
   // exactly when the route is a declared AI endpoint this binary has a table for,
-  // so it is the single condition the validation hook tests -- "not an AI
-  // endpoint" and "no table for that schema" collapse into the same null.
+  // so it is the single condition the validation hook tests.
   //
-  // Unlike the route configuration this is safe to cache for the stream: it points
-  // at a process-lifetime singleton (schema/schema_registry.h), so re-resolving the
-  // route mid-stream cannot leave it dangling.
+  // Safe to cache for the stream, unlike the route config: it points at a
+  // process-lifetime singleton, so re-resolving the route cannot dangle it.
   const PayloadSchema* request_schema_{nullptr};
 
   // The parsed payload. Populated once the body has been fully received and

@@ -709,14 +709,14 @@ TEST_F(AiProtocolManagerFilterTest, RejectsSchemaViolation) {
   setRouteConfig();
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
-  Buffer::OwnedImpl body(R"({"model":"gpt-4","messages":[{"role":"wizard","content":"hi"}]})");
+  Buffer::OwnedImpl body(R"({"model":"gpt-4","messages":[{"role":123,"content":"hi"}]})");
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
   EXPECT_EQ(local_reply_calls_, 1);
   EXPECT_EQ(local_reply_code_, Http::Code::BadRequest);
   EXPECT_EQ(local_reply_details_, "ai_protocol_manager_schema_violation");
-  EXPECT_EQ(local_reply_body_, "messages[0].role: value not permitted");
+  EXPECT_EQ(local_reply_body_, "messages[0].role: expected a string");
   EXPECT_EQ(inject_calls_, 0);
 }
 
@@ -799,12 +799,12 @@ TEST_F(AiProtocolManagerFilterTest, SchemaViolationOnMultiFrameBodyInjectsNothin
 
   Buffer::OwnedImpl chunk1(R"({"model":"gpt-4","messages":)");
   EXPECT_EQ(filter_->decodeData(chunk1, false), Http::FilterDataStatus::StopIterationNoBuffer);
-  Buffer::OwnedImpl chunk2(R"([{"role":"wizard"}]})");
+  Buffer::OwnedImpl chunk2(R"([{"role":123}]})");
   EXPECT_EQ(filter_->decodeData(chunk2, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
   EXPECT_EQ(local_reply_calls_, 1);
-  EXPECT_EQ(local_reply_body_, "messages[0].role: value not permitted");
+  EXPECT_EQ(local_reply_body_, "messages[0].role: expected a string");
   EXPECT_EQ(inject_calls_, 0);
 }
 

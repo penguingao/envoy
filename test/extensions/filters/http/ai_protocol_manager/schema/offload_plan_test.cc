@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -67,10 +68,10 @@ public:
 // The three-way answer, which is the whole point of the class.
 TEST_F(OffloadPlanTest, ThreeWayOffloadability) {
   const FieldSchema* schema = b_.object({
-      {"prompt", b_.offloadableStr(StreamOrder::Prompt)},
+      {"prompt", b_.offloadableStr()},
       {"model", b_.str()},
   });
-  const OffloadPlan plan(*schema);
+  const OffloadPlan plan(*schema, {});
 
   // Declared offloadable.
   EXPECT_TRUE(plan.isOffloadable("prompt"));
@@ -81,37 +82,34 @@ TEST_F(OffloadPlanTest, ThreeWayOffloadability) {
   EXPECT_TRUE(plan.isOffloadable("nested.future_field"));
 }
 
-// Only a declared offloadable field has a spec; an undeclared one is offloadable
-// without one.
-TEST_F(OffloadPlanTest, FindOnlyResolvesDeclaredOffloadableFields) {
+// Only declared offloadable fields are in the streaming order; an undeclared field
+// is offloadable but is not something the chain waits on.
+TEST_F(OffloadPlanTest, StreamOrderHoldsOnlyDeclaredOffloadableFields) {
   const FieldSchema* schema = b_.object({
-      {"prompt", b_.offloadableStr(StreamOrder::Prompt)},
+      {"prompt", b_.offloadableStr()},
       {"model", b_.str()},
   });
-  const OffloadPlan plan(*schema);
+  const OffloadPlan plan(*schema, {});
 
-  ASSERT_NE(plan.find("prompt"), nullptr);
-  EXPECT_EQ(plan.find("prompt")->stream_order, StreamOrder::Prompt);
-  EXPECT_EQ(plan.find("model"), nullptr);
-  EXPECT_EQ(plan.find("future_field"), nullptr);
+  EXPECT_EQ(plan.streamOrder(), (std::vector<std::string>{"prompt"}));
 }
 
 // The derived paths must be exactly what the cursor builds for the same document.
 TEST_F(OffloadPlanTest, DerivedPathsMatchTheCursorsOwnForm) {
   const FieldSchema* part = b_.object({
-      {"type", b_.str({"text"})},
-      {"text", b_.offloadableStr(StreamOrder::Prompt)},
+      {"type", b_.str()},
+      {"text", b_.offloadableStr()},
   });
   const FieldSchema* message = b_.object({
-      {"role", b_.str({"user"})},
+      {"role", b_.str()},
       {"content", b_.array(part)},
   });
   const FieldSchema* schema = b_.object({
       {"messages", b_.array(message)},
-      {"nested", b_.object({{"deep", b_.offloadableStr(StreamOrder::Other)}})},
-      {"grid", b_.array(b_.array(b_.offloadableStr(StreamOrder::Other)))},
+      {"nested", b_.object({{"deep", b_.offloadableStr()}})},
+      {"grid", b_.array(b_.array(b_.offloadableStr()))},
   });
-  const OffloadPlan plan(*schema);
+  const OffloadPlan plan(*schema, {});
 
   const std::vector<std::string> paths = cursorPaths(R"({
     "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
@@ -130,10 +128,12 @@ TEST_F(OffloadPlanTest, DerivedPathsMatchTheCursorsOwnForm) {
 
   for (const std::string& path : paths) {
     SCOPED_TRACE(path);
-    // Each cursor path is either a declared offloadable field or a declared
-    // inline-only one; none of them falls through as undeclared, which is what
-    // proves the two path forms agree.
-    const bool declared = plan.find(path) != nullptr || !plan.isOffloadable(path);
+    // Each cursor path is one the schema declared -- either offloadable (so it is
+    // in the streaming order) or inline-only. None falls through as undeclared,
+    // which is what proves the two path forms agree.
+    const auto& order = plan.streamOrder();
+    const bool declared =
+        std::find(order.begin(), order.end(), path) != order.end() || !plan.isOffloadable(path);
     EXPECT_TRUE(declared);
   }
 }
@@ -141,7 +141,7 @@ TEST_F(OffloadPlanTest, DerivedPathsMatchTheCursorsOwnForm) {
 // A string directly inside an array gets the array's own path.
 TEST_F(OffloadPlanTest, StringInsideAnArray) {
   const FieldSchema* schema = b_.object({{"stop", b_.array(b_.str())}});
-  const OffloadPlan plan(*schema);
+  const OffloadPlan plan(*schema, {});
 
   EXPECT_EQ(cursorPaths(R"({"stop":["a","b"]})"), (std::vector<std::string>{"stop[]", "stop[]"}));
   EXPECT_FALSE(plan.isOffloadable("stop[]"));
@@ -150,28 +150,27 @@ TEST_F(OffloadPlanTest, StringInsideAnArray) {
 // Both branches of a oneOf sit at the same path, which is how the string form and
 // the parts-array form of a content field are both described.
 TEST_F(OffloadPlanTest, OneOfDescribesEveryAlternativeAtTheSamePath) {
-  const FieldSchema* part = b_.object({{"text", b_.offloadableStr(StreamOrder::Prompt)}});
+  const FieldSchema* part = b_.object({{"text", b_.offloadableStr()}});
   const FieldSchema* schema = b_.object({
-      {"content", b_.oneOf({b_.offloadableStr(StreamOrder::Prompt), b_.array(part)})},
+      {"content", b_.oneOf({b_.offloadableStr(), b_.array(part)})},
   });
-  const OffloadPlan plan(*schema);
+  const OffloadPlan plan(*schema, {});
 
   EXPECT_TRUE(plan.isOffloadable("content"));
   EXPECT_TRUE(plan.isOffloadable("content[].text"));
-  EXPECT_NE(plan.find("content"), nullptr);
-  EXPECT_NE(plan.find("content[].text"), nullptr);
+  EXPECT_EQ(plan.streamOrder(), (std::vector<std::string>{"content", "content[].text"}));
 }
 
 // A field something has to read wins over one that may be offloaded, so a path
 // declared both ways stays inline.
 TEST_F(OffloadPlanTest, InlineOnlyWinsOverOffloadable) {
   const FieldSchema* schema = b_.object({
-      {"f", b_.oneOf({b_.offloadableStr(StreamOrder::Prompt), b_.str({"sentinel"})})},
+      {"f", b_.oneOf({b_.offloadableStr(), b_.str()})},
   });
-  const OffloadPlan plan(*schema);
+  const OffloadPlan plan(*schema, {});
 
   EXPECT_FALSE(plan.isOffloadable("f"));
-  EXPECT_EQ(plan.find("f"), nullptr);
+  EXPECT_TRUE(plan.streamOrder().empty());
 }
 
 // An AnyJson subtree declares nothing, so strings inside a caller's tool schema
@@ -179,7 +178,7 @@ TEST_F(OffloadPlanTest, InlineOnlyWinsOverOffloadable) {
 // description out of the DOM.
 TEST_F(OffloadPlanTest, AnyJsonSubtreeDeclaresNothing) {
   const FieldSchema* schema = b_.object({{"parameters", b_.anyJson()}});
-  const OffloadPlan plan(*schema);
+  const OffloadPlan plan(*schema, {});
 
   EXPECT_TRUE(plan.isOffloadable("parameters"));
   EXPECT_TRUE(plan.isOffloadable("parameters.properties.city.description"));
@@ -194,49 +193,71 @@ TEST_F(OffloadPlanTest, NonStringKindsAreNotRecorded) {
       {"n", b_.integer(1)},
       {"stream", b_.boolean()},
   });
-  const OffloadPlan plan(*schema);
+  const OffloadPlan plan(*schema, {});
 
   EXPECT_TRUE(plan.streamOrder().empty());
   // Not recorded as inline-only either, so they read as undeclared.
   EXPECT_TRUE(plan.isOffloadable("temperature"));
 }
 
-// Prompts stream before tools, and the order does not depend on hash iteration.
-TEST_F(OffloadPlanTest, StreamOrderIsSortedAndDeterministic) {
+// The declared order is the order, whatever the field names happen to sort as.
+TEST_F(OffloadPlanTest, StreamOrderFollowsTheDeclaredList) {
   const FieldSchema* schema = b_.object({
-      {"zzz_tool", b_.offloadableStr(StreamOrder::Tool)},
-      {"aaa_other", b_.offloadableStr(StreamOrder::Other)},
-      {"mmm_prompt", b_.offloadableStr(StreamOrder::Prompt)},
-      {"bbb_prompt", b_.offloadableStr(StreamOrder::Prompt)},
+      {"aaa", b_.offloadableStr()},
+      {"mmm", b_.offloadableStr()},
+      {"zzz", b_.offloadableStr()},
   });
-  const OffloadPlan plan(*schema);
+  const std::vector<absl::string_view> declared = {"zzz", "aaa", "mmm"};
+  const OffloadPlan plan(*schema, declared);
 
-  std::vector<std::string> ordered;
-  for (const OffloadSpec& spec : plan.streamOrder()) {
-    ordered.push_back(spec.pattern_path);
-  }
-  // Prompts first, ties broken on path; then tools; then the rest.
-  EXPECT_EQ(ordered,
-            (std::vector<std::string>{"bbb_prompt", "mmm_prompt", "zzz_tool", "aaa_other"}));
+  EXPECT_EQ(plan.streamOrder(), (std::vector<std::string>{"zzz", "aaa", "mmm"}));
+}
+
+// Offloadable fields the list omits go after the ones it names, sorted so the
+// result does not depend on hash iteration.
+TEST_F(OffloadPlanTest, UnlistedFieldsGoLastInADeterministicOrder) {
+  const FieldSchema* schema = b_.object({
+      {"zzz_listed", b_.offloadableStr()},
+      {"bbb_unlisted", b_.offloadableStr()},
+      {"aaa_unlisted", b_.offloadableStr()},
+  });
+  const std::vector<absl::string_view> declared = {"zzz_listed"};
+  const OffloadPlan plan(*schema, declared);
+
+  EXPECT_EQ(plan.streamOrder(),
+            (std::vector<std::string>{"zzz_listed", "aaa_unlisted", "bbb_unlisted"}));
 
   // Rebuilding gives the same order.
-  const OffloadPlan again(*schema);
-  std::vector<std::string> ordered_again;
-  for (const OffloadSpec& spec : again.streamOrder()) {
-    ordered_again.push_back(spec.pattern_path);
-  }
-  EXPECT_EQ(ordered, ordered_again);
+  const OffloadPlan again(*schema, declared);
+  EXPECT_EQ(plan.streamOrder(), again.streamOrder());
+}
+
+// A path in the order that is not a declared offloadable field is a typo, and a
+// typo would otherwise silently sink the field to the end.
+TEST_F(OffloadPlanTest, StreamOrderRejectsAPathThatIsNotOffloadable) {
+  const FieldSchema* schema = b_.object({
+      {"prompt", b_.offloadableStr()},
+      {"model", b_.str()},
+  });
+
+  // Misspelled.
+  EXPECT_DEATH(OffloadPlan(*schema, std::vector<absl::string_view>{"promt"}), "stream order");
+  // Declared, but inline-only.
+  EXPECT_DEATH(OffloadPlan(*schema, std::vector<absl::string_view>{"model"}), "stream order");
+  // Not declared at all.
+  EXPECT_DEATH(OffloadPlan(*schema, std::vector<absl::string_view>{"future_field"}),
+               "stream order");
 }
 
 // A node shared by two parents describes two distinct paths, which is what lets
 // one content-part schema serve two fields.
 TEST_F(OffloadPlanTest, SharedNodeYieldsOnePathPerParent) {
-  const FieldSchema* part = b_.object({{"text", b_.offloadableStr(StreamOrder::Prompt)}});
+  const FieldSchema* part = b_.object({{"text", b_.offloadableStr()}});
   const FieldSchema* schema = b_.object({
       {"messages", b_.array(b_.object({{"content", b_.array(part)}}))},
       {"prediction", b_.object({{"content", b_.array(part)}})},
   });
-  const OffloadPlan plan(*schema);
+  const OffloadPlan plan(*schema, {});
 
   EXPECT_TRUE(plan.isOffloadable("messages[].content[].text"));
   EXPECT_TRUE(plan.isOffloadable("prediction.content[].text"));

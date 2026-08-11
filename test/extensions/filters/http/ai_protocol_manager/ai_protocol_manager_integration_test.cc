@@ -413,12 +413,12 @@ TEST_P(AiProtocolManagerIntegrationTest, SchemaViolationIsRejectedWith400) {
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
   auto response = codec_client_->makeRequestWithBody(
-      requestHeaders(), R"({"model":"gpt-4","messages":[{"role":"wizard","content":"hi"}]})");
+      requestHeaders(), R"({"model":"gpt-4","messages":[{"role":123,"content":"hi"}]})");
 
   ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
   EXPECT_EQ("400", response->headers().getStatusValue());
-  EXPECT_EQ("messages[0].role: value not permitted", response->body());
+  EXPECT_EQ("messages[0].role: expected a string", response->body());
 }
 
 } // namespace
