@@ -167,3 +167,17 @@ envoy_extension_cc_test(
         "//test/test_common:utility_lib",
     ],
 )
+
+envoy_extension_cc_test(
+    name = "ai_filter_chain_test",
+    srcs = ["ai_filter_chain_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:ai_filter_chain_lib",
+        "//test/mocks/event:event_mocks",
+        "//test/mocks/http:http_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
+        "//test/test_common:utility_lib",
+    ],
+)

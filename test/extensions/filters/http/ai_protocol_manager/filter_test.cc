@@ -76,7 +76,7 @@ public:
     envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto;
     proto.set_best_effort_parsing(best_effort_parsing);
     filter_ = std::make_unique<AiProtocolManagerFilter>(
-        factory_, std::make_shared<const FilterConfig>(proto));
+        factory_, std::make_shared<const FilterConfig>(proto, AiFilterFactoryCbs{}));
     filter_->setDecoderFilterCallbacks(callbacks_);
   }
 
@@ -102,7 +102,7 @@ public:
     PerRouteProto proto;
     proto.set_schema(PerRouteProto::OPENAI_CHAT_COMPLETIONS);
     proto.set_normalize(normalize);
-    route_config_ = std::make_unique<RouteConfig>(proto);
+    route_config_ = std::make_unique<RouteConfig>(proto, std::nullopt);
     ON_CALL(callbacks_, mostSpecificPerFilterConfig())
         .WillByDefault(testing::Return(route_config_.get()));
   }

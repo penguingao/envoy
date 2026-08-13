@@ -5,6 +5,7 @@
 #include "envoy/http/codes.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/config/utility.h"
 #include "source/common/http/utility.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema/schema_registry.h"
@@ -13,6 +14,33 @@ namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
+
+absl::StatusOr<AiFilterFactoryCbs> compileAiFilters(
+    const envoy::extensions::filters::http::ai_protocol_manager::v3::AiFilterChain& proto,
+    const std::string& stats_prefix, Server::Configuration::ServerFactoryContext& context) {
+  AiFilterFactoryCbs factories;
+  factories.reserve(proto.filters().size());
+  for (const auto& filter : proto.filters()) {
+    // Resolved from the type URL against the envoy.filters.ai registry, so a
+    // filter that is not one is a configuration error rather than a surprise at
+    // request time.
+    auto* factory =
+        Envoy::Config::Utility::getFactory<AiFilters::NamedAiFilterConfigFactory>(filter);
+    if (factory == nullptr) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("no registered envoy.filters.ai implementation for '", filter.name(), "'"));
+    }
+    ProtobufTypes::MessagePtr message = Envoy::Config::Utility::translateAnyToFactoryConfig(
+        filter.typed_config(), context.messageValidationVisitor(), *factory);
+    absl::StatusOr<AiFilters::AiFilterFactoryCb> callback =
+        factory->createFilterFactoryFromProto(*message, stats_prefix, context);
+    if (!callback.ok()) {
+      return callback.status();
+    }
+    factories.push_back(std::move(*callback));
+  }
+  return factories;
+}
 
 void AiProtocolManagerFilter::onDestroy() {
   if (decode_manager_ != nullptr) {
@@ -165,19 +193,117 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
 
   decode_manager_->onData(data);
   if (end_stream) {
-    // The full body has been offloaded. The filter owns replay and end-of-stream:
-    // a future change will assemble and inspect the request here (and may replay
-    // sub-ranges); for now replay the whole body, then emit the terminal frame.
+    // The full body has been offloaded and parsed. Hand it to the AI filter
+    // chain; the payload is forwarded once the chain is done with it.
     decode_manager_->endStream();
-    decode_manager_->replay(0, decode_manager_->bodyLength(), [this]() {
-      // Terminate the stream with an empty end_stream data frame after the replayed
-      // body (also releases the held headers when the body was empty).
-      Buffer::OwnedImpl end_marker;
-      decoder_callbacks_->injectDecodedDataToFilterChain(end_marker, /*end_stream=*/true);
-    });
+    if (!startAiFilterChain()) {
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
   }
   // Hold the chain here; the BufferManager replays the payload once told to.
   return Http::FilterDataStatus::StopIterationNoBuffer;
+}
+
+bool AiProtocolManagerFilter::startAiFilterChain() {
+  // Which chain applies is a per-route decision: a route that configured one
+  // replaces the filter-level chain rather than adding to it.
+  const AiFilterFactoryCbs* factories = &config_->aiFilters();
+  if (const auto* route_config =
+          Http::Utility::resolveMostSpecificPerFilterConfig<RouteConfig>(decoder_callbacks_);
+      route_config != nullptr && route_config->aiFilters().has_value()) {
+    factories = &route_config->aiFilters().value();
+  }
+
+  if (factories->empty()) {
+    // No chain: the payload goes straight out, exactly as before.
+    forwardPayload();
+    return true;
+  }
+
+  // Instantiate a fresh chain for this stream.
+  class Sink : public AiFilters::AiFilterChainFactoryCallbacks {
+  public:
+    void addFilter(AiFilters::AiFilterPtr filter) override { filters.push_back(std::move(filter)); }
+    std::vector<AiFilters::AiFilterPtr> filters;
+  } sink;
+  for (const AiFilters::AiFilterFactoryCb& factory : *factories) {
+    factory(sink);
+  }
+
+  ai_chain_ = std::make_unique<AiFilterChain>(std::move(sink.filters), chain_callbacks_,
+                                              decoder_callbacks_->dispatcher());
+  ai_chain_->start(
+      makeInferenceRequest(std::move(request_json_)), [this](AiFilterChain::Outcome outcome) {
+        if (payload_rejected_) {
+          // A filter already ended the stream with a local reply.
+          return;
+        }
+        if (outcome.reset) {
+          ENVOY_LOG(debug, "ai_protocol_manager: AI filter asked to reset the stream");
+          payload_rejected_ = true;
+          decoder_callbacks_->resetStream(Http::StreamResetReason::LocalReset, "");
+          return;
+        }
+        if (!outcome.status.ok() || outcome.request == nullptr) {
+          ENVOY_LOG(debug, "ai_protocol_manager: AI filter chain failed: {}",
+                    outcome.status.message());
+          payload_rejected_ = true;
+          decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError,
+                                             "AI filter chain error", nullptr, std::nullopt,
+                                             "ai_protocol_manager_filter_chain_error");
+          return;
+        }
+        chain_result_ = std::move(outcome.request);
+        forwardPayload();
+      });
+  return !payload_rejected_;
+}
+
+void AiProtocolManagerFilter::forwardPayload() {
+  // Nothing modified the payload, so its original bytes are still exactly right
+  // -- replay them rather than paying to serialize an identical document.
+  if (chain_result_ == nullptr || !chain_result_->dirty()) {
+    decode_manager_->replay(0, decode_manager_->bodyLength(), [this]() { finishForwarding(); });
+    return;
+  }
+
+  // A filter changed the payload, so it has to be serialized. Its offloaded
+  // values are still only in the buffer, which is what the emitter splices back
+  // in as it goes.
+  emitter_ = std::make_unique<JsonEmitter>(chain_result_->json());
+  emit_source_ = std::make_unique<JsonEmitterSource>(*emitter_);
+  decode_manager_->emit(*emit_source_, emit_sink_);
+}
+
+ReplaySink::Disposition
+AiProtocolManagerFilter::ChainEmitSink::onReplayData(Buffer::Instance& data) {
+  parent_.decoder_callbacks_->injectDecodedDataToFilterChain(data, /*end_stream=*/false);
+  return Disposition::Continue;
+}
+
+void AiProtocolManagerFilter::ChainEmitSink::onReplayComplete() {
+  if (parent_.emitter_ != nullptr && !parent_.emitter_->status().ok()) {
+    // The body is already half-written, so there is no clean reply to send.
+    ENVOY_LOG(warn, "ai_protocol_manager: failed to serialize payload: {}",
+              parent_.emitter_->status().message());
+    parent_.payload_rejected_ = true;
+    parent_.decoder_callbacks_->resetStream(Http::StreamResetReason::LocalReset, "");
+    return;
+  }
+  parent_.finishForwarding();
+}
+
+void AiProtocolManagerFilter::finishForwarding() {
+  if (trailers_pending_) {
+    // The trailers carry END_STREAM; releasing them is what ends the stream, and
+    // they must follow the body.
+    decoder_callbacks_->continueDecoding();
+    return;
+  }
+  // Terminate with an empty end_stream frame after the body (this also releases
+  // the held headers when the body was empty).
+  Buffer::OwnedImpl end_marker;
+  decoder_callbacks_->injectDecodedDataToFilterChain(end_marker, /*end_stream=*/true);
 }
 
 Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap&) {
@@ -203,11 +329,12 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
 
   // The body ended without end_stream on a data frame; the trailers carry it.
   decode_manager_->endStream();
-  decode_manager_->replay(0, decode_manager_->bodyLength(), [this]() {
-    // Body fully replayed; release the held trailers (they carry END_STREAM) so
-    // they follow the body in order.
-    decoder_callbacks_->continueDecoding();
-  });
+  // Trailers carried end-of-stream, so the chain runs here instead; the payload
+  // is forwarded from its completion and the trailers follow it.
+  trailers_pending_ = true;
+  if (!startAiFilterChain()) {
+    return Http::FilterTrailersStatus::StopIteration;
+  }
   // Hold the trailers behind the replayed body until the replay-done callback
   // above releases them.
   return Http::FilterTrailersStatus::StopIteration;

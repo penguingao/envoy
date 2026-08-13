@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -90,7 +91,39 @@ private:
   bool dirty_{false};
 };
 
-using InferenceRequestPtr = std::unique_ptr<InferenceRequest>;
+// Deleter that lets an owner reclaim a request instead of destroying it.
+//
+// A filter that returns without forwarding must not strand the payload -- the
+// chain forwards it on the filter's behalf. The only place that can be noticed
+// is the moment the filter's unique_ptr goes out of scope, so the reclaim hook
+// lives here. Default-constructed it simply deletes, which is what every owner
+// outside the chain wants.
+class InferenceRequestDisposer {
+public:
+  using DropCallback = std::function<void(InferenceRequest*)>;
+
+  InferenceRequestDisposer() = default;
+  explicit InferenceRequestDisposer(DropCallback on_drop) : on_drop_(std::move(on_drop)) {}
+
+  void operator()(InferenceRequest* request) const {
+    if (on_drop_ != nullptr) {
+      on_drop_(request);
+      return;
+    }
+    delete request;
+  }
+
+private:
+  DropCallback on_drop_;
+};
+
+using InferenceRequestPtr = std::unique_ptr<InferenceRequest, InferenceRequestDisposer>;
+
+// Builds an owning pointer that just deletes, for callers with no chain behind
+// them (tests, and the filter before it hands the payload over).
+inline InferenceRequestPtr makeInferenceRequest(JsonWithExtBuf payload) {
+  return InferenceRequestPtr(new InferenceRequest(std::move(payload)), InferenceRequestDisposer());
+}
 
 } // namespace AiProtocolManager
 } // namespace HttpFilters

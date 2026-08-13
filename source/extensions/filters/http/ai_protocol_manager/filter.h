@@ -1,15 +1,20 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/router/router.h"
 
 #include "source/common/common/logger.h"
+#include "source/extensions/filters/ai/ai_filter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ai_filter_chain.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/json_emitter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
@@ -24,17 +29,30 @@ namespace AiProtocolManager {
 using PerRouteProto =
     envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute;
 
+// Compiled AI filter chain: one factory per configured filter, built once at
+// config time and instantiated per stream.
+using AiFilterFactoryCbs = std::vector<AiFilters::AiFilterFactoryCb>;
+
+// Compiles `proto` into per-stream factories, failing if a configured filter is
+// not a registered envoy.filters.ai extension.
+absl::StatusOr<AiFilterFactoryCbs> compileAiFilters(
+    const envoy::extensions::filters::http::ai_protocol_manager::v3::AiFilterChain& proto,
+    const std::string& stats_prefix, Server::Configuration::ServerFactoryContext& context);
+
 // Filter-level configuration, shared by every stream on the chain.
 class FilterConfig {
 public:
-  explicit FilterConfig(
-      const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager& proto)
-      : best_effort_parsing_(proto.best_effort_parsing()) {}
+  FilterConfig(
+      const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager& proto,
+      AiFilterFactoryCbs ai_filters)
+      : best_effort_parsing_(proto.best_effort_parsing()), ai_filters_(std::move(ai_filters)) {}
 
   bool bestEffortParsing() const { return best_effort_parsing_; }
+  const AiFilterFactoryCbs& aiFilters() const { return ai_filters_; }
 
 private:
   const bool best_effort_parsing_;
+  const AiFilterFactoryCbs ai_filters_;
 };
 using FilterConfigSharedPtr = std::shared_ptr<const FilterConfig>;
 
@@ -43,15 +61,21 @@ using FilterConfigSharedPtr = std::shared_ptr<const FilterConfig>;
 // canonical schema when normalize() is set.
 class RouteConfig : public Router::RouteSpecificFilterConfig {
 public:
-  explicit RouteConfig(const PerRouteProto& proto)
-      : schema_(proto.schema()), normalize_(proto.normalize()) {}
+  RouteConfig(const PerRouteProto& proto, std::optional<AiFilterFactoryCbs> ai_filters)
+      : schema_(proto.schema()), normalize_(proto.normalize()), ai_filters_(std::move(ai_filters)) {
+  }
 
   PerRouteProto::Schema schema() const { return schema_; }
   bool normalize() const { return normalize_; }
 
+  // Engaged when the route configured a chain, in which case it replaces the
+  // filter-level one rather than adding to it.
+  const std::optional<AiFilterFactoryCbs>& aiFilters() const { return ai_filters_; }
+
 private:
   const PerRouteProto::Schema schema_;
   const bool normalize_;
+  const std::optional<AiFilterFactoryCbs> ai_filters_;
 };
 
 // AI Protocol Manager HTTP filter (alpha).
@@ -114,6 +138,79 @@ public:
   Http::FilterTrailersStatus decodeTrailers(Http::RequestTrailerMap& trailers) override;
 
 private:
+  // Bridges the AI filter callbacks onto this filter's HTTP callbacks. Headers
+  // are still held here, so a header an AI filter sets is seen by routing.
+  class ChainCallbacks : public AiFilters::AiFilterCallbacks {
+  public:
+    explicit ChainCallbacks(AiProtocolManagerFilter& parent) : parent_(parent) {}
+
+    Http::RequestHeaderMapOptRef requestHeaders() override {
+      return parent_.decoder_callbacks_->requestHeaders();
+    }
+    void sendLocalReply(Http::Code code, absl::string_view body,
+                        absl::string_view details) override {
+      parent_.payload_rejected_ = true;
+      parent_.decoder_callbacks_->sendLocalReply(code, body, nullptr, std::nullopt, details);
+    }
+    StreamInfo::StreamInfo& streamInfo() override {
+      return parent_.decoder_callbacks_->streamInfo();
+    }
+    Event::Dispatcher& dispatcher() override { return parent_.decoder_callbacks_->dispatcher(); }
+
+  private:
+    AiProtocolManagerFilter& parent_;
+  };
+
+  // Adapts the emitter onto the buffer manager's source interface. Kept here
+  // rather than in json_emitter.h so the emitter stays independent of the
+  // buffer manager and remains testable on its own.
+  class JsonEmitterSource : public EmitSource {
+  public:
+    explicit JsonEmitterSource(JsonEmitter& emitter) : emitter_(emitter) {}
+
+    Piece next() override {
+      switch (emitter_.next()) {
+      case JsonEmitter::State::Text:
+        return Piece::Text;
+      case JsonEmitter::State::Range:
+        return Piece::Range;
+      case JsonEmitter::State::Done:
+        return Piece::Done;
+      }
+      return Piece::Done;
+    }
+    absl::string_view text() const override { return emitter_.text(); }
+    uint64_t rangeOffset() const override { return emitter_.range().offset; }
+    uint64_t rangeLength() const override { return emitter_.range().length; }
+    absl::Status status() const override { return emitter_.status(); }
+
+  private:
+    JsonEmitter& emitter_;
+  };
+
+  // Delivers an emitted payload into the filter chain.
+  class ChainEmitSink : public ReplaySink {
+  public:
+    explicit ChainEmitSink(AiProtocolManagerFilter& parent) : parent_(parent) {}
+
+    Disposition onReplayData(Buffer::Instance& data) override;
+    void onReplayComplete() override;
+
+  private:
+    AiProtocolManagerFilter& parent_;
+  };
+
+  // Builds and runs the AI filter chain over the parsed payload. Returns false
+  // if the request was terminated.
+  bool startAiFilterChain();
+
+  // Ends the forwarded payload the way this stream requires.
+  void finishForwarding();
+
+  // Forwards the payload downstream once the chain is done: re-serialized when a
+  // filter modified it, replayed verbatim when nobody did.
+  void forwardPayload();
+
   // Feeds one body frame to the parser in place. Returns false only if the
   // payload was rejected, in which case the caller must not offload or replay
   // it; a best-effort parse that fails abandons parsing and returns true.
@@ -149,6 +246,20 @@ private:
 
   // Once set, later frames on the dying stream are dropped, not offloaded.
   bool payload_rejected_{false};
+
+  // The AI filter chain and what it needs, alive for the stream. Null when the
+  // route configured no filters.
+  ChainCallbacks chain_callbacks_{*this};
+  AiFilterChainPtr ai_chain_;
+  // The payload the chain produced, held until it has been forwarded.
+  InferenceRequestPtr chain_result_;
+  // True when trailers carried end-of-stream, so the body must be released with
+  // continueDecoding() rather than a terminal data frame.
+  bool trailers_pending_{false};
+  // Emission state, live only while a modified payload is being serialized.
+  std::unique_ptr<JsonEmitter> emitter_;
+  std::unique_ptr<JsonEmitterSource> emit_source_;
+  ChainEmitSink emit_sink_{*this};
 };
 
 } // namespace AiProtocolManager
