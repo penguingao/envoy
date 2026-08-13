@@ -35,6 +35,17 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "json_emitter_test",
+    srcs = ["json_emitter_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:json_emitter_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "json_string_decoder_test",
     srcs = ["json_string_decoder_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],
@@ -44,6 +55,10 @@ envoy_extension_cc_test(
         "//source/extensions/filters/http/ai_protocol_manager:json_string_decoder_lib",
         "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_extension_cc_test(
     ],
 )
 
