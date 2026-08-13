@@ -58,6 +58,18 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "json_string_decoder_lib",
+    srcs = ["json_string_decoder.cc"],
+    hdrs = ["json_string_decoder.h"],
+    deps = [
+        "//source/common/json/wuffs_json:wuffs_json_cursor_lib",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
     name = "buffer_manager_lib",
     srcs = ["buffer_manager.cc"],
     hdrs = ["buffer_manager.h"],
