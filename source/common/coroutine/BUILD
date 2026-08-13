@@ -38,6 +38,15 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "status_macros_lib",
+    hdrs = ["status_macros.h"],
+    deps = [
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+    ],
+)
+
+envoy_cc_library(
     name = "leaf_awaitable_lib",
     hdrs = ["leaf_awaitable.h"],
     deps = [

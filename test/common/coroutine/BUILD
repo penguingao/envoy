@@ -40,6 +40,24 @@ envoy_cc_test(
     ],
 )
 
+# Early-return macros for coroutine bodies. Every coroutine here completes
+# without suspending, so the manual executor is all that is needed.
+envoy_cc_test(
+    name = "status_macros_test",
+    srcs = ["status_macros_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        ":manual_executor_lib",
+        "//source/common/coroutine:launch_lib",
+        "//source/common/coroutine:status_macros_lib",
+        "//source/common/coroutine:task_lib",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+    ],
+)
+
 # DispatcherExecutor + TimerAwaitable, exercised against a simulated-time
 # dispatcher.
 envoy_cc_test(
