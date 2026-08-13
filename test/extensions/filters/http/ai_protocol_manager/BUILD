@@ -35,49 +35,6 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
-    name = "inference_request_test",
-    srcs = ["inference_request_test.cc"],
-    extension_names = ["envoy.filters.http.ai_protocol_manager"],
-    rbe_pool = "6gig",
-    deps = [
-        "//source/extensions/filters/http/ai_protocol_manager:inference_request_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
-    ],
-)
-
-envoy_extension_cc_test(
-    name = "json_emitter_test",
-    srcs = ["json_emitter_test.cc"],
-    extension_names = ["envoy.filters.http.ai_protocol_manager"],
-    rbe_pool = "6gig",
-    deps = [
-        "//source/extensions/filters/http/ai_protocol_manager:json_emitter_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
-    ],
-)
-
-envoy_extension_cc_test(
-    name = "json_string_decoder_test",
-    srcs = ["json_string_decoder_test.cc"],
-    extension_names = ["envoy.filters.http.ai_protocol_manager"],
-    rbe_pool = "6gig",
-    deps = [
-        "//source/common/json:json_sanitizer_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:json_string_decoder_lib",
-        "//test/test_common:status_utility_lib",
-        "//test/test_common:utility_lib",
-    ],
-)
-
-envoy_extension_cc_test(
-    ],
-)
-
-envoy_extension_cc_test(
-    ],
-)
-
-envoy_extension_cc_test(
     name = "schema_test",
     srcs = ["schema_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],
@@ -170,5 +127,43 @@ envoy_extension_cc_test(
         # A downstream buffer filter is used to trip a local reply during replay.
         "//source/extensions/filters/http/buffer:config",
         "//test/integration:http_protocol_integration_lib",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "json_string_decoder_test",
+    srcs = ["json_string_decoder_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/json:json_sanitizer_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:json_string_decoder_lib",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "json_emitter_test",
+    srcs = ["json_emitter_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:json_emitter_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "inference_request_test",
+    srcs = ["inference_request_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:inference_request_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
+        "//test/test_common:utility_lib",
     ],
 )

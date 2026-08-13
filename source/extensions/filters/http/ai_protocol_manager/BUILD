@@ -58,46 +58,6 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "inference_request_lib",
-    srcs = ["inference_request.cc"],
-    hdrs = ["inference_request.h"],
-    deps = [
-        ":json_with_ext_buf_lib",
-    ],
-)
-
-envoy_cc_library(
-    name = "json_emitter_lib",
-    srcs = ["json_emitter.cc"],
-    hdrs = ["json_emitter.h"],
-    deps = [
-        ":json_with_ext_buf_lib",
-        "//source/common/buffer:buffer_util_lib",
-        "//source/common/json:constants_lib",
-        "//source/common/json:json_sanitizer_lib",
-        "@abseil-cpp//absl/status",
-        "@abseil-cpp//absl/strings",
-        "@nlohmann_json//:json",
-    ],
-)
-
-envoy_cc_library(
-    ],
-)
-
-envoy_cc_library(
-    name = "json_string_decoder_lib",
-    srcs = ["json_string_decoder.cc"],
-    hdrs = ["json_string_decoder.h"],
-    deps = [
-        "//source/common/json/wuffs_json:wuffs_json_cursor_lib",
-        "@abseil-cpp//absl/functional:any_invocable",
-        "@abseil-cpp//absl/status",
-        "@abseil-cpp//absl/strings",
-    ],
-)
-
-envoy_cc_library(
     name = "buffer_manager_lib",
     srcs = ["buffer_manager.cc"],
     hdrs = ["buffer_manager.h"],
@@ -168,5 +128,43 @@ envoy_cc_extension(
         "//envoy/registry",
         "//source/extensions/filters/http/common:factory_base_lib",
         "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
+    name = "json_string_decoder_lib",
+    srcs = ["json_string_decoder.cc"],
+    hdrs = ["json_string_decoder.h"],
+    deps = [
+        "//source/common/json/wuffs_json:wuffs_json_cursor_lib",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
+    name = "json_emitter_lib",
+    srcs = ["json_emitter.cc"],
+    hdrs = ["json_emitter.h"],
+    deps = [
+        ":json_with_ext_buf_lib",
+        "//source/common/buffer:buffer_util_lib",
+        "//source/common/json:constants_lib",
+        "//source/common/json:json_sanitizer_lib",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
+    ],
+)
+
+envoy_cc_library(
+    name = "inference_request_lib",
+    srcs = ["inference_request.cc"],
+    hdrs = ["inference_request.h"],
+    deps = [
+        ":json_with_ext_buf_lib",
+        "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
     ],
 )
