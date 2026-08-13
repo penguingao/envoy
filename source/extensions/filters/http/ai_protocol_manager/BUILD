@@ -58,6 +58,15 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "inference_request_lib",
+    srcs = ["inference_request.cc"],
+    hdrs = ["inference_request.h"],
+    deps = [
+        ":json_with_ext_buf_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "json_emitter_lib",
     srcs = ["json_emitter.cc"],
     hdrs = ["json_emitter.h"],
@@ -69,6 +78,10 @@ envoy_cc_library(
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/strings",
         "@nlohmann_json//:json",
+    ],
+)
+
+envoy_cc_library(
     ],
 )
 
