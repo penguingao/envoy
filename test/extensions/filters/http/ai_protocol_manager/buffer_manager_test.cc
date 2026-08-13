@@ -240,6 +240,22 @@ public:
     }
   }
 
+  // Drives the event loop to a standstill: posted callbacks and the schedulable
+  // replay continuation feed each other, so alternate until neither has work.
+  // Needed wherever a replay is armed after the offload is already durable, in
+  // which case it is deferred onto replay_cb_ rather than started by a write
+  // completion.
+  void drainAll() {
+    for (int i = 0; i < 100; ++i) {
+      drain();
+      if (!replay_cb_->enabled()) {
+        return;
+      }
+      replay_cb_->invokeCallback();
+    }
+    ADD_FAILURE() << "replay did not settle";
+  }
+
   // Runs exactly one posted callback (FIFO), leaving the rest queued -- lets a test
   // pause with a write or read still in flight.
   void runOnePosted() {
@@ -975,6 +991,283 @@ TEST_F(BufferManagerTest, ResumeReplayAfterDestroyIsInert) {
 
   EXPECT_EQ(sink.chunk_calls_, 1);
   EXPECT_EQ(sink.complete_calls_, 0);
+}
+
+// ---------------------------------------------------------------------------
+// emit(): a stream assembled from caller text and payload ranges.
+// ---------------------------------------------------------------------------
+
+// Replays a scripted list of pieces, standing in for a serializer walking a
+// modified payload.
+class ScriptedSource : public EmitSource {
+public:
+  struct Item {
+    // Exactly one of these is meaningful, per `is_range`.
+    bool is_range{false};
+    std::string text;
+    uint64_t offset{0};
+    uint64_t length{0};
+  };
+
+  static Item textPiece(std::string text) { return Item{false, std::move(text), 0, 0}; }
+  static Item rangePiece(uint64_t offset, uint64_t length) {
+    return Item{true, {}, offset, length};
+  }
+
+  explicit ScriptedSource(std::vector<Item> items) : items_(std::move(items)) {}
+
+  Piece next() override {
+    if (index_ >= items_.size()) {
+      return Piece::Done;
+    }
+    current_ = items_[index_++];
+    return current_.is_range ? Piece::Range : Piece::Text;
+  }
+  absl::string_view text() const override { return current_.text; }
+  uint64_t rangeOffset() const override { return current_.offset; }
+  uint64_t rangeLength() const override { return current_.length; }
+  absl::Status status() const override { return status_; }
+
+  void setStatus(absl::Status status) { status_ = std::move(status); }
+
+  std::vector<Item> items_;
+  size_t index_{0};
+  Item current_;
+  absl::Status status_;
+};
+
+// Text and payload ranges interleave in the order the source names them --
+// which is how a re-serialized payload splices its offloaded values back in.
+TEST_F(BufferManagerTest, EmitInterleavesTextAndRanges) {
+  Buffer::OwnedImpl body("PROMPTBODY");
+  manager_->onData(body);
+  manager_->endStream();
+
+  ScriptedSource source({
+      ScriptedSource::textPiece("{\"content\":\""),
+      ScriptedSource::rangePiece(0, 6),
+      ScriptedSource::textPiece("\",\"model\":\"gpt-4\"}"),
+  });
+  RecordingSink sink;
+  manager_->emit(source, sink);
+  drainAll();
+
+  EXPECT_EQ(sink.received_.toString(), "{\"content\":\"PROMPT\",\"model\":\"gpt-4\"}");
+  EXPECT_EQ(sink.complete_calls_, 1);
+}
+
+// A source that never names a range still completes: an unmodified-but-inline
+// payload is all text.
+TEST_F(BufferManagerTest, EmitTextOnly) {
+  Buffer::OwnedImpl body("ignored");
+  manager_->onData(body);
+  manager_->endStream();
+
+  ScriptedSource source({ScriptedSource::textPiece("{}")});
+  RecordingSink sink;
+  manager_->emit(source, sink);
+  drainAll();
+
+  EXPECT_EQ(sink.received_.toString(), "{}");
+  EXPECT_EQ(sink.complete_calls_, 1);
+}
+
+// An empty text piece is skipped rather than delivered as an empty frame.
+TEST_F(BufferManagerTest, EmitSkipsEmptyText) {
+  Buffer::OwnedImpl body("abc");
+  manager_->onData(body);
+  manager_->endStream();
+
+  ScriptedSource source({ScriptedSource::textPiece(""), ScriptedSource::textPiece("x")});
+  RecordingSink sink;
+  manager_->emit(source, sink);
+  drainAll();
+
+  EXPECT_EQ(sink.received_.toString(), "x");
+  EXPECT_EQ(sink.chunk_calls_, 1);
+}
+
+// A range larger than the read chunk is streamed in pieces, and the source
+// resumes only once it is fully delivered.
+TEST_F(BufferManagerTest, EmitStreamsLargeRangeBeforeResuming) {
+  const std::string big(200 * 1024, 'p');
+  Buffer::OwnedImpl body(big);
+  manager_->onData(body);
+  manager_->endStream();
+
+  ScriptedSource source({
+      ScriptedSource::textPiece("<"),
+      ScriptedSource::rangePiece(0, big.size()),
+      ScriptedSource::textPiece(">"),
+  });
+  RecordingSink sink;
+  manager_->emit(source, sink);
+  drainAll();
+
+  EXPECT_EQ(sink.received_.toString(), "<" + big + ">");
+  EXPECT_EQ(sink.complete_calls_, 1);
+}
+
+// A sink that pauses mid-emit is resumed where it stopped, with nothing
+// dropped or repeated.
+TEST_F(BufferManagerTest, EmitHonorsSinkPause) {
+  Buffer::OwnedImpl body("PAYLOAD");
+  manager_->onData(body);
+  manager_->endStream();
+
+  ScriptedSource source({
+      ScriptedSource::textPiece("a"),
+      ScriptedSource::rangePiece(0, 7),
+      ScriptedSource::textPiece("b"),
+  });
+  RecordingSink sink;
+  sink.pause_after_chunk_ = 1;
+  manager_->emit(source, sink);
+  drainAll();
+
+  EXPECT_EQ(sink.chunk_calls_, 1);
+  EXPECT_EQ(sink.complete_calls_, 0);
+
+  sink.pause_after_chunk_ = 0;
+  manager_->resumeReplay();
+  ASSERT_TRUE(replay_cb_->enabled());
+  replay_cb_->invokeCallback();
+  drainAll();
+
+  EXPECT_EQ(sink.received_.toString(), "aPAYLOADb");
+  EXPECT_EQ(sink.complete_calls_, 1);
+}
+
+// A long run of text pieces yields to the event loop rather than delivering
+// them all in one go, the same way a synchronous read burst is bounded.
+TEST_F(BufferManagerTest, EmitYieldsAfterManyTextPieces) {
+  Buffer::OwnedImpl body("x");
+  manager_->onData(body);
+  manager_->endStream();
+
+  std::vector<ScriptedSource::Item> items;
+  for (int i = 0; i < 20; ++i) {
+    items.push_back(ScriptedSource::textPiece("y"));
+  }
+  ScriptedSource source(std::move(items));
+  RecordingSink sink;
+  manager_->emit(source, sink);
+  drainAll();
+
+  EXPECT_EQ(sink.received_.toString(), std::string(20, 'y'));
+  EXPECT_EQ(sink.complete_calls_, 1);
+}
+
+// A source that failed still completes; noticing is the sink's job, since only
+// it knows what a half-written body means.
+TEST_F(BufferManagerTest, EmitCompletesEvenWhenSourceFailed) {
+  Buffer::OwnedImpl body("abc");
+  manager_->onData(body);
+  manager_->endStream();
+
+  ScriptedSource source({ScriptedSource::textPiece("partial")});
+  source.setStatus(absl::InternalError("boom"));
+  RecordingSink sink;
+  manager_->emit(source, sink);
+  drainAll();
+
+  EXPECT_EQ(sink.complete_calls_, 1);
+  EXPECT_FALSE(source.status().ok());
+}
+
+// ---------------------------------------------------------------------------
+// appendRegion() and bodyLength().
+// ---------------------------------------------------------------------------
+
+// The body size is frozen at endStream(), so it keeps meaning "the bytes that
+// arrived" after regions are written back.
+TEST_F(BufferManagerTest, BodyLengthIsFixedAtEndStream) {
+  Buffer::OwnedImpl body("0123456789");
+  manager_->onData(body);
+  manager_->endStream();
+  drainAll();
+  ASSERT_EQ(manager_->bodyLength(), 10);
+
+  auto region = std::make_unique<Buffer::OwnedImpl>("appended");
+  uint64_t offset = 0;
+  bool done = false;
+  manager_->appendRegion(std::move(region), [&](ExternalBufferStatus status, uint64_t at) {
+    EXPECT_EQ(status, ExternalBufferStatus::Ok);
+    offset = at;
+    done = true;
+  });
+  drainAll();
+
+  ASSERT_TRUE(done);
+  EXPECT_EQ(offset, 10);
+  EXPECT_EQ(manager_->bodyLength(), 10);
+  EXPECT_EQ(manager_->length(), 18);
+}
+
+// A written-back region is readable at the offset it reported, which is what
+// lets a rewritten value point at it.
+TEST_F(BufferManagerTest, AppendedRegionIsReadableAtReportedOffset) {
+  Buffer::OwnedImpl body("original");
+  manager_->onData(body);
+  manager_->endStream();
+  drainAll();
+
+  auto region = std::make_unique<Buffer::OwnedImpl>("rewritten");
+  uint64_t offset = 0;
+  manager_->appendRegion(std::move(region),
+                         [&](ExternalBufferStatus, uint64_t at) { offset = at; });
+  drainAll();
+
+  RecordingSink sink;
+  manager_->replay(offset, 9, sink);
+  drainAll();
+  EXPECT_EQ(sink.received_.toString(), "rewritten");
+}
+
+// Several regions stack, each reporting its own offset.
+TEST_F(BufferManagerTest, MultipleAppendedRegions) {
+  Buffer::OwnedImpl body("body");
+  manager_->onData(body);
+  manager_->endStream();
+  drainAll();
+
+  std::vector<uint64_t> offsets;
+  manager_->appendRegion(std::make_unique<Buffer::OwnedImpl>("first"),
+                         [&](ExternalBufferStatus, uint64_t at) { offsets.push_back(at); });
+  drainAll();
+  manager_->appendRegion(std::make_unique<Buffer::OwnedImpl>("second"),
+                         [&](ExternalBufferStatus, uint64_t at) { offsets.push_back(at); });
+  drainAll();
+
+  ASSERT_EQ(offsets.size(), 2);
+  EXPECT_EQ(offsets[0], 4);
+  EXPECT_EQ(offsets[1], 9);
+  EXPECT_EQ(manager_->length(), 15);
+}
+
+// An emitted stream can splice a region written back moments earlier -- the
+// whole point of appending being readable.
+TEST_F(BufferManagerTest, EmitSplicesAppendedRegion) {
+  Buffer::OwnedImpl body("OLD");
+  manager_->onData(body);
+  manager_->endStream();
+  drainAll();
+
+  uint64_t offset = 0;
+  manager_->appendRegion(std::make_unique<Buffer::OwnedImpl>("NEW"),
+                         [&](ExternalBufferStatus, uint64_t at) { offset = at; });
+  drainAll();
+
+  ScriptedSource source({
+      ScriptedSource::textPiece("["),
+      ScriptedSource::rangePiece(offset, 3),
+      ScriptedSource::textPiece("]"),
+  });
+  RecordingSink sink;
+  manager_->emit(source, sink);
+  drainAll();
+
+  EXPECT_EQ(sink.received_.toString(), "[NEW]");
 }
 
 } // namespace

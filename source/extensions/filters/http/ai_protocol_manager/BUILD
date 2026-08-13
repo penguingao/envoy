@@ -70,6 +70,8 @@ envoy_cc_library(
         "//source/common/buffer:buffer_lib",
         "//source/common/common:logger_lib",
         "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
     ],
 )
 

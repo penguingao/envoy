@@ -58,7 +58,10 @@ void BufferManager::onData(Buffer::Instance& data) {
 
 void BufferManager::endStream() {
   end_stream_seen_ = true;
-  ENVOY_LOG(trace, "ai_protocol_manager: stream complete");
+  // Freeze the body size before anything can append to the buffer: from here on
+  // length() may grow past the body as regions are written back.
+  body_length_ = length();
+  ENVOY_LOG(trace, "ai_protocol_manager: stream complete ({} body bytes)", body_length_);
   // No more data is coming: flush whatever is batched, even below the threshold.
   maybeIssueWrite();
 }
@@ -68,6 +71,15 @@ void BufferManager::replay(uint64_t offset, uint64_t length, ReplayDoneCallback 
   replay(offset, length, chain_inject_sink_);
 }
 
+void BufferManager::emit(EmitSource& source, ReplaySink& sink) {
+  // Start with an empty range, which sends the read loop straight to the source
+  // to open the first one (or deliver the first text). Marking the emit after
+  // arming is safe because replay() only schedules; nothing runs until this
+  // call unwinds.
+  replay(0, 0, sink);
+  emit_source_ = &source;
+}
+
 void BufferManager::replay(uint64_t offset, uint64_t length, ReplaySink& sink) {
   // One replay at a time: the caller chains sub-ranges from the completion.
   ASSERT(!replaying_ && !replay_requested_);
@@ -75,6 +87,8 @@ void BufferManager::replay(uint64_t offset, uint64_t length, ReplaySink& sink) {
   replay_end_ = offset + length;
   sink_ = &sink;
   sink_paused_ = false;
+  // A plain range ends when it ends; only emit() re-points this.
+  emit_source_ = nullptr;
   replay_requested_ = true;
   ENVOY_LOG(debug, "ai_protocol_manager: replay requested for [{}, {})", offset, replay_end_);
   // If the offload is already fully durable, the caller may be invoking us from a
@@ -87,6 +101,32 @@ void BufferManager::replay(uint64_t offset, uint64_t length, ReplaySink& sink) {
   if (!write_in_flight_ && pending_.length() == 0) {
     replay_cb_->scheduleCallbackCurrentIteration();
   }
+}
+
+void BufferManager::appendRegion(Buffer::InstancePtr data, AppendRegionCallback done) {
+  // Ready-phase only: the ingest batching in maybeIssueWrite() exists to pace a
+  // data source that is finished by now, and a region written while a replay is
+  // reading would race the offsets it is handing out.
+  ASSERT(end_stream_seen_);
+  ASSERT(!write_in_flight_ && pending_.length() == 0);
+  ASSERT(!replaying_ && !replay_requested_);
+  ASSERT(buffer_ != nullptr);
+
+  // Capture the offset before writing: the buffer's length only counts
+  // acknowledged writes, so afterwards it would already include this one.
+  const uint64_t offset = buffer_->length();
+  const uint64_t size = data->length();
+  write_in_flight_ = true;
+  in_flight_write_size_ = size;
+  ENVOY_LOG(trace, "ai_protocol_manager: appending {} byte region at offset {}", size, offset);
+  buffer_->write(std::move(data),
+                 [this, offset, done = std::move(done)](ExternalBufferStatus status) mutable {
+                   // Bypasses onWriteComplete(): there is no ingest back-pressure left to
+                   // recompute and no queued backlog to drain.
+                   write_in_flight_ = false;
+                   in_flight_write_size_ = 0;
+                   done(status, offset);
+                 });
 }
 
 void BufferManager::maybeIssueWrite() {
@@ -191,10 +231,28 @@ void BufferManager::maybeReadNextChunk() {
   }
 
   if (replay_offset_ >= replay_end_) {
-    // The requested range is fully injected (reached immediately for a zero-length
-    // range). Hand control back to the caller; it terminates the stream.
-    finishReplay();
-    return;
+    if (emit_source_ == nullptr) {
+      // The requested range is fully injected (reached immediately for a
+      // zero-length range). Hand control back to the caller; it terminates the
+      // stream.
+      finishReplay();
+      return;
+    }
+    // An emitted stream continues past the end of a range: pull pieces until one
+    // opens a new range to read, or the stream ends. Text pieces are delivered
+    // straight from here, so bound the run the same way a synchronous read burst
+    // is bounded -- a source producing nothing but text must not monopolize the
+    // worker either.
+    for (uint32_t pieces = 0; replay_offset_ >= replay_end_; ++pieces) {
+      if (pieces >= ReplayChunksPerIteration) {
+        ENVOY_LOG(trace, "ai_protocol_manager: emit yielding after {} pieces", pieces);
+        replay_cb_->scheduleCallbackNextIteration();
+        return;
+      }
+      if (!advanceEmitSource()) {
+        return;
+      }
+    }
   }
 
   // Bound a synchronous burst. A store that completes the read on-stack re-enters
@@ -277,11 +335,14 @@ void BufferManager::onReadComplete(ExternalBufferStatus status, Buffer::Instance
   if (destroyed_) {
     return;
   }
-  if (replay_offset_ >= replay_end_) {
+  if (replay_offset_ >= replay_end_ && emit_source_ == nullptr) {
     // Finish here rather than fall through to maybeReadNextChunk(): the delivery
     // above may have raised the replay high watermark or paused the sink, and
     // maybeReadNextChunk() tests both before the end-of-range check, so it would
     // stall instead of completing a range that has already been fully delivered.
+    //
+    // An emitted stream is not done just because a range is: it falls through so
+    // the source can produce what follows.
     finishReplay();
     return;
   }
@@ -306,9 +367,48 @@ void BufferManager::resumeReplay() {
   replay_cb_->scheduleCallbackCurrentIteration();
 }
 
+bool BufferManager::advanceEmitSource() {
+  switch (emit_source_->next()) {
+  case EmitSource::Piece::Text: {
+    const absl::string_view text = emit_source_->text();
+    if (text.empty()) {
+      return true;
+    }
+    auto data = std::make_unique<Buffer::OwnedImpl>();
+    data->add(text);
+    // Same reentrancy contract as a replayed chunk: delivering can end the
+    // stream and detach us before this returns.
+    const ReplaySink::Disposition disposition = sink_->onReplayData(*data);
+    if (destroyed_) {
+      return false;
+    }
+    if (disposition == ReplaySink::Disposition::Pause) {
+      sink_paused_ = true;
+      ENVOY_LOG(trace, "ai_protocol_manager: sink paused emit");
+      return false;
+    }
+    return true;
+  }
+
+  case EmitSource::Piece::Range:
+    replay_offset_ = emit_source_->rangeOffset();
+    replay_end_ = replay_offset_ + emit_source_->rangeLength();
+    return true;
+
+  case EmitSource::Piece::Done:
+    // A source that failed still completes here; the sink is what decides that
+    // a half-written body has to fail the stream, since only it knows what the
+    // bytes were for.
+    finishReplay();
+    return false;
+  }
+  return false;
+}
+
 void BufferManager::finishReplay() {
   replaying_ = false;
   sink_paused_ = false;
+  emit_source_ = nullptr;
   ENVOY_LOG(trace, "ai_protocol_manager: replay range [.., {}) complete", replay_end_);
   // Hand control back to the sink. It may start the next sub-range or terminate
   // the stream, so clear our reference to it first: replay() asserts no range is

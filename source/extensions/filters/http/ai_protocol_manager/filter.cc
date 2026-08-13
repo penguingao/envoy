@@ -169,7 +169,7 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
     // a future change will assemble and inspect the request here (and may replay
     // sub-ranges); for now replay the whole body, then emit the terminal frame.
     decode_manager_->endStream();
-    decode_manager_->replay(0, decode_manager_->length(), [this]() {
+    decode_manager_->replay(0, decode_manager_->bodyLength(), [this]() {
       // Terminate the stream with an empty end_stream data frame after the replayed
       // body (also releases the held headers when the body was empty).
       Buffer::OwnedImpl end_marker;
@@ -203,7 +203,7 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
 
   // The body ended without end_stream on a data frame; the trailers carry it.
   decode_manager_->endStream();
-  decode_manager_->replay(0, decode_manager_->length(), [this]() {
+  decode_manager_->replay(0, decode_manager_->bodyLength(), [this]() {
     // Body fully replayed; release the held trailers (they carry END_STREAM) so
     // they follow the body in order.
     decoder_callbacks_->continueDecoding();

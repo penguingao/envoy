@@ -56,6 +56,52 @@ public:
   virtual void onReplayComplete() PURE;
 };
 
+// Produces an output stream assembled from text the caller supplies and ranges
+// of the offloaded payload.
+//
+// This is what a modified payload needs: most of it is freshly serialized text,
+// but its offloaded values are still only in the buffer, and they can be far too
+// large to serialize through memory. A source interleaves the two, and the
+// manager resolves the ranges -- so the source never touches the buffer and the
+// manager never parses JSON. Text is copied as it is consumed, so a source may
+// reuse its own storage between calls.
+//
+// Driving this through the same read loop as replay() is what gives it the
+// manager's chunking, its bounded synchronous burst, its watermark pausing and
+// its teardown handling for free.
+class EmitSource {
+public:
+  virtual ~EmitSource() = default;
+
+  // What next() produced.
+  enum class Piece {
+    // text() holds the bytes to emit.
+    Text,
+    // rangeOffset()/rangeLength() name payload bytes to splice in verbatim.
+    Range,
+    // The stream is complete, or the source failed -- check status().
+    Done,
+  };
+
+  virtual Piece next() PURE;
+
+  // Valid after next() returned Text, until the following next().
+  virtual absl::string_view text() const PURE;
+
+  // Valid after next() returned Range.
+  virtual uint64_t rangeOffset() const PURE;
+  virtual uint64_t rangeLength() const PURE;
+
+  // Non-OK if the source could not produce the stream. The manager reports
+  // completion either way; it is the sink's job to notice and fail the stream,
+  // since only the caller knows what a failure there means.
+  virtual absl::Status status() const PURE;
+};
+
+// Reports where an appendRegion() write landed. `offset` is meaningful only when
+// the status is Ok.
+using AppendRegionCallback = absl::AnyInvocable<void(ExternalBufferStatus, uint64_t offset)>;
+
 // Replay-side flow-control sink. The BufferManager implements this so a
 // FilterChainBridge can forward the path-specific Envoy watermark callback
 // (UpstreamWatermarkCallbacks on the decode path, DownstreamWatermarkCallbacks
@@ -160,10 +206,34 @@ public:
   // reports completion through it. `sink` must outlive the range.
   void replay(uint64_t offset, uint64_t length, ReplaySink& sink);
 
+  // Streams what `source` produces to `sink`, resolving the ranges it names
+  // against the payload. replay() is the degenerate case of this -- a single
+  // range and nothing else -- and the two share every constraint: one at a
+  // time, only after endStream(), both arguments must outlive the stream.
+  void emit(EmitSource& source, ReplaySink& sink);
+
   // Resumes a replay that the active sink paused. No-op if it is not paused, so
   // a sink may call it unconditionally. The resumption is deferred, so it is
   // safe to call from within onReplayData().
   void resumeReplay();
+
+  // Appends `data` to the payload, reporting the offset it landed at.
+  //
+  // The buffer is append-only, so rewriting an offloaded value means writing a
+  // new region and pointing the value at it. Only valid once the body is complete and
+  // nothing else is in flight: this bypasses the ingest batching, which exists
+  // for a data source that no longer applies.
+  //
+  // The offset is reported on completion rather than returned, because the
+  // buffer's length only counts acknowledged writes.
+  void appendRegion(Buffer::InstancePtr data, AppendRegionCallback done);
+
+  // Size of the request body, fixed at endStream().
+  //
+  // Distinct from length(), which keeps growing as appendRegion() adds regions:
+  // a caller replaying "the body" wants the bytes that arrived, not the ones
+  // written back afterwards.
+  uint64_t bodyLength() const { return body_length_; }
 
   // Total number of bytes offloaded so far (durable, queued, and in-flight). The
   // caller uses this to size replay ranges; it is final once endStream() has been
@@ -271,6 +341,12 @@ private:
   // Completion handler for a read() issued during replay.
   void onReadComplete(ExternalBufferStatus status, Buffer::InstancePtr data);
 
+  // Pulls the next piece from the emit source: hands text straight to the sink,
+  // or opens the named range for the read loop to stream. Returns false when the
+  // caller must stop -- the stream finished, the sink paused, or we were
+  // detached mid-delivery.
+  bool advanceEmitSource();
+
   // Fails the stream when an external-buffer operation errors out.
   void onExternalBufferError();
 
@@ -367,6 +443,14 @@ private:
   // allocated per range: there is at most one replay in flight, so one instance
   // is enough, and it must outlive the range it serves.
   ChainInjectSink chain_inject_sink_{*this};
+  // Set by emit() for the duration of an emitted stream; null for a plain
+  // replay(), which is what makes the end of a range mean "done" rather than
+  // "pull the next piece".
+  EmitSource* emit_source_{nullptr};
+
+  // Body size, frozen at endStream(). Kept separately from length() because
+  // appendRegion() grows the buffer past the body.
+  uint64_t body_length_{0};
 
   // Depth of unmatched replay high-watermark callbacks. The connection manager
   // may raise the watermark more than once (stream and connection), so we resume
