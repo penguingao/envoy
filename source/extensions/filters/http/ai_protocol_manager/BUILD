@@ -58,6 +58,17 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "inference_request_lib",
+    srcs = ["inference_request.cc"],
+    hdrs = ["inference_request.h"],
+    deps = [
+        ":json_with_ext_buf_lib",
+        "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
+    ],
+)
+
+envoy_cc_library(
     name = "buffer_manager_lib",
     srcs = ["buffer_manager.cc"],
     hdrs = ["buffer_manager.h"],
