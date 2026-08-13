@@ -64,11 +64,17 @@ void BufferManager::endStream() {
 }
 
 void BufferManager::replay(uint64_t offset, uint64_t length, ReplayDoneCallback done) {
-  // One replay at a time: the caller chains sub-ranges from the done callback.
+  chain_inject_sink_.setDone(std::move(done));
+  replay(offset, length, chain_inject_sink_);
+}
+
+void BufferManager::replay(uint64_t offset, uint64_t length, ReplaySink& sink) {
+  // One replay at a time: the caller chains sub-ranges from the completion.
   ASSERT(!replaying_ && !replay_requested_);
   replay_offset_ = offset;
   replay_end_ = offset + length;
-  replay_done_ = std::move(done);
+  sink_ = &sink;
+  sink_paused_ = false;
   replay_requested_ = true;
   ENVOY_LOG(debug, "ai_protocol_manager: replay requested for [{}, {})", offset, replay_end_);
   // If the offload is already fully durable, the caller may be invoking us from a
@@ -170,6 +176,11 @@ void BufferManager::maybeReadNextChunk() {
   if (!replaying_ || read_in_flight_) {
     return;
   }
+  // The sink cannot take more yet; resumeReplay() brings us back.
+  if (sink_paused_) {
+    ENVOY_LOG(trace, "ai_protocol_manager: replay paused at offset {} (sink full)", replay_offset_);
+    return;
+  }
   // Pause while the chain we feed is backed up; onReplayBelowLowWatermark()
   // resumes once it drains. This bounds how much replayed data piles up in the
   // chain when it is slow.
@@ -262,30 +273,50 @@ void BufferManager::onReadComplete(ExternalBufferStatus status, Buffer::Instance
   // before finishing the range (finishReplay() would run the caller's replay-done
   // callback into a torn-down stream) or reading another chunk from the released
   // buffer -- and it is what keeps maybeReadNextChunk()'s ASSERT(!destroyed_) valid.
-  bridge_->injectData(*data);
+  const ReplaySink::Disposition disposition = sink_->onReplayData(*data);
   if (destroyed_) {
     return;
   }
   if (replay_offset_ >= replay_end_) {
-    // Finish here rather than fall through to maybeReadNextChunk(): the inject
-    // above may have raised the replay high watermark, and maybeReadNextChunk()
-    // tests that pause before the end-of-range check, so it would stall instead of
-    // completing a range that is already fully injected.
+    // Finish here rather than fall through to maybeReadNextChunk(): the delivery
+    // above may have raised the replay high watermark or paused the sink, and
+    // maybeReadNextChunk() tests both before the end-of-range check, so it would
+    // stall instead of completing a range that has already been fully delivered.
     finishReplay();
+    return;
+  }
+  if (disposition == ReplaySink::Disposition::Pause) {
+    sink_paused_ = true;
+    ENVOY_LOG(trace, "ai_protocol_manager: sink paused replay at offset {}", replay_offset_);
     return;
   }
   maybeReadNextChunk();
 }
 
+void BufferManager::resumeReplay() {
+  // A sink may resume unconditionally, and may do so after teardown (onDestroy()
+  // cancels replay_cb_, so re-arming it here would resurrect cancelled work).
+  if (destroyed_ || !sink_paused_) {
+    return;
+  }
+  sink_paused_ = false;
+  ENVOY_LOG(trace, "ai_protocol_manager: sink resumed replay at offset {}", replay_offset_);
+  // Defer rather than read here: the sink may call this from inside its own
+  // onReplayData(), where reading (and delivering) reentrantly is unsafe.
+  replay_cb_->scheduleCallbackCurrentIteration();
+}
+
 void BufferManager::finishReplay() {
   replaying_ = false;
+  sink_paused_ = false;
   ENVOY_LOG(trace, "ai_protocol_manager: replay range [.., {}) complete", replay_end_);
-  // Hand control back to the caller. Its callback may start the next sub-range or
-  // terminate the stream; move the callback out first so it can re-arm replay().
-  ReplayDoneCallback done = std::move(replay_done_);
-  replay_done_ = nullptr;
-  if (done) {
-    done();
+  // Hand control back to the sink. It may start the next sub-range or terminate
+  // the stream, so clear our reference to it first: replay() asserts no range is
+  // in flight, and the sink is entitled to re-arm from here.
+  ReplaySink* sink = sink_;
+  sink_ = nullptr;
+  if (sink != nullptr) {
+    sink->onReplayComplete();
   }
 }
 
