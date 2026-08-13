@@ -23,6 +23,39 @@ namespace AiProtocolManager {
 // caller can start to stream further sub-ranges or to terminate the stream.
 using ReplayDoneCallback = absl::AnyInvocable<void()>;
 
+// Destination for the bytes a replay() range produces.
+//
+// The filter chain is one such destination, but not the only one: an AI filter
+// chain consumes ranges of the offloaded payload without any of it reaching the
+// wire. Both are driven by the same read loop, so a sink gets the manager's
+// chunking, its bounded synchronous burst, and its teardown handling for free.
+//
+// A sink is owned by whoever calls replay(); it must outlive the range it was
+// passed to.
+class ReplaySink {
+public:
+  virtual ~ReplaySink() = default;
+
+  // Whether the manager should keep feeding this sink.
+  enum class Disposition {
+    // Ready for the next chunk.
+    Continue,
+    // Full: stop reading until resumeReplay(). This is how a sink that cannot
+    // absorb a chunk immediately (an AI filter still processing the last one)
+    // paces the replay.
+    Pause,
+  };
+
+  // Consumes one replayed chunk. Called with a non-empty buffer the sink may
+  // move out of. It may end the stream, so the manager treats a return from
+  // here as a point where it can have been detached.
+  virtual Disposition onReplayData(Buffer::Instance& data) PURE;
+
+  // The requested range has been fully delivered. The sink may start another
+  // range from here.
+  virtual void onReplayComplete() PURE;
+};
+
 // Replay-side flow-control sink. The BufferManager implements this so a
 // FilterChainBridge can forward the path-specific Envoy watermark callback
 // (UpstreamWatermarkCallbacks on the decode path, DownstreamWatermarkCallbacks
@@ -123,6 +156,15 @@ public:
   // Only call after endStream(). It may wait until all write is done before start streaming.
   void replay(uint64_t offset, uint64_t length, ReplayDoneCallback done);
 
+  // As above, but delivers the range to `sink` instead of the filter chain, and
+  // reports completion through it. `sink` must outlive the range.
+  void replay(uint64_t offset, uint64_t length, ReplaySink& sink);
+
+  // Resumes a replay that the active sink paused. No-op if it is not paused, so
+  // a sink may call it unconditionally. The resumption is deferred, so it is
+  // safe to call from within onReplayData().
+  void resumeReplay();
+
   // Total number of bytes offloaded so far (durable, queued, and in-flight). The
   // caller uses this to size replay ranges; it is final once endStream() has been
   // called.
@@ -153,6 +195,37 @@ public:
   void onReplayBelowLowWatermark() override;
 
 private:
+  // Adapts the ReplayDoneCallback form of replay() onto the sink interface: it
+  // injects each chunk into the filter chain and runs the caller's callback when
+  // the range ends. It never pauses -- filter-chain back-pressure is paced by the
+  // replay watermark path instead, which is coarser but applies to a destination
+  // the manager cannot ask "are you full?".
+  class ChainInjectSink : public ReplaySink {
+  public:
+    explicit ChainInjectSink(BufferManager& parent) : parent_(parent) {}
+
+    void setDone(ReplayDoneCallback done) { done_ = std::move(done); }
+
+    // ReplaySink
+    Disposition onReplayData(Buffer::Instance& data) override {
+      parent_.bridge_->injectData(data);
+      return Disposition::Continue;
+    }
+
+    void onReplayComplete() override {
+      // Move out before invoking so the callback can re-arm replay().
+      ReplayDoneCallback done = std::move(done_);
+      done_ = nullptr;
+      if (done) {
+        done();
+      }
+    }
+
+  private:
+    BufferManager& parent_;
+    ReplayDoneCallback done_;
+  };
+
   // Issues a write of the queued backlog when one is warranted: no write is in
   // flight and the backlog has reached WriteFlushThreshold, the stream has ended,
   // or the source is paused. Hands the whole backlog to the buffer as a single
@@ -283,8 +356,17 @@ private:
   // replay_end_.
   uint64_t replay_offset_{0};
   uint64_t replay_end_{0};
-  // Invoked when the active replay range is fully injected; set by replay().
-  ReplayDoneCallback replay_done_;
+  // Destination for the active replay range, set by replay() and cleared by
+  // finishReplay(). Null when no range is in flight.
+  ReplaySink* sink_{nullptr};
+  // True while the active sink has asked us to stop feeding it; cleared by
+  // resumeReplay(). Distinct from replay_high_watermark_count_, which is the
+  // filter chain pushing back rather than the sink.
+  bool sink_paused_{false};
+  // Serves the ReplayDoneCallback overload of replay(). Held by value rather than
+  // allocated per range: there is at most one replay in flight, so one instance
+  // is enough, and it must outlive the range it serves.
+  ChainInjectSink chain_inject_sink_{*this};
 
   // Depth of unmatched replay high-watermark callbacks. The connection manager
   // may raise the watermark more than once (stream and connection), so we resume

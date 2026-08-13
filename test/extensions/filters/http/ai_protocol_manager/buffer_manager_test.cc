@@ -775,6 +775,208 @@ TEST_F(BufferManagerTest, ResumeSkipsReadWhileOneInFlight) {
   EXPECT_EQ(bridge_->injected_.toString(), big);
 }
 
+// ---------------------------------------------------------------------------
+// ReplaySink: replaying to a destination other than the filter chain.
+// ---------------------------------------------------------------------------
+
+// Accumulates the replayed bytes and, when configured, pauses after the Nth
+// chunk to exercise sink-driven back-pressure.
+class RecordingSink : public ReplaySink {
+public:
+  Disposition onReplayData(Buffer::Instance& data) override {
+    ++chunk_calls_;
+    received_.add(data);
+    if (pause_after_chunk_ != 0 && chunk_calls_ == pause_after_chunk_) {
+      return Disposition::Pause;
+    }
+    return Disposition::Continue;
+  }
+  void onReplayComplete() override { ++complete_calls_; }
+
+  Buffer::OwnedImpl received_;
+  int chunk_calls_{0};
+  int complete_calls_{0};
+  int pause_after_chunk_{0}; // 0 = never pause.
+};
+
+// The payload reaches the sink and never the filter chain: this is the whole
+// point of the sink overload.
+TEST_F(BufferManagerTest, ReplaysToSinkInsteadOfChain) {
+  RecordingSink sink;
+  Buffer::OwnedImpl body("{\"model\":\"gpt-4\"}");
+  manager_->onData(body);
+  manager_->endStream();
+  manager_->replay(0, manager_->length(), sink);
+  drain();
+
+  EXPECT_EQ(sink.received_.toString(), "{\"model\":\"gpt-4\"}");
+  EXPECT_EQ(sink.complete_calls_, 1);
+  EXPECT_EQ(bridge_->inject_calls_, 0);
+}
+
+// A sub-range is delivered rather than the whole payload, which is how an AI
+// filter reads a single offloaded field.
+TEST_F(BufferManagerTest, ReplaysSubRangeToSink) {
+  RecordingSink sink;
+  Buffer::OwnedImpl body("0123456789");
+  manager_->onData(body);
+  manager_->endStream();
+  manager_->replay(3, 4, sink);
+  drain();
+
+  EXPECT_EQ(sink.received_.toString(), "3456");
+  EXPECT_EQ(sink.complete_calls_, 1);
+}
+
+// A zero-length range still reports completion, so a caller streaming a list of
+// fields is not stalled by an empty one.
+TEST_F(BufferManagerTest, ZeroLengthSinkRangeCompletes) {
+  RecordingSink sink;
+  Buffer::OwnedImpl body("abc");
+  manager_->onData(body);
+  manager_->endStream();
+  manager_->replay(0, 0, sink);
+  drain();
+
+  EXPECT_EQ(sink.chunk_calls_, 0);
+  EXPECT_EQ(sink.complete_calls_, 1);
+}
+
+// Pausing stops the read loop, and resumeReplay() picks up at the exact offset
+// where it stopped -- no chunk dropped, none delivered twice.
+TEST_F(BufferManagerTest, SinkPauseStopsReadsAndResumeContinues) {
+  const std::string big(200 * 1024, 'y'); // > ReadChunkSize (64KiB), so >1 chunk.
+  RecordingSink sink;
+  sink.pause_after_chunk_ = 1;
+
+  Buffer::OwnedImpl body(big);
+  manager_->onData(body);
+  manager_->endStream();
+  manager_->replay(0, manager_->length(), sink);
+  drain();
+
+  // Stopped after the first chunk; the range is nowhere near done.
+  EXPECT_EQ(sink.chunk_calls_, 1);
+  EXPECT_EQ(sink.complete_calls_, 0);
+  const uint64_t after_pause = sink.received_.length();
+  EXPECT_EQ(after_pause, 64 * 1024);
+
+  // Draining again changes nothing: a paused sink is not fed by stray callbacks.
+  drain();
+  EXPECT_EQ(sink.chunk_calls_, 1);
+
+  // Resuming is deferred, then delivers the remainder.
+  sink.pause_after_chunk_ = 0;
+  manager_->resumeReplay();
+  ASSERT_TRUE(replay_cb_->enabled());
+  replay_cb_->invokeCallback();
+  drain();
+
+  EXPECT_EQ(sink.complete_calls_, 1);
+  EXPECT_EQ(sink.received_.toString(), big);
+}
+
+// resumeReplay() on a sink that never paused is a no-op, so a sink may call it
+// unconditionally without double-driving the read loop.
+TEST_F(BufferManagerTest, ResumeReplayWithoutPauseIsNoOp) {
+  RecordingSink sink;
+  Buffer::OwnedImpl body("hello");
+  manager_->onData(body);
+  manager_->endStream();
+  manager_->replay(0, manager_->length(), sink);
+  drain();
+  ASSERT_EQ(sink.complete_calls_, 1);
+
+  manager_->resumeReplay();
+  drain();
+  EXPECT_EQ(sink.chunk_calls_, 1);
+  EXPECT_EQ(sink.complete_calls_, 1);
+}
+
+// A pause delivered on the final chunk completes the range rather than
+// stranding it: there is nothing left to feed, so the pause is moot.
+TEST_F(BufferManagerTest, SinkPauseOnFinalChunkStillCompletes) {
+  RecordingSink sink;
+  sink.pause_after_chunk_ = 1;
+
+  Buffer::OwnedImpl body("short");
+  manager_->onData(body);
+  manager_->endStream();
+  manager_->replay(0, manager_->length(), sink);
+  drain();
+
+  EXPECT_EQ(sink.chunk_calls_, 1);
+  EXPECT_EQ(sink.complete_calls_, 1);
+  EXPECT_EQ(sink.received_.toString(), "short");
+}
+
+// The sink may start the next range from onReplayComplete(), which is how a
+// field-at-a-time reader walks a list of ranges.
+TEST_F(BufferManagerTest, SinkCanChainRangesFromCompletion) {
+  // Reads the two halves of the payload back to back.
+  class ChainingSink : public ReplaySink {
+  public:
+    ChainingSink(BufferManager& manager, uint64_t split) : manager_(manager), split_(split) {}
+    Disposition onReplayData(Buffer::Instance& data) override {
+      received_.add(data);
+      return Disposition::Continue;
+    }
+    void onReplayComplete() override {
+      ++complete_calls_;
+      if (complete_calls_ == 1) {
+        manager_.replay(split_, split_, *this);
+      }
+    }
+    BufferManager& manager_;
+    uint64_t split_;
+    Buffer::OwnedImpl received_;
+    int complete_calls_{0};
+  };
+
+  Buffer::OwnedImpl body("abcdefgh");
+  manager_->onData(body);
+  manager_->endStream();
+
+  ChainingSink sink(*manager_, 4);
+  manager_->replay(0, 4, sink);
+  drain();
+  ASSERT_EQ(sink.complete_calls_, 1);
+
+  // The chained range was requested with everything already durable, so it is
+  // deferred to a fresh iteration rather than started reentrantly.
+  ASSERT_TRUE(replay_cb_->enabled());
+  replay_cb_->invokeCallback();
+  drain();
+
+  EXPECT_EQ(sink.complete_calls_, 2);
+  EXPECT_EQ(sink.received_.toString(), "abcdefgh");
+}
+
+// Teardown while a sink is paused must not resurrect the replay: onDestroy()
+// cancels the continuation, and resumeReplay() on a detached manager does
+// nothing.
+TEST_F(BufferManagerTest, ResumeReplayAfterDestroyIsInert) {
+  const std::string big(200 * 1024, 'z');
+  RecordingSink sink;
+  sink.pause_after_chunk_ = 1;
+
+  Buffer::OwnedImpl body(big);
+  manager_->onData(body);
+  manager_->endStream();
+  manager_->replay(0, manager_->length(), sink);
+  drain();
+  ASSERT_EQ(sink.chunk_calls_, 1);
+
+  manager_->onDestroy();
+  sink.pause_after_chunk_ = 0;
+  manager_->resumeReplay();
+  EXPECT_FALSE(replay_cb_->enabled());
+  drain();
+
+  EXPECT_EQ(sink.chunk_calls_, 1);
+  EXPECT_EQ(sink.complete_calls_, 0);
+}
+
 } // namespace
 } // namespace AiProtocolManager
 } // namespace HttpFilters
