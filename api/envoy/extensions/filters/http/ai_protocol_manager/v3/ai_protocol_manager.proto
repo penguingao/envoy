@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package envoy.extensions.filters.http.ai_protocol_manager.v3;
 
+import "envoy/config/core/v3/extension.proto";
+
 import "xds/annotations/v3/status.proto";
 
 import "udpa/annotations/status.proto";
@@ -18,6 +20,17 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // AI Protocol Manager filter
 // :ref:`configuration overview <config_http_filters_ai_protocol_manager>`.
 // [#extension: envoy.filters.http.ai_protocol_manager]
+
+// An ordered chain of AI filters run over the parsed payload.
+//
+// Wrapped in a message rather than repeated inline so that a per-route chain can
+// be distinguished from no per-route configuration at all: an empty message
+// means "run nothing here", which a bare repeated field cannot express.
+message AiFilterChain {
+  // Filters, run in order.
+  // [#extension-category: envoy.filters.ai]
+  repeated config.core.v3.TypedExtensionConfig filters = 1;
+}
 
 // Configuration for the AI Protocol Manager filter.
 //
@@ -44,6 +57,14 @@ message AiProtocolManager {
   // validated, and a malformed one rejected with a 400, regardless of this
   // setting.
   bool best_effort_parsing = 1;
+
+  // AI filters run over the parsed payload, unless the route overrides them.
+  //
+  // A filter here acts on the payload the proxy has already parsed and validated,
+  // so it can route or admit on what the request actually asks for. Request
+  // headers are still held at this point, so a header a filter sets is visible to
+  // route selection.
+  AiFilterChain ai_filters = 2;
 }
 
 // Per-route configuration for the AI Protocol Manager filter. Declares that the
@@ -85,4 +106,9 @@ message AiProtocolManagerPerRoute {
   // Transcoding is not implemented yet; a later change adds it. Until then this
   // field is accepted and has no effect.
   bool normalize = 2;
+
+  // AI filters for this route, replacing the chain configured on the filter
+  // rather than adding to it. When unset the filter-level chain runs; set it to
+  // an empty message to run no filters on this route.
+  AiFilterChain ai_filters = 3;
 }

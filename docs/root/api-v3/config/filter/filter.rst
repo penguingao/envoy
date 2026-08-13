@@ -13,3 +13,4 @@ Filters
   dubbo/dubbo
   thrift/thrift
   generic/generic
+  ai/ai

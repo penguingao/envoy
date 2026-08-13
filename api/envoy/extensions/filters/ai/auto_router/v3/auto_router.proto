@@ -1,0 +1,120 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.ai.auto_router.v3;
+
+import "envoy/type/matcher/v3/regex.proto";
+
+import "google/protobuf/wrappers.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.ai.auto_router.v3";
+option java_outer_classname = "AutoRouterProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/ai/auto_router/v3;auto_routerv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: AI Auto Router]
+// Heuristic auto router
+// [#extension: envoy.filters.ai.auto_router]
+
+// Picks a target for an inference request by classifying its payload, so a
+// deployment can send cheap requests to a small model and hard ones to a large
+// model without the caller having to choose.
+//
+// Classification is heuristic: keywords, regular expressions and structural
+// signals, all read from the payload the AI protocol manager already parsed. It
+// is deliberately not embedding-based -- that needs a model call on the request
+// path, which is a different cost and failure profile.
+// [#next-free-field: 6]
+message AutoRouter {
+  // What the router does with the target it picked.
+  enum Verdict {
+    // Set :ref:`header_name
+    // <envoy_v3_api_field_extensions.filters.ai.auto_router.v3.AutoRouter.header_name>`
+    // and leave the payload untouched. The default, because an unmodified
+    // payload is forwarded by replaying its original bytes, which is cheaper
+    // than re-serializing it and keeps the body byte-identical.
+    SET_HEADER = 0;
+
+    // Rewrite the payload's ``model`` field. This modifies the payload, so it is
+    // re-serialized on the way out.
+    REWRITE_MODEL = 1;
+
+    // Both of the above.
+    BOTH = 2;
+  }
+
+  // Signals read from the shape of the request rather than its text. Each one
+  // that is set must match, so these narrow a route rather than scoring it.
+  message Structural {
+    // Whether the request declares tools.
+    google.protobuf.BoolValue has_tools = 1;
+
+    // Whether any message part is an image.
+    google.protobuf.BoolValue has_images = 2;
+
+    // Lower bound on the total prompt size in bytes. Offloaded content is
+    // counted from its recorded length, so this costs nothing to evaluate.
+    uint32 min_prompt_bytes = 3;
+
+    // Upper bound on the total prompt size in bytes. Zero means no upper bound.
+    uint32 max_prompt_bytes = 4;
+  }
+
+  // One candidate target and what makes a request match it.
+  // [#next-free-field: 6]
+  message Route {
+    // The value reported when this route wins: a model name, or whatever the
+    // routing configuration downstream expects.
+    string name = 1 [(validate.rules).string = {min_len: 1}];
+
+    // Case-insensitive substrings looked for in the prompt. Each distinct
+    // keyword that appears adds to the route's score.
+    repeated string keywords = 2;
+
+    // Patterns matched against the scanned prompt. Each pattern that matches
+    // adds to the route's score.
+    //
+    // These follow the usual :ref:`StringMatcher
+    // <envoy_v3_api_msg_type.matcher.v3.StringMatcher>` semantics, so a pattern
+    // must match the scanned text in full -- use ``.*`` around a fragment, or
+    // prefer :ref:`keywords
+    // <envoy_v3_api_field_extensions.filters.ai.auto_router.v3.AutoRouter.Route.keywords>`,
+    // which are substring matches.
+    repeated type.matcher.v3.RegexMatcher regexes = 3;
+
+    // Structural preconditions. A request that fails any of these cannot take
+    // this route regardless of its score.
+    Structural structural = 4;
+
+    // Multiplies this route's score, to break ties between routes that match
+    // equally well. Zero is treated as one.
+    uint32 weight = 5;
+  }
+
+  // Candidate routes, in priority order: an equal score is broken by whichever
+  // is declared first.
+  repeated Route routes = 1;
+
+  // Reported when no route matches. When empty, an unmatched request is left
+  // alone.
+  string default_route = 2;
+
+  // What to do with the target that was picked.
+  Verdict verdict = 3 [(validate.rules).enum = {defined_only: true}];
+
+  // Header set when the verdict includes ``SET_HEADER``. Defaults to
+  // ``x-envoy-ai-route``.
+  string header_name = 4;
+
+  // How much of the prompt to hold for regular-expression matching. Keywords are
+  // matched as the prompt streams past and are not subject to this, but a
+  // regular expression cannot be applied incrementally, so only this many
+  // leading bytes are matched against. Defaults to 64 KiB.
+  uint32 max_scan_bytes = 5;
+}

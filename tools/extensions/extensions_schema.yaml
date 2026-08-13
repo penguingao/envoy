@@ -75,6 +75,7 @@ categories:
 - envoy.config_subscription
 - envoy.config_mux
 - envoy.filters.http
+- envoy.filters.ai
 - envoy.filters.listener
 - envoy.filters.network
 - envoy.filters.udp_listener
