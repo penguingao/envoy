@@ -58,6 +58,21 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "json_emitter_lib",
+    srcs = ["json_emitter.cc"],
+    hdrs = ["json_emitter.h"],
+    deps = [
+        ":json_with_ext_buf_lib",
+        "//source/common/buffer:buffer_util_lib",
+        "//source/common/json:constants_lib",
+        "//source/common/json:json_sanitizer_lib",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
+    ],
+)
+
+envoy_cc_library(
     name = "buffer_manager_lib",
     srcs = ["buffer_manager.cc"],
     hdrs = ["buffer_manager.h"],
