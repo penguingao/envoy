@@ -116,6 +116,69 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "serializer_test",
+    srcs = ["serializer_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/common/coroutine:coroutine_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:serializer_lib",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "field_stream_test",
+    srcs = ["field_stream_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/common/coroutine:coroutine_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:field_stream_lib",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "normalization_filter_test",
+    srcs = ["normalization_filter_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/coroutine:coroutine_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:filter_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:normalization_filter_lib",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "filter_manager_test",
+    srcs = ["filter_manager_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/common/coroutine:coroutine_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:ai_filter_interface",
+        "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:filter_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:schema_lib",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "ai_protocol_manager_integration_test",
     size = "large",
     srcs = ["ai_protocol_manager_integration_test.cc"],

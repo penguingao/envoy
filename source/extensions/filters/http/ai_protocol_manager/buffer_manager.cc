@@ -63,6 +63,14 @@ void BufferManager::endStream() {
   maybeIssueWrite();
 }
 
+void BufferManager::read(uint64_t offset, uint64_t length, ReadCallback done) {
+  if (destroyed_ || buffer_ == nullptr) {
+    done(ExternalBufferStatus::Error, nullptr);
+    return;
+  }
+  buffer_->read(offset, length, std::move(done));
+}
+
 void BufferManager::replay(uint64_t offset, uint64_t length, ReplayDoneCallback done) {
   // One replay at a time: the caller chains sub-ranges from the done callback.
   ASSERT(!replaying_ && !replay_requested_);

@@ -7,6 +7,7 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/http/utility.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
+#include "source/extensions/filters/http/ai_protocol_manager/normalization_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema/schema_registry.h"
 
 namespace Envoy {
@@ -15,6 +16,9 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 
 void AiProtocolManagerFilter::onDestroy() {
+  if (filter_manager_ != nullptr) {
+    filter_manager_->onDestroy();
+  }
   if (decode_manager_ != nullptr) {
     // Detach the manager (releases the external buffer and unsubscribes from
     // watermarks) but do NOT free it here. onDestroy() can run synchronously while
@@ -165,16 +169,31 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
 
   decode_manager_->onData(data);
   if (end_stream) {
-    // The full body has been offloaded. The filter owns replay and end-of-stream:
-    // a future change will assemble and inspect the request here (and may replay
-    // sub-ranges); for now replay the whole body, then emit the terminal frame.
+    // The full body has been offloaded.
     decode_manager_->endStream();
-    decode_manager_->replay(0, decode_manager_->length(), [this]() {
-      // Terminate the stream with an empty end_stream data frame after the replayed
-      // body (also releases the held headers when the body was empty).
-      Buffer::OwnedImpl end_marker;
-      decoder_callbacks_->injectDecodedDataToFilterChain(end_marker, /*end_stream=*/true);
-    });
+    if (isAiEndpoint() && !decode_manager_->empty() && !payload_rejected_) {
+      std::vector<AiFilterPtr> filters;
+      if (normalize_) {
+        filters.push_back(std::make_unique<NormalizationFilter>());
+      }
+      const PayloadSchema* payload_schema = SchemaRegistry::getSchema(schema_);
+      filter_manager_ = std::make_unique<FilterManager>(
+          std::move(filters), std::move(request_json_), decode_manager_.get(),
+          decoder_callbacks_->dispatcher(), payload_schema,
+          [this](Buffer::Instance& data, bool end_stream) {
+            decoder_callbacks_->injectDecodedDataToFilterChain(data, end_stream);
+          });
+      filter_manager_->start([this](absl::Status status) {
+        if (!status.ok()) {
+          rejectInvalidPayload(status);
+        }
+      });
+    } else {
+      decode_manager_->replay(0, decode_manager_->length(), [this]() {
+        Buffer::OwnedImpl end_marker;
+        decoder_callbacks_->injectDecodedDataToFilterChain(end_marker, /*end_stream=*/true);
+      });
+    }
   }
   // Hold the chain here; the BufferManager replays the payload once told to.
   return Http::FilterDataStatus::StopIterationNoBuffer;
@@ -203,11 +222,31 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
 
   // The body ended without end_stream on a data frame; the trailers carry it.
   decode_manager_->endStream();
-  decode_manager_->replay(0, decode_manager_->length(), [this]() {
-    // Body fully replayed; release the held trailers (they carry END_STREAM) so
-    // they follow the body in order.
-    decoder_callbacks_->continueDecoding();
-  });
+  if (isAiEndpoint() && !decode_manager_->empty() && !payload_rejected_) {
+    std::vector<AiFilterPtr> filters;
+    if (normalize_) {
+      filters.push_back(std::make_unique<NormalizationFilter>());
+    }
+    const PayloadSchema* payload_schema = SchemaRegistry::getSchema(schema_);
+    filter_manager_ = std::make_unique<FilterManager>(
+        std::move(filters), std::move(request_json_), decode_manager_.get(),
+        decoder_callbacks_->dispatcher(), payload_schema,
+        [this](Buffer::Instance& data, bool /*end_stream*/) {
+          decoder_callbacks_->injectDecodedDataToFilterChain(data, /*end_stream=*/false);
+          decoder_callbacks_->continueDecoding();
+        });
+    filter_manager_->start([this](absl::Status status) {
+      if (!status.ok()) {
+        rejectInvalidPayload(status);
+      }
+    });
+  } else {
+    decode_manager_->replay(0, decode_manager_->length(), [this]() {
+      // Body fully replayed; release the held trailers (they carry END_STREAM) so
+      // they follow the body in order.
+      decoder_callbacks_->continueDecoding();
+    });
+  }
   // Hold the trailers behind the replayed body until the replay-done callback
   // above releases them.
   return Http::FilterTrailersStatus::StopIteration;

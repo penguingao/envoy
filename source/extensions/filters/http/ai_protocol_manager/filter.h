@@ -10,6 +10,7 @@
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
@@ -146,6 +147,9 @@ private:
   // Cleared once parsing is done with, whether it completed, was abandoned, or
   // failed the request.
   std::unique_ptr<JsonWithExtBufParser> request_parser_;
+
+  // FilterManager orchestrating the AI filter chain.
+  std::unique_ptr<FilterManager> filter_manager_;
 
   // Once set, later frames on the dying stream are dropped, not offloaded.
   bool payload_rejected_{false};

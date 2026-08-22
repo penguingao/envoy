@@ -135,6 +135,9 @@ public:
     return buffer_ == nullptr || buffer_->length() + pending_.length() + in_flight_write_size_ == 0;
   }
 
+  // Reads the byte range [offset, offset+length) from the external buffer.
+  void read(uint64_t offset, uint64_t length, ReadCallback done);
+
   // Detaches the manager from the filter chain: releases the external buffer,
   // unsubscribes from replay watermarks, and cancels the pending replay
   // continuation, so async completions and replay reentrancy become inert (they

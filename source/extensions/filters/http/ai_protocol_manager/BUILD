@@ -97,6 +97,96 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "ai_filter_interface",
+    hdrs = ["ai_filter.h"],
+    deps = [
+        "//source/common/coroutine:coroutine_lib",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+    ],
+)
+
+envoy_cc_library(
+    name = "field_stream_lib",
+    srcs = ["field_stream.cc"],
+    hdrs = ["field_stream.h"],
+    deps = [
+        "//envoy/buffer:buffer_interface",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/coroutine:coroutine_lib",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
+    name = "serializer_lib",
+    srcs = ["serializer.cc"],
+    hdrs = ["serializer.h"],
+    deps = [
+        ":buffer_manager_lib",
+        ":external_buffer_interface",
+        ":field_stream_lib",
+        ":json_with_ext_buf_lib",
+        "//envoy/buffer:buffer_interface",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/coroutine:coroutine_lib",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
+    ],
+)
+
+envoy_cc_library(
+    name = "filter_manager_lib",
+    srcs = [
+        "ai_request.cc",
+        "field_streaming_session.cc",
+        "filter_manager.cc",
+    ],
+    hdrs = [
+        "ai_request.h",
+        "field_streaming_session.h",
+        "filter_manager.h",
+    ],
+    deps = [
+        ":ai_filter_interface",
+        ":buffer_manager_lib",
+        ":external_buffer_interface",
+        ":field_stream_lib",
+        ":json_with_ext_buf_lib",
+        ":schema_lib",
+        ":serializer_lib",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/common:logger_lib",
+        "//source/common/coroutine:coroutine_lib",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
+    ],
+)
+
+envoy_cc_library(
+    name = "normalization_filter_lib",
+    srcs = ["normalization_filter.cc"],
+    hdrs = ["normalization_filter.h"],
+    deps = [
+        ":ai_filter_interface",
+        ":filter_manager_lib",
+        "//source/common/coroutine:coroutine_lib",
+        "@abseil-cpp//absl/status",
+    ],
+)
+
+envoy_cc_library(
     name = "filter_lib",
     srcs = ["filter.cc"],
     hdrs = ["filter.h"],
@@ -104,8 +194,10 @@ envoy_cc_library(
         ":buffer_manager_lib",
         ":external_buffer_interface",
         ":filter_chain_bridge_lib",
+        ":filter_manager_lib",
         ":json_with_ext_buf_lib",
         ":json_with_ext_buf_parser_lib",
+        ":normalization_filter_lib",
         ":schema_lib",
         "//envoy/http:codes_interface",
         "//envoy/router:router_interface",
