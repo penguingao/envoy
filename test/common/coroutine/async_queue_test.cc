@@ -973,11 +973,9 @@ TEST_F(AsyncQueueTest, SelfMoveAssignmentIsSafe) {
   AsyncQueue<int> queue(2);
   EXPECT_TRUE(queue.tryPush(10));
 
-  // Self-move assignment
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wself-move"
-  queue = std::move(queue);
-#pragma clang diagnostic pop
+  // Self-move assignment via pointer indirection to avoid compiler self-move warnings
+  auto* queue_ptr = &queue;
+  queue = std::move(*queue_ptr);
 
   EXPECT_EQ(queue.itemCount(), 1);
   auto pop = queue.tryPop();
