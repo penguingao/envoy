@@ -9,9 +9,9 @@
 #include "envoy/buffer/buffer.h"
 
 #include "source/common/coroutine/task.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ingestion_buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_scanner.h"
@@ -29,9 +29,9 @@ namespace AiProtocolManager {
 // Response payload bytes are fed to this class as they arrive. It parses each line into an
 // SseEvent and emits it once a full frame is seen.
 //
-// Memory bound: each frame gets BufferManager instances of its own, which hold its bytes in
-// memory up to Config::max_in_memory_frame_bytes and offload beyond that. They are carried on the
-// SseEvent, so references into them stay accessible as long as the event does.
+// Memory bound: each frame gets IngestionBufferManager instances of its own, which hold its bytes
+// in memory up to Config::max_in_memory_frame_bytes and offload beyond that. They are carried on
+// the SseEvent, so references into them stay accessible as long as the event does.
 //
 // A payload that is not valid JSON is not an error -- `[DONE]`, a binary audio delta and a
 // provider error dump all reach filters through SseEvent::raw_data() (or, once offloaded,
@@ -150,13 +150,13 @@ private:
   uint64_t extras_len_{0};
   // Unmodeled field lines, verbatim and in arrival order. Written as they are scanned, so the
   // line currently being scanned, if it is one, is whatever is at the end.
-  BufferManagerPtr extras_store_;
+  IngestionBufferManagerPtr extras_store_;
 
   // Payload state. The store and the parser are opened together on the frame's first payload byte
   // and see exactly the same bytes, so an offset in one names the same byte in the other.
   bool has_data_{false};
   uint64_t payload_len_{0}; // Total payload bytes seen.
-  BufferManagerPtr data_store_;
+  IngestionBufferManagerPtr data_store_;
   std::unique_ptr<JsonWithExtBufParser> json_parser_;
   // One (offset, length) pair per `data:` line.
   std::vector<std::pair<uint64_t, uint64_t>> data_spans_;

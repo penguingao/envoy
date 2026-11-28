@@ -10,8 +10,8 @@
 #include "source/common/common/assert.h"
 #include "source/common/coroutine/status_macros.h"
 #include "source/common/coroutine/task.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ingestion_buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/payload_reader.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/stream_payload.h"
@@ -288,8 +288,9 @@ absl::Status SseEventDecoder::appendPayload(absl::string_view bytes) {
         absl::StrCat("SSE frame exceeded the ", config_.max_frame_bytes, " byte limit"));
   }
   if (data_store_ == nullptr) {
-    data_store_ = std::make_unique<BufferManager>(
-        BufferManager::Config{config_.max_in_memory_frame_bytes}, buffer_factory_, bridge_);
+    data_store_ = std::make_unique<IngestionBufferManager>(
+        IngestionBufferManager::Config{config_.max_in_memory_frame_bytes}, buffer_factory_,
+        bridge_);
     json_parser_ = std::make_unique<JsonWithExtBufParser>(config_.parser);
   }
   // A parse error is not fatal: the payload may simply not be JSON. The parser is dropped at that
@@ -312,8 +313,9 @@ absl::Status SseEventDecoder::appendExtras(absl::string_view bytes) {
         absl::StrCat("SSE frame exceeded the ", config_.max_frame_bytes, " byte limit"));
   }
   if (extras_store_ == nullptr) {
-    extras_store_ = std::make_unique<BufferManager>(
-        BufferManager::Config{config_.max_in_memory_frame_bytes}, buffer_factory_, bridge_);
+    extras_store_ = std::make_unique<IngestionBufferManager>(
+        IngestionBufferManager::Config{config_.max_in_memory_frame_bytes}, buffer_factory_,
+        bridge_);
   }
   Buffer::OwnedImpl buf;
   buf.add(bytes);
@@ -338,7 +340,7 @@ void SseEventDecoder::finishFrame(std::vector<SseEventPtr>& out,
     const Buffer::Instance* extras_in_memory = extras_store_->inMemoryBytes();
     const uint64_t extras_in_memory_bytes =
         extras_in_memory != nullptr ? extras_in_memory->length() : 0;
-    event->set_extras_reader(BufferManager::exportPayloadReader(std::move(extras_store_)),
+    event->set_extras_reader(IngestionBufferManager::exportPayloadReader(std::move(extras_store_)),
                              extras_in_memory_bytes);
   }
 
@@ -373,7 +375,7 @@ void SseEventDecoder::finishFrame(std::vector<SseEventPtr>& out,
     }
     if (keeps_references) {
       const uint64_t payload_in_memory_bytes = in_memory != nullptr ? in_memory->length() : 0;
-      event->set_payload_reader(BufferManager::exportPayloadReader(std::move(data_store_)),
+      event->set_payload_reader(IngestionBufferManager::exportPayloadReader(std::move(data_store_)),
                                 payload_in_memory_bytes);
     }
   }

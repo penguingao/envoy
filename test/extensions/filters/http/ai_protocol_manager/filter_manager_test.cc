@@ -10,10 +10,10 @@
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_request.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ingestion_buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
 
@@ -725,12 +725,12 @@ public:
 
   // Buffers the body as the AI Protocol Manager does before parsing it.
   JsonWithExtBuf receive() {
-    auto buffer_manager =
-        std::make_unique<BufferManager>(BufferManager::Config{}, factory_, bridge_);
+    auto buffer_manager = std::make_unique<IngestionBufferManager>(IngestionBufferManager::Config{},
+                                                                   factory_, bridge_);
     Buffer::OwnedImpl data(kReceived);
     buffer_manager->onData(data);
     buffer_manager->endStream();
-    payload_reader_ = BufferManager::exportPayloadReader(std::move(buffer_manager));
+    payload_reader_ = IngestionBufferManager::exportPayloadReader(std::move(buffer_manager));
     JsonWithExtBuf doc;
     doc.setJson(nlohmann::json::parse(kReceived));
     return doc;

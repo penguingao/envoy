@@ -1,4 +1,4 @@
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ingestion_buffer_manager.h"
 
 #include <cstdint>
 #include <memory>
@@ -18,18 +18,18 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-BufferManager::BufferManager(Config config, ExternalBufferFactory& buffer_factory,
-                             FilterChainBridge& bridge)
+IngestionBufferManager::IngestionBufferManager(Config config, ExternalBufferFactory& buffer_factory,
+                                               FilterChainBridge& bridge)
     : config_(config), buffer_factory_(buffer_factory), bridge_(bridge) {
   bridge_.registerClient(bridge_adapter_);
 }
 
-void BufferManager::onDestroy() {
+void IngestionBufferManager::onDestroy() {
   if (destroyed_) {
     return;
   }
   // Keep `this` alive on the stack until teardown finishes when self-owned.
-  BufferManagerPtr self = std::move(self_owner_);
+  IngestionBufferManagerPtr self = std::move(self_owner_);
   destroyed_ = true;
   *alive_ = false;
   bridge_.unregisterClient(bridge_adapter_);
@@ -52,7 +52,7 @@ void BufferManager::onDestroy() {
   }
 }
 
-void BufferManager::onData(Buffer::Instance& data, bool end_stream) {
+void IngestionBufferManager::onData(Buffer::Instance& data, bool end_stream) {
   if (destroyed_ || write_failed_) {
     if (end_stream) {
       end_stream_seen_ = true;
@@ -107,7 +107,7 @@ void BufferManager::onData(Buffer::Instance& data, bool end_stream) {
   maybeIssueWrite();
 }
 
-void BufferManager::endStream() {
+void IngestionBufferManager::endStream() {
   end_stream_seen_ = true;
   if (destroyed_ || write_failed_) {
     return;
@@ -117,14 +117,15 @@ void BufferManager::endStream() {
   maybeIssueWrite();
 }
 
-const Buffer::Instance* BufferManager::inMemoryBytes() const {
+const Buffer::Instance* IngestionBufferManager::inMemoryBytes() const {
   if (destroyed_ || write_failed_ || buffer_ != nullptr) {
     return nullptr;
   }
   return &pending_;
 }
 
-PayloadReaderSharedPtr BufferManager::exportPayloadReader(BufferManagerPtr manager) {
+PayloadReaderSharedPtr
+IngestionBufferManager::exportPayloadReader(IngestionBufferManagerPtr manager) {
   ASSERT(manager != nullptr);
   ASSERT(manager->end_stream_seen_);
   if (manager->destroyed_ || manager->write_failed_) {
@@ -138,14 +139,14 @@ PayloadReaderSharedPtr BufferManager::exportPayloadReader(BufferManagerPtr manag
   }
   ASSERT(manager->write_in_flight_);
   const uint64_t total_length = manager->total_length_;
-  BufferManager* raw = manager.get();
+  IngestionBufferManager* raw = manager.get();
   PayloadReaderSharedPtr reader = PayloadReader::createPendingExternal(total_length);
   raw->exported_reader_ = reader;
   raw->self_owner_ = std::move(manager);
   return reader;
 }
 
-void BufferManager::maybeIssueWrite() {
+void IngestionBufferManager::maybeIssueWrite() {
   // Nothing to do while the payload is still within the in-memory tier: there is no store yet, and
   // the bytes are already readable in pending_.
   //
@@ -185,7 +186,7 @@ void BufferManager::maybeIssueWrite() {
   });
 }
 
-void BufferManager::onWriteComplete(ExternalBufferStatus status) {
+void IngestionBufferManager::onWriteComplete(ExternalBufferStatus status) {
   std::shared_ptr<bool> alive = alive_;
   // A conforming store cancels pending completions when it is destroyed in
   // onDestroy() (see ExternalBuffer), so this never fires once detached.
@@ -206,7 +207,7 @@ void BufferManager::onWriteComplete(ExternalBufferStatus status) {
   if (status != ExternalBufferStatus::Ok) {
     write_failed_ = true;
     PayloadReaderSharedPtr reader = exported_reader_.lock();
-    BufferManagerPtr self = std::move(self_owner_);
+    IngestionBufferManagerPtr self = std::move(self_owner_);
     onExternalBufferError();
     if (reader != nullptr) {
       reader->failExternalHandoff();
@@ -229,7 +230,7 @@ void BufferManager::onWriteComplete(ExternalBufferStatus status) {
   }
 }
 
-void BufferManager::onExternalBufferError() {
+void IngestionBufferManager::onExternalBufferError() {
   ENVOY_LOG(warn, "ai_protocol_manager: external buffer I/O error, failing stream");
   bridge_.notifyUnrecoverableError();
 }

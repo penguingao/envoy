@@ -146,9 +146,9 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "buffer_manager_lib",
-    srcs = ["buffer_manager.cc"],
-    hdrs = ["buffer_manager.h"],
+    name = "ingestion_buffer_manager_lib",
+    srcs = ["ingestion_buffer_manager.cc"],
+    hdrs = ["ingestion_buffer_manager.h"],
     deps = [
         ":external_buffer_interface",
         ":filter_chain_bridge_lib",
@@ -389,6 +389,7 @@ envoy_cc_library(
         ":filter_chain_bridge_lib",
         ":filter_pipeline_lib",
         ":flattening_json_codec_lib",
+        ":ingestion_buffer_manager_lib",
         ":task_group_lib",
         "//envoy/buffer:buffer_interface",
         "//source/common/buffer:buffer_lib",
@@ -512,6 +513,7 @@ envoy_cc_library(
         ":chain_writer_lib",
         ":external_buffer_interface",
         ":filter_chain_bridge_lib",
+        ":ingestion_buffer_manager_lib",
         ":json_with_ext_buf_lib",
         ":payload_reader_lib",
         ":request_filter_manager_lib",
@@ -533,11 +535,11 @@ envoy_cc_library(
     deps = [
         ":ai_filter_lib",
         ":ai_filter_state_lib",
-        ":buffer_manager_lib",
         ":chain_writer_lib",
         ":external_buffer_interface",
         ":filter_chain_bridge_lib",
         ":filter_manager_lib",
+        ":ingestion_buffer_manager_lib",
         ":json_with_ext_buf_lib",
         ":json_with_ext_buf_parser_lib",
         ":llm_binding_lib",

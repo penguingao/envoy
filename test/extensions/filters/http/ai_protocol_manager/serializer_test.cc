@@ -5,9 +5,9 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/coroutine/dispatcher_executor.h"
 #include "source/common/coroutine/launch.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ingestion_buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
 
@@ -30,8 +30,8 @@ class SerializerTest : public testing::Test {
 public:
   SerializerTest()
       : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test")), factory_(),
-        bridge_(*dispatcher_), buffer_manager_(std::make_unique<BufferManager>(
-                                   BufferManager::Config{}, factory_, bridge_)),
+        bridge_(*dispatcher_), buffer_manager_(std::make_unique<IngestionBufferManager>(
+                                   IngestionBufferManager::Config{}, factory_, bridge_)),
         writer_(bridge_) {}
 
   void drain() {
@@ -41,12 +41,13 @@ public:
   }
 
   absl::StatusOr<JsonWithExtBuf> runSerialize(const JsonWithExtBuf& doc,
-                                              BufferManagerPtr buffer_manager) {
+                                              IngestionBufferManagerPtr buffer_manager) {
     if (buffer_manager == nullptr) {
       return runSerialize(doc, nullptr, nullptr);
     }
     buffer_manager->endStream();
-    PayloadReaderSharedPtr reader = BufferManager::exportPayloadReader(std::move(buffer_manager));
+    PayloadReaderSharedPtr reader =
+        IngestionBufferManager::exportPayloadReader(std::move(buffer_manager));
     return runSerialize(doc, &writer_, reader.get());
   }
 
@@ -92,7 +93,7 @@ public:
   InMemoryExternalBufferFactory factory_;
   // Declared before buffer_manager_ and writer_ so it outlives the objects that reference it.
   FakeBridge bridge_;
-  BufferManagerPtr buffer_manager_;
+  IngestionBufferManagerPtr buffer_manager_;
   ChainWriter writer_;
 };
 
@@ -166,8 +167,8 @@ TEST_F(SerializerTest, ExternalRefNullBufferFails) {
   EXPECT_THAT(result_or.status(), HasStatusCode(absl::StatusCode::kInvalidArgument));
 }
 
-// A reference names bytes in some BufferManager; without one to read them from there is nothing
-// to emit, so the serialization fails rather than putting a truncated payload on the wire.
+// A reference names bytes in some IngestionBufferManager; without one to read them from there is
+// nothing to emit, so the serialization fails rather than putting a truncated payload on the wire.
 TEST_F(SerializerTest, ExternalRefWithNoRefSourceFails) {
   JsonWithExtBuf doc;
   doc.setJson(nlohmann::json{

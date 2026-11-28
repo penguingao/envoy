@@ -14,10 +14,10 @@
 #include "source/common/common/logger.h"
 #include "source/common/coroutine/launch.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ingestion_buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_binding.h"
@@ -152,12 +152,12 @@ private:
 // decodeHeaders() returns Continue and the offload path is never entered.
 //
 // Payload ingestion, reading, and filter-chain emission are split across
-// BufferManager (buffer_manager.h), PayloadReader
+// IngestionBufferManager (ingestion_buffer_manager.h), PayloadReader
 // (payload_reader.h), and ChainWriter (chain_writer.h), coordinated through the
 // path-specific FilterChainBridge (filter_chain_bridge.h).
 //
 // Parsing runs alongside the offload: every body frame is fed to a
-// JsonWithExtBufParser before it reaches the BufferManager, so the two
+// JsonWithExtBufParser before it reaches the IngestionBufferManager, so the two
 // see the identical byte stream from the first body byte -- which is what makes
 // the parser's recorded offsets valid buffer offsets (json_with_ext_buf_parser.h).
 // Feeding first also fails a malformed payload the moment the bad byte arrives,
@@ -234,7 +234,7 @@ private:
   bool finalizeResponseHandling();
 
   // Finalizes the decode path when the full request body (and optional trailers) has been received.
-  // Sets endStream on `decode_manager_` and executes the AI filter chain or forwards the body.
+  // Sets endStream on `decode_ingester_` and executes the AI filter chain or forwards the body.
   void finalizeDecode(bool has_trailers);
 
   // Invoked when the SSE response filter pipeline completes or fails.
@@ -252,14 +252,14 @@ private:
 
   FilterConfigSharedPtr config_;
 
-  // Declared before `decode_manager_`, `decode_writer_`, `encode_writer_`, and `filter_manager_`
+  // Declared before `decode_ingester_`, `decode_writer_`, `encode_writer_`, and `filter_manager_`
   // so they outlive the ingest managers, writers, and coroutines that reference them.
   FilterChainBridgePtr decode_bridge_;
 
   // Non-null exactly when decodeHeaders() decided to inspect this stream, so it
   // doubles as the engaged flag. Outlives request_parser_, which is released as
   // soon as parsing is done with.
-  BufferManagerPtr decode_manager_;
+  IngestionBufferManagerPtr decode_ingester_;
   PayloadReaderSharedPtr decode_reader_;
   ChainWriterPtr decode_writer_;
   std::optional<Coroutine::DetachedHandle> passthrough_handle_;

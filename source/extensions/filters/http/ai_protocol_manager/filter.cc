@@ -18,10 +18,10 @@
 #include "source/common/http/utility.h"
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ingestion_buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
 #include "source/extensions/filters/http/ai_protocol_manager/stream_payload.h"
@@ -275,12 +275,12 @@ void AiProtocolManagerFilter::onDestroy() {
     filter_manager_->cancel();
   }
   if (decode_bridge_ != nullptr) {
-    // Detach the bridge so all registered BufferManagers on this path are detached and
+    // Detach the bridge so all registered IngestionBufferManagers on this path are detached and
     // their callbacks disarmed.
     decode_bridge_->detachFromFilterChain();
   }
-  if (decode_manager_ != nullptr) {
-    decode_manager_->onDestroy();
+  if (decode_ingester_ != nullptr) {
+    decode_ingester_->onDestroy();
   }
   decode_reader_.reset();
 }
@@ -362,9 +362,9 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // A request small enough that the chain would have buffered it anyway is held in memory and
   // forwarded from there, so it costs no storage IO at all. Past that the chain would have pushed
   // back, which is exactly the point at which offloading starts to pay for itself.
-  decode_manager_ = std::make_unique<BufferManager>(
-      BufferManager::Config{decoder_callbacks_->decoderBufferLimit()}, config_->bufferFactory(),
-      *decode_bridge_);
+  decode_ingester_ = std::make_unique<IngestionBufferManager>(
+      IngestionBufferManager::Config{decoder_callbacks_->decoderBufferLimit()},
+      config_->bufferFactory(), *decode_bridge_);
   decode_writer_ = std::make_unique<ChainWriter>(*decode_bridge_);
 
   // Pin the headers so routing and admission filters do not act on them before
@@ -448,7 +448,7 @@ void AiProtocolManagerFilter::rejectInvalidPayload(const absl::Status& status) {
 
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data,
                                                            bool end_stream) {
-  if (decode_manager_ == nullptr) {
+  if (decode_ingester_ == nullptr) {
     // decodeHeaders() decided this stream is none of our business.
     return Http::FilterDataStatus::Continue;
   }
@@ -460,7 +460,7 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
   // The framing promised a body but no byte of one arrived -- a chunked request
   // whose only chunk is the terminator, or an empty terminal DATA frame. There
   // is no payload to validate or forward, so let the headers and terminal frame flow.
-  if (end_stream && data.length() == 0 && decode_manager_->empty()) {
+  if (end_stream && data.length() == 0 && decode_ingester_->empty()) {
     request_parser_.reset();
     return Http::FilterDataStatus::Continue;
   }
@@ -469,7 +469,7 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
-  decode_manager_->onData(data, end_stream);
+  decode_ingester_->onData(data, end_stream);
   if (end_stream) {
     finalizeDecode(/*has_trailers=*/false);
   }
@@ -478,14 +478,14 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
 }
 
 Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap&) {
-  if (decode_manager_ == nullptr) {
+  if (decode_ingester_ == nullptr) {
     return Http::FilterTrailersStatus::Continue;
   }
   if (decodeRejected()) {
     return Http::FilterTrailersStatus::StopIteration;
   }
   // A trailer-only request (no body) has nothing to forward; let the trailers flow.
-  if (decode_manager_->empty()) {
+  if (decode_ingester_->empty()) {
     return Http::FilterTrailersStatus::Continue;
   }
 
@@ -505,13 +505,13 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
 }
 
 void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
-  decode_manager_->endStream();
+  decode_ingester_->endStream();
   if (decodeRejected()) {
     // A synchronous ExternalBuffer::write() failure during the terminal onData() or endStream()
     // already sent the 500 local reply via DecoderFilterChainBridge::onUnrecoverableError().
     return;
   }
-  decode_reader_ = BufferManager::exportPayloadReader(std::move(decode_manager_));
+  decode_reader_ = IngestionBufferManager::exportPayloadReader(std::move(decode_ingester_));
   auto on_complete = [this, has_trailers](absl::Status status) {
     if (decodeRejected()) {
       return;

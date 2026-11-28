@@ -16,8 +16,8 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-class BufferManager;
-using BufferManagerPtr = std::unique_ptr<BufferManager>;
+class IngestionBufferManager;
+using IngestionBufferManagerPtr = std::unique_ptr<IngestionBufferManager>;
 
 // Owns callback-driven HTTP payload ingestion into an in-memory queue or ExternalBuffer with
 // ingest back-pressure, exporting a PayloadReader once endStream() is reached.
@@ -27,7 +27,7 @@ using BufferManagerPtr = std::unique_ptr<BufferManager>;
 // that keeps up does not get a stream of tiny writes. It reports the not-yet-durable byte count
 // (queued plus in-flight) to the bridge, which pushes back on the data source when the backing
 // store cannot keep up.
-class BufferManager : public Logger::Loggable<Logger::Id::filter> {
+class IngestionBufferManager : public Logger::Loggable<Logger::Id::filter> {
 public:
   struct Config {
     // Maximum bytes held in memory before spilling to an ExternalBuffer. Payloads within this
@@ -35,10 +35,11 @@ public:
     uint64_t max_in_memory_bytes{0};
   };
 
-  // `bridge` is shared by every BufferManager on the path and must outlive them all.
-  BufferManager(Config config, ExternalBufferFactory& buffer_factory, FilterChainBridge& bridge);
+  // `bridge` is shared by every IngestionBufferManager on the path and must outlive them all.
+  IngestionBufferManager(Config config, ExternalBufferFactory& buffer_factory,
+                         FilterChainBridge& bridge);
 
-  ~BufferManager() {
+  ~IngestionBufferManager() {
     onDestroy();
     *alive_ = false;
   }
@@ -66,7 +67,7 @@ public:
   // already durable (or failed), `manager` is destroyed immediately; if an ExternalBuffer flush is
   // still in flight, `manager` becomes self-owned until the terminal write completes, fails, all
   // readers are dropped, or the bridge detaches.
-  static PayloadReaderSharedPtr exportPayloadReader(BufferManagerPtr manager);
+  static PayloadReaderSharedPtr exportPayloadReader(IngestionBufferManagerPtr manager);
 
   // Detaches the manager from the filter chain: unregisters from the bridge, cancels any
   // still-flushing PayloadReader handoff, releases unshared ExternalBuffer ownership, and returns
@@ -76,12 +77,12 @@ public:
 private:
   class BridgeAdapter : public FilterChainBridge::Client {
   public:
-    explicit BridgeAdapter(BufferManager& owner) : owner_(owner) {}
+    explicit BridgeAdapter(IngestionBufferManager& owner) : owner_(owner) {}
     void onBridgeDetached() override { owner_.onDestroy(); }
     void onIngestPaused() override { owner_.maybeIssueWrite(); }
 
   private:
-    BufferManager& owner_;
+    IngestionBufferManager& owner_;
   };
 
   void maybeIssueWrite();
@@ -101,7 +102,7 @@ private:
   std::weak_ptr<PayloadReader> exported_reader_;
   // Non-null only after exportPayloadReader() when an ExternalBuffer flush is still in flight;
   // released on write completion/error, reader expiration, or bridge detachment (onDestroy()).
-  BufferManagerPtr self_owner_;
+  IngestionBufferManagerPtr self_owner_;
 
   uint64_t total_length_{0};
   bool end_stream_seen_{false};

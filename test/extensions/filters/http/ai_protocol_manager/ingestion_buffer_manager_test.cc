@@ -7,9 +7,9 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/coroutine/dispatcher_executor.h"
 #include "source/common/coroutine/launch.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ingestion_buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/stream_payload.h"
 
 #include "test/extensions/filters/http/ai_protocol_manager/fake_bridge.h"
@@ -30,7 +30,7 @@ namespace {
 
 // An ExternalBuffer that completes both write and read asynchronously, via
 // dispatcher.post() -- modelling a network/disk-backed store. Used to exercise
-// the BufferManager's asynchronous (non-re-entrant) replay path, where each read
+// the IngestionBufferManager's asynchronous (non-re-entrant) replay path, where each read
 // completion runs on its own event-loop iteration.
 class PostingExternalBuffer : public ExternalBuffer {
 public:
@@ -95,14 +95,14 @@ public:
     return buffer;
   }
 
-  // The most recently created buffer (owned by the BufferManager under test).
+  // The most recently created buffer (owned by the IngestionBufferManager under test).
   PostingExternalBuffer* last_{nullptr};
   // Counted so a test can assert that a payload within the in-memory limit creates no store.
   int create_calls_{0};
 };
 
 // An ExternalBuffer that reports an I/O error from its write or read completion,
-// to exercise the BufferManager's unrecoverable-error path. The write completion
+// to exercise the IngestionBufferManager's unrecoverable-error path. The write completion
 // is posted (so the test drives it via the event loop); the read completes
 // synchronously, like the in-memory store.
 class FailingExternalBuffer : public ExternalBuffer {
@@ -179,9 +179,9 @@ private:
   NiceMock<Event::MockSchedulableCallback>** slot_{nullptr};
 };
 
-class BufferManagerTest : public testing::Test {
+class IngestionBufferManagerTest : public testing::Test {
 public:
-  BufferManagerTest() {
+  IngestionBufferManagerTest() {
     // The in-memory buffer delivers write completions via dispatcher.post().
     // Capture those callbacks so the test can run the event loop deterministically.
     ON_CALL(dispatcher_, post(testing::_)).WillByDefault([this](Event::PostCb cb) {
@@ -209,7 +209,7 @@ public:
     resetManager(factory_);
   }
 
-  ~BufferManagerTest() override {
+  ~IngestionBufferManagerTest() override {
     cancelActiveTask();
     if (manager_ != nullptr) {
       manager_->onDestroy();
@@ -217,13 +217,13 @@ public:
     drain();
   }
 
-  // Builds a BufferManager backed by `factory`, wiring a fresh FakeBridge. bridge_ points
+  // Builds an IngestionBufferManager backed by `factory`, wiring a fresh FakeBridge. bridge_ points
   // at the new one; replay_cb_ is filled in if and when the writer creates its schedule callback.
-  BufferManagerPtr makeManager(ExternalBufferFactory& factory) {
+  IngestionBufferManagerPtr makeManager(ExternalBufferFactory& factory) {
     bridges_.push_back(std::make_unique<FakeBridge>(dispatcher_, bridge_buffer_limit_));
     bridge_ = bridges_.back().get();
     replay_cb_ = nullptr;
-    return std::make_unique<BufferManager>(manager_config_, factory, *bridge_);
+    return std::make_unique<IngestionBufferManager>(manager_config_, factory, *bridge_);
   }
 
   // Swaps in a manager and writer backed by `factory`, cancelling active coroutines and detaching
@@ -241,7 +241,7 @@ public:
 
   PayloadReader& exportedReader() {
     if (exported_reader_ == nullptr) {
-      exported_reader_ = BufferManager::exportPayloadReader(std::move(manager_));
+      exported_reader_ = IngestionBufferManager::exportPayloadReader(std::move(manager_));
     }
     return *exported_reader_;
   }
@@ -314,7 +314,7 @@ public:
   NiceMock<Event::MockDispatcher> dispatcher_;
   std::deque<Event::PostCb> posted_;
   // Offload from the first byte unless a test opts into the in-memory tier (before resetManager()).
-  BufferManager::Config manager_config_{};
+  IngestionBufferManager::Config manager_config_{};
   // The bridge samples this at construction, so a test must set it before resetManager().
   uint32_t bridge_buffer_limit_{1024 * 1024};
   InMemoryExternalBufferFactory factory_;
@@ -337,14 +337,14 @@ public:
   std::shared_ptr<Coroutine::DispatcherExecutor> executor_{
       std::make_shared<Coroutine::DispatcherExecutor>(dispatcher_)};
   std::optional<Coroutine::DetachedHandle> active_handle_;
-  BufferManagerPtr manager_;
+  IngestionBufferManagerPtr manager_;
   PayloadReaderSharedPtr exported_reader_;
   ChainWriterPtr writer_;
 };
 
 // The body is offloaded chunk-by-chunk and replayed verbatim once the caller
 // triggers replay; completion is reported through the done callback.
-TEST_F(BufferManagerTest, OffloadsAndReplaysBody) {
+TEST_F(IngestionBufferManagerTest, OffloadsAndReplaysBody) {
   Buffer::OwnedImpl chunk1("{\"messages\":");
   manager_->onData(chunk1);
   Buffer::OwnedImpl chunk2("[\"hi\"]}");
@@ -364,7 +364,7 @@ TEST_F(BufferManagerTest, OffloadsAndReplaysBody) {
 }
 
 // A body that arrives in a single frame is still round-tripped.
-TEST_F(BufferManagerTest, SingleFrameBody) {
+TEST_F(IngestionBufferManagerTest, SingleFrameBody) {
   Buffer::OwnedImpl body("{}");
   manager_->onData(body);
   manager_->endStream();
@@ -377,7 +377,7 @@ TEST_F(BufferManagerTest, SingleFrameBody) {
 
 // An empty body has nothing to inject: a zero-length streamPayload resolves immediately without
 // suspending or touching the bridge.
-TEST_F(BufferManagerTest, EmptyBody) {
+TEST_F(IngestionBufferManagerTest, EmptyBody) {
   Buffer::OwnedImpl empty;
   manager_->onData(empty);
   manager_->endStream();
@@ -389,7 +389,7 @@ TEST_F(BufferManagerTest, EmptyBody) {
 
 // A payload larger than the replay chunk size is streamed back in multiple
 // bounded frames and reassembles to the original bytes.
-TEST_F(BufferManagerTest, LargePayloadReplayedInChunks) {
+TEST_F(IngestionBufferManagerTest, LargePayloadReplayedInChunks) {
   const std::string big(200 * 1024, 'x'); // > ReadChunkSize (64KiB)
   Buffer::OwnedImpl body(big);
   manager_->onData(body);
@@ -407,7 +407,7 @@ TEST_F(BufferManagerTest, LargePayloadReplayedInChunks) {
 // chunks of ReadChunkSize) is not replayed all at once: replay injects one budget
 // of chunks, yields to the event loop, and resumes via the scheduled continuation.
 // This keeps a large replay from monopolizing the worker thread.
-TEST_F(BufferManagerTest, ReplayYieldsAcrossIterationsForLargePayload) {
+TEST_F(IngestionBufferManagerTest, ReplayYieldsAcrossIterationsForLargePayload) {
   // 10 chunks total; the budget is 8, so replay should stop after 8 and resume
   // for the remaining 2 on the next iteration.
   const uint64_t chunk = 64 * 1024;
@@ -436,7 +436,7 @@ TEST_F(BufferManagerTest, ReplayYieldsAcrossIterationsForLargePayload) {
 
 // An asynchronous store completes each chunk read via dispatcher.post() and streams all chunks
 // across the per-iteration budget boundary cleanly.
-TEST_F(BufferManagerTest, AsyncStoreReplaysOneChunkPerCallWithoutYield) {
+TEST_F(IngestionBufferManagerTest, AsyncStoreReplaysOneChunkPerCallWithoutYield) {
   resetManager(posting_factory_);
 
   const std::string big(10 * 64 * 1024, 'x'); // 10 chunks > InjectChunksPerIteration (8).
@@ -459,7 +459,7 @@ TEST_F(BufferManagerTest, AsyncStoreReplaysOneChunkPerCallWithoutYield) {
 // Replay is caller-triggered: the body can be fully offloaded and durable before
 // the caller decides to replay. replay() then starts playback on a fresh
 // event-loop iteration, decoupling offload from playback.
-TEST_F(BufferManagerTest, ReplayDeferredUntilCallerRequests) {
+TEST_F(IngestionBufferManagerTest, ReplayDeferredUntilCallerRequests) {
   Buffer::OwnedImpl body("{\"messages\":[\"hi\"]}");
   manager_->onData(body);
   manager_->endStream();
@@ -482,7 +482,7 @@ TEST_F(BufferManagerTest, ReplayDeferredUntilCallerRequests) {
 
 // The caller can stream the payload back as independent sub-ranges, chaining the
 // next from each range's done callback. The ranges reassemble to the full payload.
-TEST_F(BufferManagerTest, ReplaysSubRangesInSequence) {
+TEST_F(IngestionBufferManagerTest, ReplaysSubRangesInSequence) {
   Buffer::OwnedImpl body("HELLOWORLD");
   manager_->onData(body);
   manager_->endStream();
@@ -509,7 +509,7 @@ TEST_F(BufferManagerTest, ReplaysSubRangesInSequence) {
 }
 
 // Cancelling the coroutine context and dropping the pending reader mid-flight stops pending replay.
-TEST_F(BufferManagerTest, DestroyBeforeReplay) {
+TEST_F(IngestionBufferManagerTest, DestroyBeforeReplay) {
   Buffer::OwnedImpl body("payload");
   manager_->onData(body);
   manager_->endStream();
@@ -525,7 +525,7 @@ TEST_F(BufferManagerTest, DestroyBeforeReplay) {
 // A synchronous store completes its final replay read on-stack, so the stream completion callback
 // may end the stream and detach the bridge on-stack -- exactly what the real filter does when the
 // terminal end-of-stream injection triggers teardown.
-TEST_F(BufferManagerTest, TerminalReplayDoneDetachesManagerSynchronously) {
+TEST_F(IngestionBufferManagerTest, TerminalReplayDoneDetachesManagerSynchronously) {
   Buffer::OwnedImpl body("payload");
   manager_->onData(body);
   manager_->endStream();
@@ -546,7 +546,7 @@ TEST_F(BufferManagerTest, TerminalReplayDoneDetachesManagerSynchronously) {
 
 // Writers share one bridge and take its write-resume slot only while paused, so a second writer on
 // the same bridge can stream after the first is done.
-TEST_F(BufferManagerTest, ManagersTakeTheBridgeReplaySlotInTurn) {
+TEST_F(IngestionBufferManagerTest, ManagersTakeTheBridgeReplaySlotInTurn) {
   Buffer::OwnedImpl body("first");
   manager_->onData(body);
   manager_->endStream();
@@ -554,12 +554,13 @@ TEST_F(BufferManagerTest, ManagersTakeTheBridgeReplaySlotInTurn) {
   drain();
   ASSERT_TRUE(replay_done_);
 
-  auto second = std::make_unique<BufferManager>(manager_config_, factory_, *bridge_);
+  auto second = std::make_unique<IngestionBufferManager>(manager_config_, factory_, *bridge_);
   ChainWriter second_writer(*bridge_);
   Buffer::OwnedImpl more("second");
   second->onData(more);
   second->endStream();
-  PayloadReaderSharedPtr second_reader = BufferManager::exportPayloadReader(std::move(second));
+  PayloadReaderSharedPtr second_reader =
+      IngestionBufferManager::exportPayloadReader(std::move(second));
   bool second_done = false;
   launchStream(second_writer, *second_reader, 0, second_reader->length(),
                [&second_done](absl::Status status) { second_done = status.ok(); });
@@ -571,7 +572,7 @@ TEST_F(BufferManagerTest, ManagersTakeTheBridgeReplaySlotInTurn) {
 // With no body offloaded the manager reports empty(), so the caller knows there is
 // nothing to replay (a trailer-only request lets its trailers flow without calling
 // endStream()/replay()).
-TEST_F(BufferManagerTest, EmptyWhenNoDataOffloaded) {
+TEST_F(IngestionBufferManagerTest, EmptyWhenNoDataOffloaded) {
   EXPECT_TRUE(manager_->empty());
   Buffer::OwnedImpl body("x");
   manager_->onData(body);
@@ -579,7 +580,7 @@ TEST_F(BufferManagerTest, EmptyWhenNoDataOffloaded) {
 }
 
 // length() reports the total offloaded so far, including not-yet-durable bytes.
-TEST_F(BufferManagerTest, LengthCountsNotYetDurableBytes) {
+TEST_F(IngestionBufferManagerTest, LengthCountsNotYetDurableBytes) {
   Buffer::OwnedImpl chunk1("abc");
   manager_->onData(chunk1);
   Buffer::OwnedImpl chunk2("defg");
@@ -593,7 +594,7 @@ TEST_F(BufferManagerTest, LengthCountsNotYetDurableBytes) {
 
 // Not-yet-durable bytes crossing the buffer limit pause the data source via the
 // bridge; once the write completes and they drain, the source resumes.
-TEST_F(BufferManagerTest, IngestBackpressureDrivesSourceFlowControl) {
+TEST_F(IngestionBufferManagerTest, IngestBackpressureDrivesSourceFlowControl) {
   // Small limit so a single frame crosses the high watermark (high=100, low=50).
   bridge_buffer_limit_ = 100;
   resetManager(factory_);
@@ -614,7 +615,7 @@ TEST_F(BufferManagerTest, IngestBackpressureDrivesSourceFlowControl) {
 
 // Sub-threshold frames are batched: each is held in the queue rather than written
 // individually, and they coalesce into a single write flushed at endStream().
-TEST_F(BufferManagerTest, BatchesSmallFramesUntilEndStream) {
+TEST_F(IngestionBufferManagerTest, BatchesSmallFramesUntilEndStream) {
   resetManager(posting_factory_);
 
   Buffer::OwnedImpl f1("aaa");
@@ -647,7 +648,7 @@ TEST_F(BufferManagerTest, BatchesSmallFramesUntilEndStream) {
 // that write is in flight queue and coalesce into a single follow-up write. The
 // manager issues exactly one write at a time (asserted in the fake) and replays
 // the reassembled payload verbatim.
-TEST_F(BufferManagerTest, SerializesAndCoalescesQueuedWrites) {
+TEST_F(IngestionBufferManagerTest, SerializesAndCoalescesQueuedWrites) {
   resetManager(posting_factory_);
 
   // Each frame is exactly the flush threshold (WriteFlushThreshold == 64KiB), so
@@ -682,7 +683,7 @@ TEST_F(BufferManagerTest, SerializesAndCoalescesQueuedWrites) {
 // The terminal write is the store's commit signal. When the last data write has
 // already drained the backlog before endStream() arrives, the manager still
 // issues one zero-length write carrying end_stream, and replay waits for it.
-TEST_F(BufferManagerTest, EndStreamAfterDrainedBacklogIssuesTerminalWrite) {
+TEST_F(IngestionBufferManagerTest, EndStreamAfterDrainedBacklogIssuesTerminalWrite) {
   resetManager(posting_factory_);
 
   const std::string chunk(64 * 1024, 'x');
@@ -707,7 +708,7 @@ TEST_F(BufferManagerTest, EndStreamAfterDrainedBacklogIssuesTerminalWrite) {
 
 // endStream() while a data write is in flight is carried by one zero-length
 // follow-up write.
-TEST_F(BufferManagerTest, EndStreamDuringInFlightWriteIssuesOneTerminalWrite) {
+TEST_F(IngestionBufferManagerTest, EndStreamDuringInFlightWriteIssuesOneTerminalWrite) {
   resetManager(posting_factory_);
 
   const std::string chunk(64 * 1024, 'x');
@@ -727,7 +728,7 @@ TEST_F(BufferManagerTest, EndStreamDuringInFlightWriteIssuesOneTerminalWrite) {
 }
 
 // A last frame passed with end_stream is written once, carrying end_stream.
-TEST_F(BufferManagerTest, FinalFrameWithEndStreamIsWrittenOnce) {
+TEST_F(IngestionBufferManagerTest, FinalFrameWithEndStreamIsWrittenOnce) {
   resetManager(posting_factory_);
 
   const std::string chunk(64 * 1024, 'x');
@@ -749,7 +750,7 @@ TEST_F(BufferManagerTest, FinalFrameWithEndStreamIsWrittenOnce) {
 
 // A last frame passed with end_stream during an in-flight write goes down in the
 // follow-up write, which carries end_stream.
-TEST_F(BufferManagerTest, FinalFrameWithEndStreamDuringInFlightWriteFoldsIntoFollowUp) {
+TEST_F(IngestionBufferManagerTest, FinalFrameWithEndStreamDuringInFlightWriteFoldsIntoFollowUp) {
   resetManager(posting_factory_);
 
   const std::string chunk(64 * 1024, 'x');
@@ -773,7 +774,7 @@ TEST_F(BufferManagerTest, FinalFrameWithEndStreamDuringInFlightWriteFoldsIntoFol
 
 // An empty end_stream frame after the backlog has drained is a zero-length
 // terminal write.
-TEST_F(BufferManagerTest, EmptyFinalFrameAfterDrainedBacklogIssuesTerminalWrite) {
+TEST_F(IngestionBufferManagerTest, EmptyFinalFrameAfterDrainedBacklogIssuesTerminalWrite) {
   resetManager(posting_factory_);
 
   const std::string chunk(64 * 1024, 'x');
@@ -796,7 +797,7 @@ TEST_F(BufferManagerTest, EmptyFinalFrameAfterDrainedBacklogIssuesTerminalWrite)
 }
 
 // A small body passed with end_stream stays in memory and creates no store.
-TEST_F(BufferManagerTest, FinalFrameWithEndStreamWithinInMemoryTierCreatesNoStore) {
+TEST_F(IngestionBufferManagerTest, FinalFrameWithEndStreamWithinInMemoryTierCreatesNoStore) {
   manager_config_.max_in_memory_bytes = 1024;
   resetManager(posting_factory_);
 
@@ -813,7 +814,7 @@ TEST_F(BufferManagerTest, FinalFrameWithEndStreamWithinInMemoryTierCreatesNoStor
 }
 
 // Data after end of stream is reported and dropped.
-TEST_F(BufferManagerTest, DataAfterEndStreamIsReportedAndDropped) {
+TEST_F(IngestionBufferManagerTest, DataAfterEndStreamIsReportedAndDropped) {
   resetManager(posting_factory_);
 
   const std::string chunk(64 * 1024, 'x');
@@ -830,7 +831,7 @@ TEST_F(BufferManagerTest, DataAfterEndStreamIsReportedAndDropped) {
 
 // When the chain we replay into is backed up before replay starts, no data is
 // injected until the back-pressure is released.
-TEST_F(BufferManagerTest, ReplayPausesUnderBackPressure) {
+TEST_F(IngestionBufferManagerTest, ReplayPausesUnderBackPressure) {
   const std::string big(200 * 1024, 'x'); // > ReadChunkSize, multiple chunks.
   Buffer::OwnedImpl body(big);
   manager_->onData(body);
@@ -861,7 +862,7 @@ TEST_F(BufferManagerTest, ReplayPausesUnderBackPressure) {
 
 // Back-pressure arising mid-replay (the chain fills as we inject) halts the
 // synchronous read loop, and replay resumes when it clears.
-TEST_F(BufferManagerTest, ReplayResumesMidStream) {
+TEST_F(IngestionBufferManagerTest, ReplayResumesMidStream) {
   const std::string big(200 * 1024, 'x'); // 4 chunks of 64KiB + remainder.
   // The chain raises its replay high watermark right after the first injected
   // chunk; the loop must then stop until it is released.
@@ -892,7 +893,7 @@ TEST_F(BufferManagerTest, ReplayResumesMidStream) {
 
 // High watermark callbacks can nest (stream + connection); replay resumes only
 // after a matching number of low-watermark callbacks.
-TEST_F(BufferManagerTest, NestedWatermarksRequireBalancedRelease) {
+TEST_F(IngestionBufferManagerTest, NestedWatermarksRequireBalancedRelease) {
   const std::string big(200 * 1024, 'x');
   Buffer::OwnedImpl body(big);
   manager_->onData(body);
@@ -923,7 +924,7 @@ TEST_F(BufferManagerTest, NestedWatermarksRequireBalancedRelease) {
 
 // A write that fails fails the stream: the manager surfaces the unrecoverable
 // error through the bridge and injects nothing. A pending replay never starts.
-TEST_F(BufferManagerTest, WriteErrorFailsStream) {
+TEST_F(IngestionBufferManagerTest, WriteErrorFailsStream) {
   resetManager(write_failing_factory_);
 
   Buffer::OwnedImpl body("payload");
@@ -942,7 +943,7 @@ TEST_F(BufferManagerTest, WriteErrorFailsStream) {
 }
 
 // A read that fails during streamPayload returns DataLossError without injecting the failed chunk.
-TEST_F(BufferManagerTest, ReadErrorFailsStream) {
+TEST_F(IngestionBufferManagerTest, ReadErrorFailsStream) {
   resetManager(read_failing_factory_);
 
   Buffer::OwnedImpl body("payload");
@@ -961,7 +962,7 @@ TEST_F(BufferManagerTest, ReadErrorFailsStream) {
 
 // An external-buffer error delivered after onDestroy() is inert: the completion
 // handlers bail out and never touch the (detached) bridge.
-TEST_F(BufferManagerTest, ErrorAfterDestroyIsInert) {
+TEST_F(IngestionBufferManagerTest, ErrorAfterDestroyIsInert) {
   resetManager(write_failing_factory_);
 
   Buffer::OwnedImpl body("payload");
@@ -980,7 +981,7 @@ TEST_F(BufferManagerTest, ErrorAfterDestroyIsInert) {
 // With an asynchronous store, a replay resumed by a watermark drain while a read is
 // still in flight must not issue an overlapping read -- it waits for the in-flight
 // read to complete.
-TEST_F(BufferManagerTest, ResumeSkipsReadWhileOneInFlight) {
+TEST_F(IngestionBufferManagerTest, ResumeSkipsReadWhileOneInFlight) {
   resetManager(posting_factory_);
 
   const std::string big(200 * 1024, 'x'); // Multiple chunks.
@@ -1012,7 +1013,7 @@ TEST_F(BufferManagerTest, ResumeSkipsReadWhileOneInFlight) {
 
 // Inject injects small buffer data into the filter chain verbatim and triggers done
 // callback.
-TEST_F(BufferManagerTest, InjectsCallerDataVerbatim) {
+TEST_F(IngestionBufferManagerTest, InjectsCallerDataVerbatim) {
   Buffer::OwnedImpl body("{\"messages\":[\"hello\"]}");
   manager_->onData(body);
   manager_->endStream();
@@ -1033,7 +1034,7 @@ TEST_F(BufferManagerTest, InjectsCallerDataVerbatim) {
 }
 
 // Inject pauses when high watermark is hit and resumes when low watermark drains.
-TEST_F(BufferManagerTest, InjectRespectsWatermarkBackpressure) {
+TEST_F(IngestionBufferManagerTest, InjectRespectsWatermarkBackpressure) {
   Buffer::OwnedImpl body("initial");
   manager_->onData(body);
   manager_->endStream();
@@ -1068,7 +1069,7 @@ TEST_F(BufferManagerTest, InjectRespectsWatermarkBackpressure) {
 
 // Inject larger than the bridge's inject budget stops mid-drain, yields to the event
 // loop, and finishes on the continuation that refills the budget.
-TEST_F(BufferManagerTest, InjectYieldsWhenTheBudgetIsSpent) {
+TEST_F(IngestionBufferManagerTest, InjectYieldsWhenTheBudgetIsSpent) {
   Buffer::OwnedImpl body("initial");
   manager_->onData(body);
   manager_->endStream();
@@ -1096,7 +1097,7 @@ TEST_F(BufferManagerTest, InjectYieldsWhenTheBudgetIsSpent) {
 
 // A payload that stays within the in-memory limit never creates a store: it is replayed straight
 // out of the ingest queue, with no write and no read.
-TEST_F(BufferManagerTest, PayloadUnderTheInMemoryLimitSkipsStorage) {
+TEST_F(IngestionBufferManagerTest, PayloadUnderTheInMemoryLimitSkipsStorage) {
   manager_config_.max_in_memory_bytes = 1024;
   resetManager(posting_factory_);
 
@@ -1122,7 +1123,7 @@ TEST_F(BufferManagerTest, PayloadUnderTheInMemoryLimitSkipsStorage) {
 
 // Crossing the in-memory limit creates the store and offloads everything held up to that point,
 // so the replay comes back from storage.
-TEST_F(BufferManagerTest, CrossingTheInMemoryLimitOffloadsEverything) {
+TEST_F(IngestionBufferManagerTest, CrossingTheInMemoryLimitOffloadsEverything) {
   manager_config_.max_in_memory_bytes = 8;
   resetManager(posting_factory_);
 
@@ -1149,7 +1150,7 @@ TEST_F(BufferManagerTest, CrossingTheInMemoryLimitOffloadsEverything) {
 
 // Cancelling the stream coroutine handle cancels an in-flight external buffer read so late read
 // completions are dropped.
-TEST_F(BufferManagerTest, CancelTaskCancelsPendingExternalBufferStream) {
+TEST_F(IngestionBufferManagerTest, CancelTaskCancelsPendingExternalBufferStream) {
   resetManager(posting_factory_);
 
   Buffer::OwnedImpl body("message data for offload");
@@ -1174,7 +1175,7 @@ TEST_F(BufferManagerTest, CancelTaskCancelsPendingExternalBufferStream) {
 }
 
 // Cancelling the inject coroutine handle disarms scheduled callbacks so nothing is injected.
-TEST_F(BufferManagerTest, CancelTaskCancelsAPendingInject) {
+TEST_F(IngestionBufferManagerTest, CancelTaskCancelsAPendingInject) {
   Buffer::OwnedImpl inject_data("{\"modified\":true}");
   bool inject_done = false;
   launchInject(*writer_, inject_data, [&inject_done](absl::Status) { inject_done = true; });
@@ -1189,7 +1190,7 @@ TEST_F(BufferManagerTest, CancelTaskCancelsAPendingInject) {
 
 // If the coroutine context is cancelled synchronously during injectData, draining stops
 // immediately without touching subsequent chunks.
-TEST_F(BufferManagerTest, SynchronousCancelStopsAnInjectImmediately) {
+TEST_F(IngestionBufferManagerTest, SynchronousCancelStopsAnInjectImmediately) {
   Buffer::OwnedImpl body("initial");
   manager_->onData(body);
   manager_->endStream();
@@ -1212,7 +1213,7 @@ TEST_F(BufferManagerTest, SynchronousCancelStopsAnInjectImmediately) {
 }
 
 // If streamPayload is cancelled synchronously during injectData, emission stops immediately.
-TEST_F(BufferManagerTest, SynchronousCancelStopsExternalBufferStreamImmediately) {
+TEST_F(IngestionBufferManagerTest, SynchronousCancelStopsExternalBufferStreamImmediately) {
   const std::string big_payload(200 * 1024, 'z');
   Buffer::OwnedImpl body(big_payload);
   manager_->onData(body);
@@ -1233,9 +1234,10 @@ TEST_F(BufferManagerTest, SynchronousCancelStopsExternalBufferStreamImmediately)
   EXPECT_FALSE(replay_done);
 }
 
-// Destroying a spilled BufferManager while writes are in-flight or pending releases its unacked
-// byte count back to the bridge so ingest backpressure does not permanently deadlock the stream.
-TEST_F(BufferManagerTest, DestroyReleasesUnackedBytesAndUnpausesSource) {
+// Destroying a spilled IngestionBufferManager while writes are in-flight or pending releases its
+// unacked byte count back to the bridge so ingest backpressure does not permanently deadlock the
+// stream.
+TEST_F(IngestionBufferManagerTest, DestroyReleasesUnackedBytesAndUnpausesSource) {
   bridge_buffer_limit_ = 1024;
   PostingExternalBufferFactory posting_factory;
   resetManager(posting_factory);
@@ -1255,13 +1257,13 @@ TEST_F(BufferManagerTest, DestroyReleasesUnackedBytesAndUnpausesSource) {
   EXPECT_EQ(bridge_->resume_source_calls_, 1);
 }
 
-// If the FilterChainBridge is destroyed while a BufferManager and ChainWriter are still
+// If the FilterChainBridge is destroyed while an IngestionBufferManager and ChainWriter are still
 // alive, the bridge detaches all registered managers so subsequent destruction does not access the
 // destroyed bridge.
-TEST_F(BufferManagerTest, BridgeDestructionDetachesRegisteredManagers) {
+TEST_F(IngestionBufferManagerTest, BridgeDestructionDetachesRegisteredManagers) {
   auto local_bridge = std::make_unique<FakeBridge>(dispatcher_, 1024);
-  auto local_manager =
-      std::make_unique<BufferManager>(BufferManager::Config{}, factory_, *local_bridge);
+  auto local_manager = std::make_unique<IngestionBufferManager>(IngestionBufferManager::Config{},
+                                                                factory_, *local_bridge);
   auto local_writer = std::make_unique<ChainWriter>(*local_bridge);
 
   Buffer::OwnedImpl body("payload");
@@ -1276,19 +1278,19 @@ TEST_F(BufferManagerTest, BridgeDestructionDetachesRegisteredManagers) {
   local_manager.reset();
 }
 
-// Cancelling the coroutine context and destroying ChainWriter, BufferManager, and caller's
+// Cancelling the coroutine context and destroying ChainWriter, IngestionBufferManager, and caller's
 // PayloadReader handle synchronously inside injectData() must not cause stack UAF when the stream
 // coroutine unwinds.
-TEST_F(BufferManagerTest, SynchronousDeallocationDuringInjectDataDoesNotUAF) {
+TEST_F(IngestionBufferManagerTest, SynchronousDeallocationDuringInjectDataDoesNotUAF) {
   manager_config_.max_in_memory_bytes = 1024 * 1024;
-  BufferManagerPtr local_manager = makeManager(factory_);
+  IngestionBufferManagerPtr local_manager = makeManager(factory_);
   auto local_writer = std::make_unique<ChainWriter>(*bridge_);
 
   Buffer::OwnedImpl body("hello world");
   local_manager->onData(body);
   local_manager->endStream();
   PayloadReaderSharedPtr local_reader =
-      BufferManager::exportPayloadReader(std::move(local_manager));
+      IngestionBufferManager::exportPayloadReader(std::move(local_manager));
 
   bridge_->on_inject_ = [this, &local_writer, &local_reader]() {
     cancelActiveTask();
@@ -1305,13 +1307,13 @@ TEST_F(BufferManagerTest, SynchronousDeallocationDuringInjectDataDoesNotUAF) {
   EXPECT_EQ(bridge_->injected_.toString(), "hello world");
 }
 
-// Because PayloadReader is reference-counted and decoupled from BufferManager, dropping the
-// caller's PayloadReaderSharedPtr synchronously inside injectData() while ChainWriter stays alive
-// keeps the underlying PayloadReader alive until the active stream completes cleanly.
-TEST_F(BufferManagerTest,
+// Because PayloadReader is reference-counted and decoupled from IngestionBufferManager, dropping
+// the caller's PayloadReaderSharedPtr synchronously inside injectData() while ChainWriter stays
+// alive keeps the underlying PayloadReader alive until the active stream completes cleanly.
+TEST_F(IngestionBufferManagerTest,
        SynchronousManagerAndCallerHandleDropDuringInjectDataCompletesReplaySafely) {
   manager_config_.max_in_memory_bytes = 1024 * 1024;
-  BufferManagerPtr local_manager = makeManager(factory_);
+  IngestionBufferManagerPtr local_manager = makeManager(factory_);
   auto local_writer = std::make_unique<ChainWriter>(*bridge_);
 
   const std::string big(200 * 1024, 'a');
@@ -1319,7 +1321,7 @@ TEST_F(BufferManagerTest,
   local_manager->onData(body);
   local_manager->endStream();
   PayloadReaderSharedPtr local_reader =
-      BufferManager::exportPayloadReader(std::move(local_manager));
+      IngestionBufferManager::exportPayloadReader(std::move(local_manager));
 
   bool done_called = false;
   bridge_->on_inject_ = [&local_reader]() { local_reader.reset(); };
@@ -1336,7 +1338,7 @@ TEST_F(BufferManagerTest,
 
 // If a pending PayloadReader fails handoff while streamPayload is waiting for readability,
 // streamPayload aborts with DataLossError.
-TEST_F(BufferManagerTest, PayloadReaderWhenReadableErrorFailsStream) {
+TEST_F(IngestionBufferManagerTest, PayloadReaderWhenReadableErrorFailsStream) {
   PayloadReaderSharedPtr failing_reader = PayloadReader::createPendingExternal(10);
   bool done_called = false;
   launchStream(*writer_, *failing_reader, 0, 10,
@@ -1350,7 +1352,8 @@ TEST_F(BufferManagerTest, PayloadReaderWhenReadableErrorFailsStream) {
 
 // When injection has yielded for the per-iteration inject budget, a watermark cycle while parked on
 // the budget yield must not schedule a current-iteration callback.
-TEST_F(BufferManagerTest, WatermarkCycleWhileBudgetYieldedDoesNotScheduleCurrentIteration) {
+TEST_F(IngestionBufferManagerTest,
+       WatermarkCycleWhileBudgetYieldedDoesNotScheduleCurrentIteration) {
   manager_config_.max_in_memory_bytes = 1024 * 1024;
   resetManager(factory_);
 
@@ -1379,11 +1382,11 @@ TEST_F(BufferManagerTest, WatermarkCycleWhileBudgetYieldedDoesNotScheduleCurrent
 }
 
 // Write failure completion that triggers onUnrecoverableError() and drops the last external
-// BufferManagerPtr while onWriteComplete() is on the call stack must not cause UAF.
-TEST_F(BufferManagerTest, SynchronousDeallocationDuringWriteFailureDoesNotUAF) {
+// IngestionBufferManagerPtr while onWriteComplete() is on the call stack must not cause UAF.
+TEST_F(IngestionBufferManagerTest, SynchronousDeallocationDuringWriteFailureDoesNotUAF) {
   manager_config_.max_in_memory_bytes = 0;
   FailingExternalBufferFactory failing_factory(FailingExternalBuffer::FailMode::Write);
-  BufferManagerPtr local_manager = makeManager(failing_factory);
+  IngestionBufferManagerPtr local_manager = makeManager(failing_factory);
 
   bridge_->on_error_ = [&]() {
     bridge_->detachFromFilterChain();
@@ -1402,7 +1405,8 @@ TEST_F(BufferManagerTest, SynchronousDeallocationDuringWriteFailureDoesNotUAF) {
 // and resumeSource() synchronously triggers bridge_.detachFromFilterChain(), unregistering from
 // registered_managers_ before releaseUnacked() prevents an infinite loop in
 // detachFromFilterChain().
-TEST_F(BufferManagerTest, SynchronousDetachDuringResumeSourceInOnDestroyDoesNotInfiniteLoop) {
+TEST_F(IngestionBufferManagerTest,
+       SynchronousDetachDuringResumeSourceInOnDestroyDoesNotInfiniteLoop) {
   bridge_buffer_limit_ = 1024;
   PostingExternalBufferFactory posting_factory;
   resetManager(posting_factory);
@@ -1417,11 +1421,12 @@ TEST_F(BufferManagerTest, SynchronousDetachDuringResumeSourceInOnDestroyDoesNotI
   EXPECT_EQ(bridge_->resume_source_calls_, 1);
 }
 
-// When a BufferManager holds a sub-WriteFlushThreshold pending backlog (> low_watermark_) while
-// ingestPaused() is false, and a second charger (such as ScopedUnacked or another BufferManager)
-// subsequently pushes unacked_ over high_watermark_, the bridge notifies registered BufferManagers
-// to flush their pending backlog so unacked_ can fall back below low_watermark_.
-TEST_F(BufferManagerTest, SubThresholdPendingFlushedWhenExternalChargerPausesIngest) {
+// When an IngestionBufferManager holds a sub-WriteFlushThreshold pending backlog (> low_watermark_)
+// while ingestPaused() is false, and a second charger (such as ScopedUnacked or another
+// IngestionBufferManager) subsequently pushes unacked_ over high_watermark_, the bridge notifies
+// registered IngestionBufferManagers to flush their pending backlog so unacked_ can fall back below
+// low_watermark_.
+TEST_F(IngestionBufferManagerTest, SubThresholdPendingFlushedWhenExternalChargerPausesIngest) {
   // high_watermark = 40 KiB, low_watermark = 20 KiB, WriteFlushThreshold = 64 KiB.
   bridge_buffer_limit_ = 40 * 1024;
   PostingExternalBufferFactory posting_factory;
@@ -1449,10 +1454,11 @@ TEST_F(BufferManagerTest, SubThresholdPendingFlushedWhenExternalChargerPausesIng
   EXPECT_EQ(bridge_->resume_source_calls_, 1);
 }
 
-// When exportPayloadReader() leaves a still-flushing BufferManager self-owned, dropping the
-// PayloadReader causes the next write completion to skip any remaining backlog, release unacked
-// bytes, and destroy the manager without surfacing errors.
-TEST_F(BufferManagerTest, DroppingPendingPayloadReaderCleansUpSelfOwnedManagerOnWriteCompletion) {
+// When exportPayloadReader() leaves a still-flushing IngestionBufferManager self-owned, dropping
+// the PayloadReader causes the next write completion to skip any remaining backlog, release
+// unacked bytes, and destroy the manager without surfacing errors.
+TEST_F(IngestionBufferManagerTest,
+       DroppingPendingPayloadReaderCleansUpSelfOwnedManagerOnWriteCompletion) {
   bridge_buffer_limit_ = 1024;
   PostingExternalBufferFactory posting_factory;
   resetManager(posting_factory);
@@ -1464,7 +1470,7 @@ TEST_F(BufferManagerTest, DroppingPendingPayloadReaderCleansUpSelfOwnedManagerOn
   ASSERT_TRUE(bridge_->ingestPaused());
   ASSERT_EQ(posting_factory.last_->write_calls_, 1);
 
-  PayloadReaderSharedPtr reader = BufferManager::exportPayloadReader(std::move(manager_));
+  PayloadReaderSharedPtr reader = IngestionBufferManager::exportPayloadReader(std::move(manager_));
   ASSERT_EQ(manager_, nullptr);
   ASSERT_FALSE(reader->allBytesReadable());
   ASSERT_TRUE(bridge_->ingestPaused());
@@ -1480,20 +1486,21 @@ TEST_F(BufferManagerTest, DroppingPendingPayloadReaderCleansUpSelfOwnedManagerOn
   EXPECT_EQ(bridge_->error_calls_, 0);
 }
 
-// Detaching or destroying the bridge while a self-owned BufferManager is still flushing must
-// destroy the manager and fail the pending PayloadReader immediately, even if another holder
+// Detaching or destroying the bridge while a self-owned IngestionBufferManager is still flushing
+// must destroy the manager and fail the pending PayloadReader immediately, even if another holder
 // retains the PayloadReaderSharedPtr past the bridge's lifetime.
-TEST_F(BufferManagerTest, DetachingBridgeDestroysSelfOwnedManagerEvenWhileReaderSurvives) {
+TEST_F(IngestionBufferManagerTest, DetachingBridgeDestroysSelfOwnedManagerEvenWhileReaderSurvives) {
   PostingExternalBufferFactory posting_factory;
   auto local_bridge = std::make_unique<FakeBridge>(dispatcher_, /*buffer_limit=*/1024);
   auto local_manager =
-      std::make_unique<BufferManager>(manager_config_, posting_factory, *local_bridge);
+      std::make_unique<IngestionBufferManager>(manager_config_, posting_factory, *local_bridge);
 
   Buffer::OwnedImpl body(std::string(2048, 'a'));
   local_manager->onData(body, /*end_stream=*/true);
   ASSERT_TRUE(local_bridge->ingestPaused());
 
-  PayloadReaderSharedPtr reader = BufferManager::exportPayloadReader(std::move(local_manager));
+  PayloadReaderSharedPtr reader =
+      IngestionBufferManager::exportPayloadReader(std::move(local_manager));
   ASSERT_EQ(local_manager, nullptr);
   ASSERT_FALSE(reader->allBytesReadable());
 
@@ -1507,16 +1514,17 @@ TEST_F(BufferManagerTest, DetachingBridgeDestroysSelfOwnedManagerEvenWhileReader
   EXPECT_TRUE(reader->hasFailed());
 }
 
-// When a self-owned flushing BufferManager's write fails and triggers synchronous bridge
+// When a self-owned flushing IngestionBufferManager's write fails and triggers synchronous bridge
 // detachment and reader drop inside onUnrecoverableError(), onWriteComplete() must not UAF.
-TEST_F(BufferManagerTest, SelfOwnedWriteFailureWithSynchronousDetachDoesNotUAF) {
+TEST_F(IngestionBufferManagerTest, SelfOwnedWriteFailureWithSynchronousDetachDoesNotUAF) {
   manager_config_.max_in_memory_bytes = 0;
   FailingExternalBufferFactory failing_factory(FailingExternalBuffer::FailMode::Write);
-  BufferManagerPtr local_manager = makeManager(failing_factory);
+  IngestionBufferManagerPtr local_manager = makeManager(failing_factory);
 
   Buffer::OwnedImpl body(std::string(128 * 1024, 'x'));
   local_manager->onData(body, /*end_stream=*/true);
-  PayloadReaderSharedPtr reader = BufferManager::exportPayloadReader(std::move(local_manager));
+  PayloadReaderSharedPtr reader =
+      IngestionBufferManager::exportPayloadReader(std::move(local_manager));
   ASSERT_EQ(local_manager, nullptr);
 
   bridge_->on_error_ = [&]() {
@@ -1530,8 +1538,8 @@ TEST_F(BufferManagerTest, SelfOwnedWriteFailureWithSynchronousDetachDoesNotUAF) 
 }
 
 // A synchronous ExternalBuffer::write() failure triggered reentrantly from bridge_.addUnacked() ->
-// onIngestPaused() that destroys the BufferManager must not UAF when addUnacked() unwinds.
-TEST_F(BufferManagerTest, SynchronousWriteFailureDuringAddUnackedDoesNotUAF) {
+// onIngestPaused() that destroys the IngestionBufferManager must not UAF when addUnacked() unwinds.
+TEST_F(IngestionBufferManagerTest, SynchronousWriteFailureDuringAddUnackedDoesNotUAF) {
   class SyncFailingWriteBuffer : public ExternalBuffer {
   public:
     void write(Buffer::InstancePtr, bool, WriteCallback cb) override {
@@ -1552,7 +1560,7 @@ TEST_F(BufferManagerTest, SynchronousWriteFailureDuringAddUnackedDoesNotUAF) {
   bridge_buffer_limit_ = 1024;
   manager_config_.max_in_memory_bytes = 0;
   SyncFailingWriteFactory sync_failing_factory;
-  BufferManagerPtr local_manager = makeManager(sync_failing_factory);
+  IngestionBufferManagerPtr local_manager = makeManager(sync_failing_factory);
 
   bridge_->on_error_ = [&]() {
     bridge_->detachFromFilterChain();
@@ -1567,8 +1575,8 @@ TEST_F(BufferManagerTest, SynchronousWriteFailureDuringAddUnackedDoesNotUAF) {
 }
 
 // Calling onData() or endStream() after onDestroy() must drain the input and never resurrect an
-// ExternalBuffer on a destroyed BufferManager.
-TEST_F(BufferManagerTest, OnDataAndEndStreamAfterDestroyAreNoOps) {
+// ExternalBuffer on a destroyed IngestionBufferManager.
+TEST_F(IngestionBufferManagerTest, OnDataAndEndStreamAfterDestroyAreNoOps) {
   class CountingFactory : public ExternalBufferFactory {
   public:
     ExternalBufferPtr createBuffer(Event::Dispatcher& dispatcher) override {
@@ -1596,18 +1604,19 @@ TEST_F(BufferManagerTest, OnDataAndEndStreamAfterDestroyAreNoOps) {
 // Calling endStream() or onData(..., /*end_stream=*/true) followed by exportPayloadReader() after
 // a write failure or onDestroy() must return a failed PayloadReader without hitting
 // ASSERT(end_stream_seen_).
-TEST_F(BufferManagerTest, ExportAfterWriteFailureAndAfterDestroyReturnsFailedReader) {
+TEST_F(IngestionBufferManagerTest, ExportAfterWriteFailureAndAfterDestroyReturnsFailedReader) {
   manager_config_.max_in_memory_bytes = 0;
 
   // 1) After an async write failure + endStream().
   {
     FailingExternalBufferFactory failing_factory(FailingExternalBuffer::FailMode::Write);
-    BufferManagerPtr local_manager = makeManager(failing_factory);
+    IngestionBufferManagerPtr local_manager = makeManager(failing_factory);
     Buffer::OwnedImpl body(std::string(64 * 1024, 'x'));
     local_manager->onData(body);
     drain();
     local_manager->endStream();
-    PayloadReaderSharedPtr reader = BufferManager::exportPayloadReader(std::move(local_manager));
+    PayloadReaderSharedPtr reader =
+        IngestionBufferManager::exportPayloadReader(std::move(local_manager));
     ASSERT_NE(reader, nullptr);
     EXPECT_TRUE(reader->hasFailed());
     EXPECT_EQ(reader->length(), 64 * 1024);
@@ -1616,32 +1625,35 @@ TEST_F(BufferManagerTest, ExportAfterWriteFailureAndAfterDestroyReturnsFailedRea
   // 2) After an async write failure + onData(..., /*end_stream=*/true).
   {
     FailingExternalBufferFactory failing_factory(FailingExternalBuffer::FailMode::Write);
-    BufferManagerPtr local_manager = makeManager(failing_factory);
+    IngestionBufferManagerPtr local_manager = makeManager(failing_factory);
     Buffer::OwnedImpl chunk1(std::string(64 * 1024, 'x'));
     local_manager->onData(chunk1);
     drain();
     Buffer::OwnedImpl chunk2("tail");
     local_manager->onData(chunk2, /*end_stream=*/true);
     EXPECT_EQ(chunk2.length(), 0);
-    PayloadReaderSharedPtr reader = BufferManager::exportPayloadReader(std::move(local_manager));
+    PayloadReaderSharedPtr reader =
+        IngestionBufferManager::exportPayloadReader(std::move(local_manager));
     ASSERT_NE(reader, nullptr);
     EXPECT_TRUE(reader->hasFailed());
   }
 
   // 3) After onDestroy() + endStream().
   {
-    BufferManagerPtr local_manager = makeManager(factory_);
+    IngestionBufferManagerPtr local_manager = makeManager(factory_);
     local_manager->onDestroy();
     local_manager->endStream();
-    PayloadReaderSharedPtr reader = BufferManager::exportPayloadReader(std::move(local_manager));
+    PayloadReaderSharedPtr reader =
+        IngestionBufferManager::exportPayloadReader(std::move(local_manager));
     ASSERT_NE(reader, nullptr);
     EXPECT_TRUE(reader->hasFailed());
   }
 }
 
-// A synchronous ExternalBuffer::write(Ok) on a follow-up write of a self-owned BufferManager must
-// complete the PayloadReader handoff and tear down self_owner_ cleanly without UAF.
-TEST_F(BufferManagerTest, SynchronousWriteOkCompletesSelfOwnedFollowUpWrite) {
+// A synchronous ExternalBuffer::write(Ok) on a follow-up write of a self-owned
+// IngestionBufferManager must complete the PayloadReader handoff and tear down self_owner_ cleanly
+// without UAF.
+TEST_F(IngestionBufferManagerTest, SynchronousWriteOkCompletesSelfOwnedFollowUpWrite) {
   class HybridSyncOkBuffer : public ExternalBuffer {
   public:
     void write(Buffer::InstancePtr data, bool, WriteCallback cb) override {
@@ -1683,7 +1695,7 @@ TEST_F(BufferManagerTest, SynchronousWriteOkCompletesSelfOwnedFollowUpWrite) {
 
   HybridSyncOkFactory hybrid_factory;
   manager_config_.max_in_memory_bytes = 0;
-  BufferManagerPtr local_manager = makeManager(hybrid_factory);
+  IngestionBufferManagerPtr local_manager = makeManager(hybrid_factory);
 
   const std::string part1(64 * 1024, 'a');
   const std::string part2 = "tail-bytes";
@@ -1694,7 +1706,8 @@ TEST_F(BufferManagerTest, SynchronousWriteOkCompletesSelfOwnedFollowUpWrite) {
   Buffer::OwnedImpl b2(part2);
   local_manager->onData(b2, /*end_stream=*/true);
 
-  PayloadReaderSharedPtr reader = BufferManager::exportPayloadReader(std::move(local_manager));
+  PayloadReaderSharedPtr reader =
+      IngestionBufferManager::exportPayloadReader(std::move(local_manager));
   ASSERT_EQ(local_manager, nullptr);
   EXPECT_FALSE(reader->allBytesReadable());
 

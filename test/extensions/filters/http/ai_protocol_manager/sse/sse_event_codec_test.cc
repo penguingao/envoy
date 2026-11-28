@@ -5,10 +5,10 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/coroutine/dispatcher_executor.h"
 #include "source/common/coroutine/launch.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ingestion_buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event_codec.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_scanner.h"
 
@@ -420,8 +420,8 @@ TEST_F(SseEventDecoderTest, TrailingLineResolvedAtEndStreamCanFail) {
 
 // Exercises the paths that need somewhere to offload to: a frame that outgrows the in-memory tier,
 // and re-serialization of the references such a frame leaves behind. Both sides run against a real
-// BufferManager, so an offset the decoder records and the bytes the serializer replays for it have
-// to agree -- which is the whole point of the per-frame store.
+// IngestionBufferManager, so an offset the decoder records and the bytes the serializer replays for
+// it have to agree -- which is the whole point of the per-frame store.
 class SseCodecBufferTest : public SseEventDecoderTest {
 protected:
   SseCodecBufferTest()
@@ -808,11 +808,13 @@ TEST_F(SseCodecBufferTest, RejectsOutOfBoundsExternalRefViaChainWriter) {
 #endif
 
   SseEvent out_of_bounds_event;
-  auto store = std::make_unique<BufferManager>(BufferManager::Config{}, factory_, bridge_);
+  auto store =
+      std::make_unique<IngestionBufferManager>(IngestionBufferManager::Config{}, factory_, bridge_);
   Buffer::OwnedImpl short_data("12345");
   store->onData(short_data);
   store->endStream();
-  out_of_bounds_event.set_payload_reader(BufferManager::exportPayloadReader(std::move(store)));
+  out_of_bounds_event.set_payload_reader(
+      IngestionBufferManager::exportPayloadReader(std::move(store)));
   out_of_bounds_event.set_raw_data_ext_refs({JsonWithExtBuf::ExternalRef{0, 10}});
 
   absl::Status result = absl::OkStatus();
@@ -941,7 +943,8 @@ TEST_F(SseEventDecoderTest, ByteSizeReflectsInMemoryResidenceNotOffloadedStorage
   const std::string frame =
       absl::StrCat(": ", std::string(1024, 'c'), "\ndata: {\"text\":\"", big_text, "\"}\n\n");
 
-  // 1) In-memory BufferManager (max_in_memory_frame_bytes = 64 KiB, string threshold = 128 B):
+  // 1) In-memory IngestionBufferManager (max_in_memory_frame_bytes = 64 KiB, string threshold = 128
+  // B):
   //    payload_store_ and extras_store_ stay in memory, so byteSize() includes their lengths.
   {
     events_.clear();
@@ -956,7 +959,8 @@ TEST_F(SseEventDecoderTest, ByteSizeReflectsInMemoryResidenceNotOffloadedStorage
     EXPECT_GT(events_[0]->byteSize(), 5000u);
   }
 
-  // 2) Offloaded BufferManager (max_in_memory_frame_bytes = 256 B, string threshold = 128 B):
+  // 2) Offloaded IngestionBufferManager (max_in_memory_frame_bytes = 256 B, string threshold = 128
+  // B):
   //    payload_store_, extras_store_, and the 4 KiB JSON string are offloaded, so byteSize()
   //    reflects only the small in-memory overhead (< 512 bytes).
   {
@@ -1003,8 +1007,8 @@ TEST_F(SseEventDecoderTest, SynchronousWriteFailureDuringOnDataExportsFailedRead
   cfg.max_in_memory_frame_bytes = 64;
   SseEventDecoder decoder(cfg, failing_factory, bridge_);
 
-  // Each line exceeds BufferManager's 64 KiB WriteFlushThreshold so write() fires synchronously
-  // during onData() before finishFrame() calls endStream() -> exportPayloadReader().
+  // Each line exceeds IngestionBufferManager's 64 KiB WriteFlushThreshold so write() fires
+  // synchronously during onData() before finishFrame() calls endStream() -> exportPayloadReader().
   const std::string input =
       absl::StrCat(": ", std::string(70 * 1024, 'e'), "\ndata: ", std::string(70 * 1024, 'd'),
                    "\n\ndata: ", std::string(70 * 1024, 'z'), "\n\n");
