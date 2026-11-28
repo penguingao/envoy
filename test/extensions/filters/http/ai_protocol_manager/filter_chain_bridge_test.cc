@@ -141,12 +141,27 @@ TEST_F(DecoderFilterChainBridgeTest, CallbackRegisteredWhilePausedSeesThePause) 
   EXPECT_EQ(resumed_, 1);
 }
 
-// An unrecoverable buffer error is surfaced as a 500 local reply.
-TEST_F(DecoderFilterChainBridgeTest, UnrecoverableErrorSendsLocalReply) {
+// An unrecoverable buffer error increments stats and sends a 500 local reply at most once across
+// cascaded I/O failures.
+TEST_F(DecoderFilterChainBridgeTest, UnrecoverableErrorSendsLocalReplyOnce) {
+  EXPECT_FALSE(bridge_->hasUnrecoverableError());
   EXPECT_CALL(callbacks_, sendLocalReply(Http::Code::InternalServerError, _, _, _,
                                          "ai_protocol_manager_external_buffer_error"));
-  bridge_->onUnrecoverableError();
+  bridge_->notifyUnrecoverableError();
+  EXPECT_TRUE(bridge_->hasUnrecoverableError());
+  bridge_->notifyUnrecoverableError();
   EXPECT_EQ(stats_.request_external_buffer_error_.value(), 1);
+}
+
+// Once the bridge is detached, late unrecoverable errors must not emit local replies or stats.
+TEST_F(DecoderFilterChainBridgeTest, UnrecoverableErrorAfterDetachIsIgnored) {
+  EXPECT_CALL(callbacks_, removeUpstreamWatermarkCallbacks(Ref(*bridge_)));
+  bridge_->detachFromFilterChain();
+
+  EXPECT_CALL(callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+  bridge_->notifyUnrecoverableError();
+  EXPECT_FALSE(bridge_->hasUnrecoverableError());
+  EXPECT_EQ(stats_.request_external_buffer_error_.value(), 0);
 }
 
 // Both DownstreamFilterManager and UpstreamFilterManager fan the decoder's own high/low watermark
@@ -437,13 +452,37 @@ TEST_F(EncoderFilterChainBridgeEchoTest, NonEchoingResumeDoesNotDeadlockWrite) {
   EXPECT_EQ(resumed_, 1);
 }
 
-// On the response path the error is surfaced through the encoder callbacks' sendLocalReply
-// (best-effort, since the response may already be in flight).
-TEST_F(EncoderFilterChainBridgeTest, UnrecoverableErrorSendsLocalReply) {
+// On the response path the error surfaces a 500 local reply at most once.
+TEST_F(EncoderFilterChainBridgeTest, UnrecoverableErrorSendsLocalReplyOnce) {
+  EXPECT_FALSE(bridge_->hasUnrecoverableError());
   EXPECT_CALL(encoder_callbacks_, sendLocalReply(Http::Code::InternalServerError, _, _, _,
                                                  "ai_protocol_manager_external_buffer_error"));
-  bridge_->onUnrecoverableError();
+  bridge_->notifyUnrecoverableError();
+  EXPECT_TRUE(bridge_->hasUnrecoverableError());
+  bridge_->notifyUnrecoverableError();
   EXPECT_EQ(stats_.response_external_buffer_error_.value(), 1);
+}
+
+// Registering a client after detachFromFilterChain() has already run must immediately detach it
+// rather than leaving it registered on a detached bridge.
+TEST_F(DecoderFilterChainBridgeTest, RegisterClientAfterDetachImmediatelyDetachesClient) {
+  class CountingClient : public FilterChainBridge::Client {
+  public:
+    void onBridgeDetached() override { ++detached_calls; }
+    void onIngestPaused() override { ++paused_calls; }
+    int detached_calls{0};
+    int paused_calls{0};
+  };
+
+  bridge_->detachFromFilterChain();
+  CountingClient client;
+  bridge_->registerClient(client);
+  EXPECT_EQ(client.detached_calls, 1);
+
+  // Destroying the bridge must not call onBridgeDetached() a second time.
+  bridge_.reset();
+  EXPECT_EQ(client.detached_calls, 1);
+  EXPECT_EQ(client.paused_calls, 0);
 }
 
 } // namespace

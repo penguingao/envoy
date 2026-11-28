@@ -29,10 +29,10 @@ envoy_extension_cc_test(
     deps = [
         "//source/common/stream_info:stream_info_lib",
         "//source/extensions/filters/http/ai_protocol_manager:ai_filter_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:chain_writer_lib",
         "//source/extensions/filters/http/ai_protocol_manager:filter_manager_lib",
         "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:payload_reader_lib",
         "//source/extensions/http/ai_filters/common:sync_filter_lib",
         "//source/extensions/http/ai_filters/schema_validation:filter_lib",
         "//test/extensions/filters/http/ai_protocol_manager:fake_bridge_lib",

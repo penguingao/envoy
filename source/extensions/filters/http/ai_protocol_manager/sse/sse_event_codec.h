@@ -10,6 +10,7 @@
 
 #include "source/common/coroutine/task.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event.h"
@@ -161,7 +162,7 @@ private:
   std::vector<std::pair<uint64_t, uint64_t>> data_spans_;
 };
 
-// Writes an SseEvent back out as SSE bytes, through the BufferManager.
+// Writes an SseEvent back out as SSE bytes, through a ChainWriter.
 //
 // Re-serialization is canonical, not byte-preserving: fields are emitted in a fixed order and a
 // JSON payload is re-rendered compactly from the DOM. That is inherent to letting filters mutate
@@ -174,8 +175,8 @@ class SseEventSerializer {
 public:
   // Emits `event` and its terminating blank line through `out`. Awaits each piece, so only one
   // replay is ever in flight and the downstream chain's back-pressure reaches the producer. Bytes
-  // the event holds by reference are replayed from its own store, not from `out`.
-  static Coroutine::Task<absl::Status> serialize(SseEvent& event, BufferManager& out);
+  // the event holds by reference are read from its own store and emitted through `out`.
+  static Coroutine::Task<absl::Status> serialize(SseEvent& event, ChainWriter& out);
 };
 
 } // namespace AiProtocolManager

@@ -8,7 +8,9 @@
 #include "source/common/common/assert.h"
 #include "source/common/common/thread.h"
 #include "source/common/coroutine/status_macros.h"
-#include "source/extensions/filters/http/ai_protocol_manager/replay_awaitable.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/payload_reader.h"
+#include "source/extensions/filters/http/ai_protocol_manager/stream_payload.h"
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
@@ -40,7 +42,7 @@ enum class SerializationMode {
 
 class SerializerImpl {
 public:
-  SerializerImpl(BufferManager* out, BufferManager* ref_source, SerializationMode mode)
+  SerializerImpl(ChainWriter* out, PayloadReader* ref_source, SerializationMode mode)
       : out_(out), ref_source_(ref_source), mode_(mode) {}
 
   Coroutine::Task<absl::Status> serialize(const nlohmann::json& node, nlohmann::json& new_node) {
@@ -67,10 +69,10 @@ private:
       case SerializationMode::Emit:
         // TODO(penguingao): if the replay becomes too fragmented between
         // external buffer and re-serialization, we could change the interface to
-        // BufferManager take hint from the serializer's potential next replay
+        // PayloadReader take hint from the serializer's potential next replay
         // ranges, this way, it can then internally coalescing reads to save
         // I/O.
-        CO_RETURN_IF_ERROR(co_await ReplayAwaitable(*out_, small_buf_));
+        CO_RETURN_IF_ERROR(co_await out_->inject(small_buf_));
         break;
       case SerializationMode::Counting:
         small_buf_.drain(small_buf_.length());
@@ -85,7 +87,7 @@ private:
     ASSIGN_OR_CO_RETURN(const JsonWithExtBuf::ExternalRef ref, JsonWithExtBuf::externalRef(node));
     if (mode_ == SerializationMode::Emit) {
       if (ref_source_ == nullptr) {
-        co_return absl::InternalError("no buffer manager holds the bytes an ExternalRef names");
+        co_return absl::InternalError("no payload reader holds the bytes an ExternalRef names");
       }
       if (ref.offset > ref_source_->length() || ref.length > ref_source_->length() - ref.offset) {
         co_return absl::InvalidArgumentError(
@@ -101,7 +103,7 @@ private:
       byte_counter_ += ref.length;
       switch (mode_) {
       case SerializationMode::Emit:
-        CO_RETURN_IF_ERROR(co_await ReplayAwaitable(*ref_source_, ref.offset, ref.length));
+        CO_RETURN_IF_ERROR(co_await streamPayload(*ref_source_, ref.offset, ref.length, *out_));
         break;
       case SerializationMode::Counting:
         break;
@@ -190,8 +192,8 @@ private:
     co_return absl::OkStatus();
   }
 
-  BufferManager* out_{nullptr};
-  BufferManager* ref_source_{nullptr};
+  ChainWriter* out_{nullptr};
+  PayloadReader* ref_source_{nullptr};
   SerializationMode mode_{SerializationMode::Emit};
   Buffer::OwnedImpl small_buf_;
   uint64_t byte_counter_{0};
@@ -211,7 +213,7 @@ Serializer::calculateSerializedOffsets(const JsonWithExtBuf& doc) {
 }
 
 Coroutine::Task<absl::StatusOr<JsonWithExtBuf>>
-Serializer::serialize(const JsonWithExtBuf& doc, BufferManager* out, BufferManager* ref_source) {
+Serializer::serialize(const JsonWithExtBuf& doc, ChainWriter* out, PayloadReader* ref_source) {
   if (out == nullptr) {
     co_return absl::InvalidArgumentError("out must not be null for serialize");
   }

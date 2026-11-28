@@ -12,7 +12,9 @@
 #include "source/common/coroutine/async_queue.h"
 #include "source/common/coroutine/leaf_awaitable.h"
 #include "source/common/coroutine/status_macros.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_pipeline.h"
+#include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event_codec.h"
 #include "source/extensions/filters/http/ai_protocol_manager/task_group.h"
 
 #include "absl/status/statusor.h"
@@ -47,10 +49,9 @@ class ResponseAsyncState : public ResponseFilterManager::AsyncState,
                            public Logger::Loggable<Logger::Id::ai_protocol_manager> {
 public:
   ResponseAsyncState(std::vector<AiFilterSharedPtr> filters, FilterChainBridge& bridge,
-                     BufferManager& out_buffer_manager,
-                     ResponseFilterManager::OnCompleteFn on_complete)
+                     ChainWriter& writer, ResponseFilterManager::OnCompleteFn on_complete)
       : ResponseFilterManager::AsyncState(bridge.dispatcher()), filters_(std::move(filters)),
-        pipeline_(filters_.size()), bridge_(bridge), out_buffer_manager_(out_buffer_manager),
+        pipeline_(filters_.size()), bridge_(bridge), writer_(writer),
         on_complete_(std::move(on_complete)), remaining_stages_(filters_.size()) {}
 
   ~ResponseAsyncState() override { cancel(); }
@@ -179,7 +180,7 @@ protected:
   std::vector<AiFilterSharedPtr> filters_;
   FilterPipeline<Item> pipeline_;
   FilterChainBridge& bridge_;
-  BufferManager& out_buffer_manager_;
+  ChainWriter& writer_;
 
 private:
   struct PendingItem {
@@ -319,10 +320,10 @@ private:
 class SseAsyncState : public ResponseAsyncState<SseEventPtr> {
 public:
   SseAsyncState(std::vector<AiFilterSharedPtr> filters, ExternalBufferFactory& buffer_factory,
-                FilterChainBridge& bridge, BufferManager& out_buffer_manager,
+                FilterChainBridge& bridge, ChainWriter& writer,
                 ResponseFilterManager::OnCompleteFn on_complete,
                 SseEventDecoder::Config decoder_config)
-      : ResponseAsyncState(std::move(filters), bridge, out_buffer_manager, std::move(on_complete)),
+      : ResponseAsyncState(std::move(filters), bridge, writer, std::move(on_complete)),
         decoder_(decoder_config, buffer_factory, bridge) {}
 
   ~SseAsyncState() override { cancel(); }
@@ -341,7 +342,7 @@ protected:
   }
 
   Coroutine::Task<absl::Status> serializeItem(SseEventPtr item) override {
-    co_return co_await SseEventSerializer::serialize(*item, out_buffer_manager_);
+    co_return co_await SseEventSerializer::serialize(*item, writer_);
   }
 
   Coroutine::Task<absl::Status> finishSerialize() override { co_return absl::OkStatus(); }
@@ -394,10 +395,9 @@ private:
 class UnaryAsyncState : public ResponseAsyncState<std::vector<FlattenJsonField>> {
 public:
   UnaryAsyncState(std::vector<AiFilterSharedPtr> filters, FilterChainBridge& bridge,
-                  BufferManager& out_buffer_manager,
-                  ResponseFilterManager::OnCompleteFn on_complete)
-      : ResponseAsyncState(std::move(filters), bridge, out_buffer_manager, std::move(on_complete)),
-        serializer_(out_buffer_manager) {}
+                  ChainWriter& writer, ResponseFilterManager::OnCompleteFn on_complete)
+      : ResponseAsyncState(std::move(filters), bridge, writer, std::move(on_complete)),
+        serializer_(writer) {}
 
   ~UnaryAsyncState() override { cancel(); }
 
@@ -496,16 +496,14 @@ private:
 
 ResponseFilterManager::ResponseFilterManager(std::vector<AiFilterSharedPtr> filters,
                                              ExternalBufferFactory& buffer_factory,
-                                             FilterChainBridge& bridge,
-                                             BufferManager& out_buffer_manager,
+                                             FilterChainBridge& bridge, ChainWriter& writer,
                                              OnCompleteFn on_complete, Config config) {
   if (config.mode == Mode::Unary) {
-    async_state_ = std::make_shared<UnaryAsyncState>(std::move(filters), bridge, out_buffer_manager,
+    async_state_ = std::make_shared<UnaryAsyncState>(std::move(filters), bridge, writer,
                                                      std::move(on_complete));
   } else {
-    async_state_ =
-        std::make_shared<SseAsyncState>(std::move(filters), buffer_factory, bridge,
-                                        out_buffer_manager, std::move(on_complete), config.sse);
+    async_state_ = std::make_shared<SseAsyncState>(std::move(filters), buffer_factory, bridge,
+                                                   writer, std::move(on_complete), config.sse);
   }
 }
 

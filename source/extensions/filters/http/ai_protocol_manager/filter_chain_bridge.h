@@ -52,7 +52,13 @@ public:
 
   // Registers/unregisters an ingest client adapter on this path so detachFromFilterChain() can
   // detach all active stores on stream teardown.
-  void registerClient(Client& client) { registered_clients_.insert(&client); }
+  void registerClient(Client& client) {
+    if (detached_) {
+      client.onBridgeDetached();
+      return;
+    }
+    registered_clients_.insert(&client);
+  }
 
   void unregisterClient(Client& client) { registered_clients_.erase(&client); }
 
@@ -63,8 +69,16 @@ public:
   // concern.
   virtual void injectData(Buffer::Instance& data) PURE;
 
-  // Fails the stream after an unrecoverable external-buffer error.
-  virtual void onUnrecoverableError() PURE;
+  // Reports an unrecoverable external-buffer error to the bridge at most once per stream.
+  void notifyUnrecoverableError() {
+    if (!detached_ && !unrecoverable_error_reported_) {
+      unrecoverable_error_reported_ = true;
+      onUnrecoverableError();
+    }
+  }
+
+  // True once notifyUnrecoverableError() has fired for this path.
+  bool hasUnrecoverableError() const { return unrecoverable_error_reported_; }
 
   // Reports bytes an ingest client has accepted but not yet made durable. The bridge sums them
   // across clients and pauses the data source once the total reaches high_watermark_.
@@ -138,6 +152,9 @@ protected:
   void onBelowWriteWatermark();
 
 private:
+  // Fails the stream after an unrecoverable external-buffer error.
+  virtual void onUnrecoverableError() PURE;
+
   // Pushes ingest back-pressure toward the data source (the filter's own write-buffer high/low
   // watermark on this path).
   virtual void pauseSource() PURE;
@@ -162,6 +179,7 @@ private:
   // Tracked so each crossing pauses or resumes the source exactly once.
   bool source_paused_{false};
   bool detached_{false};
+  bool unrecoverable_error_reported_{false};
 
   // Depth of unmatched write high-watermark callbacks. The connection manager may raise the
   // watermark more than once (stream and connection), so injection resumes only when this returns
@@ -199,7 +217,6 @@ public:
   void injectData(Buffer::Instance& data) override {
     callbacks_.injectDecodedDataToFilterChain(data, /*end_stream=*/false);
   }
-  void onUnrecoverableError() override;
 
   // Http::UpstreamWatermarkCallbacks (write side: upstream back-pressure).
   void onAboveWriteBufferHighWatermark() override { onAboveWriteWatermark(); }
@@ -207,6 +224,7 @@ public:
 
 private:
   // FilterChainBridge
+  void onUnrecoverableError() override;
   void pauseSource() override { callbacks_.onDecoderFilterAboveWriteBufferHighWatermark(); }
   void resumeSource() override { callbacks_.onDecoderFilterBelowWriteBufferLowWatermark(); }
   void unsubscribeWriteWatermarks() override { callbacks_.removeUpstreamWatermarkCallbacks(*this); }
@@ -237,7 +255,6 @@ public:
   void injectData(Buffer::Instance& data) override {
     encoder_callbacks_.injectEncodedDataToFilterChain(data, /*end_stream=*/false);
   }
-  void onUnrecoverableError() override;
 
   // Http::DownstreamWatermarkCallbacks (write side: downstream back-pressure).
   void onAboveWriteBufferHighWatermark() override { onAboveWriteWatermark(); }
@@ -245,6 +262,7 @@ public:
 
 private:
   // FilterChainBridge
+  void onUnrecoverableError() override;
   void pauseSource() override { encoder_callbacks_.onEncoderFilterAboveWriteBufferHighWatermark(); }
   void resumeSource() override { encoder_callbacks_.onEncoderFilterBelowWriteBufferLowWatermark(); }
   void unsubscribeWriteWatermarks() override {

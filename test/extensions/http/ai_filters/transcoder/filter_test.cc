@@ -13,7 +13,7 @@
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/flattening_json_codec.h"
@@ -51,7 +51,7 @@ using HttpFilters::AiProtocolManager::AiRequestPtr;
 using HttpFilters::AiProtocolManager::AiRequestReceiver;
 using HttpFilters::AiProtocolManager::AiResponseStreamPropagator;
 using HttpFilters::AiProtocolManager::AiResponseStreamReceiver;
-using HttpFilters::AiProtocolManager::BufferManager;
+using HttpFilters::AiProtocolManager::ChainWriter;
 using HttpFilters::AiProtocolManager::FakeBridge;
 using HttpFilters::AiProtocolManager::FieldPathSegment;
 using HttpFilters::AiProtocolManager::FilterManager;
@@ -146,13 +146,11 @@ class TranscoderFilterTest : public testing::Test {
 public:
   TranscoderFilterTest()
       : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test")),
-        bridge_(*dispatcher_), buffer_manager_(BufferManager::Config{}, factory_, bridge_),
+        bridge_(*dispatcher_), writer_(bridge_),
         connection_filter_state_(std::make_shared<StreamInfo::FilterStateImpl>(
             StreamInfo::FilterState::LifeSpan::Connection)),
         stream_info_(api_->timeSource(), nullptr, StreamInfo::FilterState::LifeSpan::FilterChain,
                      connection_filter_state_) {}
-
-  ~TranscoderFilterTest() override { buffer_manager_.onDestroy(); }
 
   TranscoderFilterConfigSharedPtr makeConfig(
       TranscoderProto::Direction request_handling,
@@ -188,7 +186,7 @@ public:
     doc.setJson(nlohmann::json::parse(payload));
 
     manager.startRequest(
-        std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+        std::move(doc), &writer_, /*payload_reader=*/nullptr, *dispatcher_, stream_info_,
         [this](absl::Status s) {
           status_ = std::move(s);
           completed_ = true;
@@ -227,7 +225,7 @@ public:
 
   std::string runResponse(FilterManager& manager, const std::string& body, bool sse) {
     FakeBridge bridge(*dispatcher_);
-    BufferManager out(BufferManager::Config{}, factory_, bridge);
+    ChainWriter out(bridge);
     absl::Status status;
     bool done = false;
     const auto on_done = [&](absl::Status s) {
@@ -246,9 +244,7 @@ public:
     }
     EXPECT_TRUE(done);
     EXPECT_TRUE(status.ok()) << status;
-    const std::string wire = bridge.injected_.toString();
-    out.onDestroy();
-    return wire;
+    return bridge.injected_.toString();
   }
 
   uint64_t counterValue(const std::string& name) {
@@ -281,7 +277,7 @@ public:
   Event::DispatcherPtr dispatcher_;
   InMemoryExternalBufferFactory factory_;
   FakeBridge bridge_;
-  BufferManager buffer_manager_;
+  ChainWriter writer_;
   // The downstream connection's filter state, which every stream on the connection shares.
   StreamInfo::FilterStateSharedPtr connection_filter_state_;
   StreamInfo::StreamInfoImpl stream_info_;
@@ -1253,7 +1249,7 @@ public:
     FilterManager manager({std::make_shared<TranscoderFilter>(config, context)});
     InMemoryExternalBufferFactory factory;
     FakeBridge bridge(*dispatcher_);
-    BufferManager out(BufferManager::Config{}, factory, bridge);
+    ChainWriter out(bridge);
     absl::Status status;
     bool done = false;
     const auto on_done = [&](absl::Status s) {
@@ -1276,7 +1272,6 @@ public:
     EXPECT_TRUE(status.ok()) << status;
 
     const std::string wire = bridge.injected_.toString();
-    out.onDestroy();
     return sse ? fromSseWire(wire) : nlohmann::json::parse(wire);
   }
 

@@ -6,6 +6,8 @@
 #include "source/common/coroutine/dispatcher_executor.h"
 #include "source/common/coroutine/launch.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event_codec.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_scanner.h"
@@ -66,14 +68,20 @@ protected:
     return absl::OkStatus();
   }
 
-  // The bytes an event's extras store holds. Only valid for a frame small enough that the store
-  // never offloaded, which is every frame in this fixture.
+  // The bytes an event's extras reader holds.
   std::string extras(const SseEvent& event) {
-    if (event.extras_store() == nullptr) {
+    if (event.extras_reader() == nullptr) {
       return {};
     }
-    const Buffer::Instance* bytes = event.extras_store()->inMemoryBytes();
-    return bytes == nullptr ? std::string() : bytes->toString();
+    auto executor = std::make_shared<Coroutine::DispatcherExecutor>(*dispatcher_);
+    absl::StatusOr<Buffer::InstancePtr> chunk_or = absl::UnknownError("pending");
+    auto handle = Coroutine::launch(
+        event.extras_reader()->readChunk(0, event.extras_reader()->length()), executor,
+        [&chunk_or](absl::StatusOr<Buffer::InstancePtr> res) { chunk_or = std::move(res); },
+        Coroutine::StartMode::Inline);
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    EXPECT_THAT(chunk_or.status(), IsOk());
+    return chunk_or.ok() ? (*chunk_or)->toString() : std::string();
   }
 
   Api::ApiPtr api_;
@@ -323,7 +331,7 @@ TEST_F(SseEventDecoderTest, LeadingUtf8BomIsStripped) {
 
   ASSERT_EQ(events_.size(), 1);
   EXPECT_EQ(events_[0]->raw_data_as_string(), "x");
-  EXPECT_EQ(events_[0]->extras_store(), nullptr);
+  EXPECT_EQ(events_[0]->extras_reader(), nullptr);
 }
 
 // The BOM is three bytes, so it can straddle a chunk boundary like any other terminator.
@@ -333,7 +341,7 @@ TEST_F(SseEventDecoderTest, Utf8BomSplitAcrossChunksIsStripped) {
 
   ASSERT_EQ(events_.size(), 1);
   EXPECT_EQ(events_[0]->raw_data_as_string(), "x");
-  EXPECT_EQ(events_[0]->extras_store(), nullptr);
+  EXPECT_EQ(events_[0]->extras_reader(), nullptr);
 }
 
 // A stream opening on a BOM prefix that turns out to be something else: the bytes withheld while
@@ -417,7 +425,7 @@ TEST_F(SseEventDecoderTest, TrailingLineResolvedAtEndStreamCanFail) {
 class SseCodecBufferTest : public SseEventDecoderTest {
 protected:
   SseCodecBufferTest()
-      : buffer_manager_(BufferManager::Config{}, factory_, bridge_),
+      : out_writer_(bridge_),
         executor_(std::make_shared<Coroutine::DispatcherExecutor>(*dispatcher_)) {}
 
   void drain() {
@@ -439,7 +447,7 @@ protected:
   std::string serialize(SseEvent& event) {
     absl::Status result = absl::UnknownError("never completed");
     Coroutine::DetachedHandle handle = Coroutine::launch(
-        SseEventSerializer::serialize(event, buffer_manager_), executor_,
+        SseEventSerializer::serialize(event, out_writer_), executor_,
         [&result](absl::Status status) { result = std::move(status); },
         Coroutine::StartMode::Inline);
     drain();
@@ -450,9 +458,9 @@ protected:
     return out;
   }
 
-  // bridge_ and factory_ live in the base, so they are constructed before buffer_manager_ and
+  // bridge_ and factory_ live in the base, so they are constructed before out_writer_ and
   // destroyed after it.
-  BufferManager buffer_manager_;
+  ChainWriter out_writer_;
   std::shared_ptr<Coroutine::DispatcherExecutor> executor_;
 };
 
@@ -678,8 +686,8 @@ TEST_F(SseCodecBufferTest, SpilledUnknownFieldRoundTrips) {
   ASSERT_THAT(feed(decoder, absl::StrCat("x-big: ", value, "\ndata: p\n\n")), IsOk());
 
   ASSERT_EQ(events_.size(), 1);
-  ASSERT_NE(events_[0]->extras_store(), nullptr);
-  EXPECT_EQ(events_[0]->extras_store()->inMemoryBytes(), nullptr) << "extras did not spill";
+  ASSERT_NE(events_[0]->extras_reader(), nullptr);
+  EXPECT_LT(events_[0]->byteSize(), sizeof(SseEvent) + value.size()) << "extras did not spill";
 
   EXPECT_EQ(serialize(*events_[0]), absl::StrCat("x-big: ", value, "\ndata: p\n\n"));
 }
@@ -790,9 +798,9 @@ TEST_F(SseEventDecoderTest, FrameExceedingMaxMetadataFieldsFails) {
   EXPECT_EQ(status.code(), absl::StatusCode::kResourceExhausted);
 }
 
-// ExternalRef ranges in raw_data_ext_refs() assert non-null payload_store and are range-checked by
-// ReplayAwaitable.
-TEST_F(SseCodecBufferTest, RejectsOutOfBoundsExternalRefViaReplayAwaitable) {
+// ExternalRef ranges in raw_data_ext_refs() assert non-null payload_reader and are range-checked by
+// ChainWriter.
+TEST_F(SseCodecBufferTest, RejectsOutOfBoundsExternalRefViaChainWriter) {
 #if !defined(NDEBUG)
   SseEvent null_store_event;
   null_store_event.set_raw_data_ext_refs({JsonWithExtBuf::ExternalRef{0, 10}});
@@ -800,16 +808,16 @@ TEST_F(SseCodecBufferTest, RejectsOutOfBoundsExternalRefViaReplayAwaitable) {
 #endif
 
   SseEvent out_of_bounds_event;
-  auto store = std::make_shared<BufferManager>(BufferManager::Config{}, factory_, bridge_);
+  auto store = std::make_unique<BufferManager>(BufferManager::Config{}, factory_, bridge_);
   Buffer::OwnedImpl short_data("12345");
   store->onData(short_data);
   store->endStream();
-  out_of_bounds_event.set_payload_store(std::move(store));
+  out_of_bounds_event.set_payload_reader(BufferManager::exportPayloadReader(std::move(store)));
   out_of_bounds_event.set_raw_data_ext_refs({JsonWithExtBuf::ExternalRef{0, 10}});
 
   absl::Status result = absl::OkStatus();
   Coroutine::DetachedHandle handle = Coroutine::launch(
-      SseEventSerializer::serialize(out_of_bounds_event, buffer_manager_), executor_,
+      SseEventSerializer::serialize(out_of_bounds_event, out_writer_), executor_,
       [&result](absl::Status status) { result = std::move(status); }, Coroutine::StartMode::Inline);
   drain();
   EXPECT_EQ(result.code(), absl::StatusCode::kInvalidArgument);
@@ -840,7 +848,7 @@ TEST_F(SseCodecBufferTest, SynchronousStreamResetDuringSerializationDoesNotUAF) 
 
   absl::Status result = absl::OkStatus();
   handle = Coroutine::launch(
-      SseEventSerializer::serialize(*events_[0], buffer_manager_), executor_,
+      SseEventSerializer::serialize(*events_[0], out_writer_), executor_,
       [&result](absl::Status status) { result = std::move(status); }, Coroutine::StartMode::Inline);
   drain();
   EXPECT_TRUE(events_.empty());
@@ -943,8 +951,8 @@ TEST_F(SseEventDecoderTest, ByteSizeReflectsInMemoryResidenceNotOffloadedStorage
     SseEventDecoder decoder = makeDecoder(cfg);
     ASSERT_THAT(feed(decoder, frame), IsOk());
     ASSERT_EQ(events_.size(), 1);
-    ASSERT_NE(events_[0]->payload_store(), nullptr);
-    ASSERT_NE(events_[0]->payload_store()->inMemoryBytes(), nullptr);
+    ASSERT_NE(events_[0]->payload_reader(), nullptr);
+    ASSERT_NE(events_[0]->extras_reader(), nullptr);
     EXPECT_GT(events_[0]->byteSize(), 5000u);
   }
 
@@ -959,11 +967,58 @@ TEST_F(SseEventDecoderTest, ByteSizeReflectsInMemoryResidenceNotOffloadedStorage
     SseEventDecoder decoder = makeDecoder(cfg);
     ASSERT_THAT(feed(decoder, frame), IsOk());
     ASSERT_EQ(events_.size(), 1);
-    ASSERT_NE(events_[0]->payload_store(), nullptr);
-    EXPECT_EQ(events_[0]->payload_store()->inMemoryBytes(), nullptr);
-    EXPECT_EQ(events_[0]->extras_store()->inMemoryBytes(), nullptr);
+    ASSERT_NE(events_[0]->payload_reader(), nullptr);
+    ASSERT_NE(events_[0]->extras_reader(), nullptr);
     EXPECT_LT(events_[0]->byteSize(), 512u);
   }
+}
+
+// A synchronous ExternalBuffer::write() failure during SseEventDecoder::onData() that detaches the
+// bridge must allow finishFrame() to export failed PayloadReaders without hitting
+// ASSERT(end_stream_seen_), and subsequent frames in the same buffer must not allocate new buffers.
+TEST_F(SseEventDecoderTest, SynchronousWriteFailureDuringOnDataExportsFailedReaderWithoutAborting) {
+  class SyncFailingWriteBuffer : public ExternalBuffer {
+  public:
+    void write(Buffer::InstancePtr, bool, WriteCallback cb) override {
+      cb(ExternalBufferStatus::Error);
+    }
+    void read(uint64_t, uint64_t, ReadCallback cb) override {
+      cb(ExternalBufferStatus::Error, nullptr);
+    }
+    uint64_t length() const override { return 0; }
+  };
+  class SyncFailingWriteFactory : public ExternalBufferFactory {
+  public:
+    ExternalBufferPtr createBuffer(Event::Dispatcher&) override {
+      ++create_calls;
+      return std::make_unique<SyncFailingWriteBuffer>();
+    }
+    int create_calls{0};
+  };
+
+  SyncFailingWriteFactory failing_factory;
+  bridge_.on_error_ = [this]() { bridge_.detachFromFilterChain(); };
+
+  SseEventDecoder::Config cfg;
+  cfg.max_in_memory_frame_bytes = 64;
+  SseEventDecoder decoder(cfg, failing_factory, bridge_);
+
+  // Each line exceeds BufferManager's 64 KiB WriteFlushThreshold so write() fires synchronously
+  // during onData() before finishFrame() calls endStream() -> exportPayloadReader().
+  const std::string input =
+      absl::StrCat(": ", std::string(70 * 1024, 'e'), "\ndata: ", std::string(70 * 1024, 'd'),
+                   "\n\ndata: ", std::string(70 * 1024, 'z'), "\n\n");
+  ASSERT_THAT(feed(decoder, input), IsOk());
+
+  EXPECT_EQ(bridge_.error_calls_, 1);
+  EXPECT_EQ(failing_factory.create_calls, 1);
+  ASSERT_EQ(events_.size(), 2);
+  ASSERT_NE(events_[0]->extras_reader(), nullptr);
+  EXPECT_TRUE(events_[0]->extras_reader()->hasFailed());
+  ASSERT_NE(events_[0]->payload_reader(), nullptr);
+  EXPECT_TRUE(events_[0]->payload_reader()->hasFailed());
+  ASSERT_NE(events_[1]->payload_reader(), nullptr);
+  EXPECT_TRUE(events_[1]->payload_reader()->hasFailed());
 }
 
 } // namespace

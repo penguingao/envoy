@@ -7,8 +7,9 @@
 #include "envoy/buffer/buffer.h"
 
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event_codec.h"
 
 #include "absl/functional/any_invocable.h"
@@ -25,7 +26,7 @@ namespace AiProtocolManager {
 // relative to the request path. Incoming response bytes fed via onData() are buffered and
 // accounted against the stream's FilterChainBridge watermarks, decoded into response items by the
 // active response mode (e.g. SSE frames), passed through the filter pipeline, and re-serialized
-// into the output BufferManager.
+// into `writer`.
 //
 // Lifetime: owns a shared_ptr<AsyncState> so coroutines can safely suspend across asynchronous
 // operations; cancel() and destruction safely tear down the pipeline at any point.
@@ -47,7 +48,7 @@ public:
 
   ResponseFilterManager(std::vector<AiFilterSharedPtr> filters,
                         ExternalBufferFactory& buffer_factory, FilterChainBridge& bridge,
-                        BufferManager& out_buffer_manager, OnCompleteFn on_complete, Config config);
+                        ChainWriter& writer, OnCompleteFn on_complete, Config config);
   ~ResponseFilterManager();
 
   // Starts the response filter pipeline and sink coroutines.

@@ -1,6 +1,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/filter.h"
 
 #include <memory>
+#include <utility>
 
 #include "envoy/common/exception.h"
 #include "envoy/data/ai/v3/token_usage.pb.h"
@@ -9,17 +10,23 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/utility.h"
 #include "source/common/config/utility.h"
+#include "source/common/coroutine/dispatcher_executor.h"
+#include "source/common/coroutine/launch.h"
 #include "source/common/grpc/common.h"
 #include "source/common/http/header_utility.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
+#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
+#include "source/extensions/filters/http/ai_protocol_manager/stream_payload.h"
 
+#include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
@@ -257,23 +264,25 @@ absl::StatusOr<FilterConfigSharedPtr> FilterConfig::create(
 }
 
 void AiProtocolManagerFilter::onDestroy() {
+  if (std::optional<Coroutine::DetachedHandle> handle = std::move(passthrough_handle_);
+      handle.has_value()) {
+    handle->cancel();
+  }
+  if (encode_bridge_ != nullptr) {
+    encode_bridge_->detachFromFilterChain();
+  }
+  if (filter_manager_ != nullptr) {
+    filter_manager_->cancel();
+  }
   if (decode_bridge_ != nullptr) {
-    // Detach the bridge first so all registered BufferManagers on this path are detached and
-    // their callbacks disarmed before cancelling coroutines in filter_manager_.
+    // Detach the bridge so all registered BufferManagers on this path are detached and
+    // their callbacks disarmed.
     decode_bridge_->detachFromFilterChain();
   }
   if (decode_manager_ != nullptr) {
     decode_manager_->onDestroy();
   }
-  if (encode_bridge_ != nullptr) {
-    encode_bridge_->detachFromFilterChain();
-  }
-  if (encode_manager_ != nullptr) {
-    encode_manager_->onDestroy();
-  }
-  if (filter_manager_ != nullptr) {
-    filter_manager_->cancel();
-  }
+  decode_reader_.reset();
 }
 
 Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers,
@@ -351,11 +360,12 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   decode_bridge_ =
       std::make_unique<DecoderFilterChainBridge>(*decoder_callbacks_, config_->stats());
   // A request small enough that the chain would have buffered it anyway is held in memory and
-  // replayed from there, so it costs no storage IO at all. Past that the chain would have pushed
+  // forwarded from there, so it costs no storage IO at all. Past that the chain would have pushed
   // back, which is exactly the point at which offloading starts to pay for itself.
-  decode_manager_ = std::make_shared<BufferManager>(
+  decode_manager_ = std::make_unique<BufferManager>(
       BufferManager::Config{decoder_callbacks_->decoderBufferLimit()}, config_->bufferFactory(),
       *decode_bridge_);
+  decode_writer_ = std::make_unique<ChainWriter>(*decode_bridge_);
 
   // Pin the headers so routing and admission filters do not act on them before
   // the payload is offloaded. decodeData() still fires while iteration is stopped
@@ -428,6 +438,10 @@ void AiProtocolManagerFilter::rejectInvalidPayload(const absl::Status& status) {
   ENVOY_LOG(debug, "ai_protocol_manager: rejecting request: {}", status.message());
   payload_rejected_ = true;
   request_parser_.reset();
+  if (decode_bridge_ != nullptr) {
+    decode_bridge_->detachFromFilterChain();
+  }
+  decode_reader_.reset();
   decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, status.message(), nullptr,
                                      std::nullopt, "ai_protocol_manager_invalid_json");
 }
@@ -438,29 +452,28 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
     // decodeHeaders() decided this stream is none of our business.
     return Http::FilterDataStatus::Continue;
   }
-  if (payload_rejected_) {
+  if (decodeRejected()) {
     // Already terminated by the local reply; drop whatever is still in flight.
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
-  if (request_parser_ != nullptr) {
-    // The framing promised a body but no byte of one arrived -- a chunked request
-    // whose only chunk is the terminator, or an empty terminal DATA frame. There
-    // is no payload to validate, so the request passes through, the same as one
-    // that ended on its headers. The parser has been fed nothing exactly when the
-    // manager has been given nothing, since every frame reaches both.
-    if (end_stream && data.length() == 0 && decode_manager_->empty()) {
-      request_parser_.reset();
-    } else if (!feedParser(data, end_stream)) {
-      return Http::FilterDataStatus::StopIterationNoBuffer;
-    }
+  // The framing promised a body but no byte of one arrived -- a chunked request
+  // whose only chunk is the terminator, or an empty terminal DATA frame. There
+  // is no payload to validate or forward, so let the headers and terminal frame flow.
+  if (end_stream && data.length() == 0 && decode_manager_->empty()) {
+    request_parser_.reset();
+    return Http::FilterDataStatus::Continue;
+  }
+
+  if (request_parser_ != nullptr && !feedParser(data, end_stream)) {
+    return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
   decode_manager_->onData(data, end_stream);
   if (end_stream) {
     finalizeDecode(/*has_trailers=*/false);
   }
-  // Hold the chain here; the BufferManager replays the payload once told to.
+  // Hold the chain here until the payload is forwarded into decode_writer_.
   return Http::FilterDataStatus::StopIterationNoBuffer;
 }
 
@@ -468,10 +481,10 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
   if (decode_manager_ == nullptr) {
     return Http::FilterTrailersStatus::Continue;
   }
-  if (payload_rejected_) {
+  if (decodeRejected()) {
     return Http::FilterTrailersStatus::StopIteration;
   }
-  // A trailer-only request (no body) has nothing to replay; let the trailers flow.
+  // A trailer-only request (no body) has nothing to forward; let the trailers flow.
   if (decode_manager_->empty()) {
     return Http::FilterTrailersStatus::Continue;
   }
@@ -486,41 +499,58 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
   }
 
   finalizeDecode(/*has_trailers=*/true);
-  // Hold the trailers behind the replayed body until the replay-done callback
+  // Hold the trailers behind the forwarded body until the completion callback
   // above releases them.
   return Http::FilterTrailersStatus::StopIteration;
 }
 
 void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
   decode_manager_->endStream();
+  if (decodeRejected()) {
+    // A synchronous ExternalBuffer::write() failure during the terminal onData() or endStream()
+    // already sent the 500 local reply via DecoderFilterChainBridge::onUnrecoverableError().
+    return;
+  }
+  decode_reader_ = BufferManager::exportPayloadReader(std::move(decode_manager_));
   auto on_complete = [this, has_trailers](absl::Status status) {
+    if (decodeRejected()) {
+      return;
+    }
     if (!status.ok()) {
-      ENVOY_LOG(error, "ai_protocol_manager: replay failed: {}", status.message());
-      if (!payload_rejected_) {
+      if (absl::IsCancelled(status)) {
+        return;
+      }
+      ENVOY_LOG(error, "ai_protocol_manager: request pipeline failed: {}", status.message());
+      if (absl::IsDataLoss(status) && decode_bridge_ != nullptr) {
+        decode_bridge_->notifyUnrecoverableError();
+      } else {
         payload_rejected_ = true;
+        if (decode_bridge_ != nullptr) {
+          decode_bridge_->detachFromFilterChain();
+        }
+        decode_reader_.reset();
         decoder_callbacks_->sendLocalReply(Http::Code::BadGateway, status.message(), nullptr,
                                            std::nullopt, "ai_protocol_manager_replay_error");
       }
       return;
     }
     if (has_trailers) {
-      // Body fully replayed; release the held trailers (they carry END_STREAM) so
+      // Body fully forwarded; release the held trailers (they carry END_STREAM) so
       // they follow the body in order.
       decoder_callbacks_->continueDecoding();
     } else {
-      // Terminate the stream with an empty end_stream data frame after the replayed
-      // body (also releases the held headers when the body was empty).
+      // Terminate the stream with an empty end_stream data frame after the forwarded body.
       Buffer::OwnedImpl end_marker;
       decoder_callbacks_->injectDecodedDataToFilterChain(end_marker, /*end_stream=*/true);
     }
   };
 
-  if (request_parsed_ && !payload_rejected_) {
+  if (request_parsed_) {
     ASSERT(request_headers_ != nullptr);
     const AiFilterContext context{.stream_info = decoder_callbacks_->streamInfo(),
                                   .request_headers = *request_headers_,
                                   .request_protocol = request_protocol_,
-                                  .request_payload_bytes = decode_manager_->length(),
+                                  .request_payload_bytes = decode_reader_->length(),
                                   .response_protocol = route_response_protocol_,
                                   .request_binding = route_request_binding_,
                                   .response_binding = route_response_binding_};
@@ -548,18 +578,30 @@ void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
     // behave differently.
     filter_manager_ = std::make_unique<FilterManager>(std::move(filters));
     filter_manager_->startRequest(
-        std::move(request_json_), decode_manager_.get(), decoder_callbacks_->dispatcher(),
-        decoder_callbacks_->streamInfo(), std::move(on_complete), request_headers_,
+        std::move(request_json_), decode_writer_.get(), decode_reader_.get(),
+        decoder_callbacks_->dispatcher(), decoder_callbacks_->streamInfo(), std::move(on_complete),
+        request_headers_,
         [this](Http::Code code, std::string details) {
+          if (decodeRejected()) {
+            return;
+          }
           ENVOY_LOG(debug, "ai_protocol_manager: rejecting request via local reply: {} {}",
                     static_cast<uint32_t>(code), details);
           payload_rejected_ = true;
+          if (decode_bridge_ != nullptr) {
+            decode_bridge_->detachFromFilterChain();
+          }
+          decode_reader_.reset();
           decoder_callbacks_->sendLocalReply(code, details, nullptr, std::nullopt,
                                              "ai_protocol_manager_filter_rejected");
         },
         config_->alwaysSerializeRequest(), request_protocol_);
   } else {
-    decode_manager_->replay(0, decode_manager_->length(), std::move(on_complete));
+    auto executor =
+        std::make_shared<Coroutine::DispatcherExecutor>(decoder_callbacks_->dispatcher());
+    passthrough_handle_ = Coroutine::launch(
+        streamPayload(*decode_reader_, 0, decode_reader_->length(), *decode_writer_),
+        std::move(executor), std::move(on_complete), Coroutine::StartMode::Inline);
   }
 }
 
@@ -599,7 +641,7 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
   // A response runs the AI filters when its request was an AI call: a declared endpoint, or one
   // whose API a filter named.
   const bool can_filter_response =
-      filter_manager_ != nullptr && !payload_rejected_ &&
+      filter_manager_ != nullptr && !decodeRejected() &&
       (isAiEndpoint() || filter_state_request_api != LLMProtocol::Unspecified);
 
   if (!can_filter_response && !want_token_usage) {
@@ -649,16 +691,14 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
     headers.removeContentLength();
     encode_bridge_ = std::make_unique<EncoderFilterChainBridge>(
         *encoder_callbacks_, *decoder_callbacks_, config_->stats());
-    encode_manager_ = std::make_shared<BufferManager>(
-        BufferManager::Config{encoder_callbacks_->encoderBufferLimit()}, config_->bufferFactory(),
-        *encode_bridge_);
+    encode_writer_ = std::make_unique<ChainWriter>(*encode_bridge_);
     if (is_sse) {
       filter_manager_->startSseResponse(
-          config_->bufferFactory(), *encode_bridge_, *encode_manager_,
+          config_->bufferFactory(), *encode_bridge_, *encode_writer_,
           [this](absl::Status status) { onEncodeComplete(std::move(status)); });
     } else if (is_json) {
       filter_manager_->startUnaryResponse(
-          config_->bufferFactory(), *encode_bridge_, *encode_manager_,
+          config_->bufferFactory(), *encode_bridge_, *encode_writer_,
           [this](absl::Status status) { onEncodeComplete(std::move(status)); });
     }
   }
@@ -725,8 +765,8 @@ Http::FilterDataStatus AiProtocolManagerFilter::encodeData(Buffer::Instance& dat
     }
   }
 
-  if (encode_manager_ != nullptr) {
-    if (encode_rejected_) {
+  if (encode_writer_ != nullptr) {
+    if (encodeRejected()) {
       data.drain(data.length());
       return Http::FilterDataStatus::StopIterationNoBuffer;
     }
@@ -749,8 +789,8 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::encodeTrailers(Http::Respons
     finalizeResponseHandling();
   }
 
-  if (encode_manager_ != nullptr) {
-    if (encode_rejected_) {
+  if (encode_writer_ != nullptr) {
+    if (encodeRejected()) {
       return Http::FilterTrailersStatus::StopIteration;
     }
     encode_has_trailers_ = true;
@@ -766,10 +806,21 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::encodeTrailers(Http::Respons
 }
 
 void AiProtocolManagerFilter::onEncodeComplete(absl::Status status) {
+  if (encodeRejected()) {
+    return;
+  }
   if (!status.ok()) {
+    if (absl::IsCancelled(status)) {
+      return;
+    }
     ENVOY_LOG(error, "ai_protocol_manager: response filter chain failed: {}", status.message());
-    if (!encode_rejected_) {
+    if (absl::IsDataLoss(status) && encode_bridge_ != nullptr) {
+      encode_bridge_->notifyUnrecoverableError();
+    } else {
       encode_rejected_ = true;
+      if (encode_bridge_ != nullptr) {
+        encode_bridge_->detachFromFilterChain();
+      }
       encoder_callbacks_->sendLocalReply(Http::Code::BadGateway, status.message(), nullptr,
                                          std::nullopt, "ai_protocol_manager_response_error");
     }

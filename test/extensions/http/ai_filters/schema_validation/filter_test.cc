@@ -7,8 +7,7 @@
 
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
-#include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/http/ai_filters/common/sync_filter.h"
@@ -32,10 +31,9 @@ namespace {
 using HttpFilters::AiProtocolManager::AiFilterContext;
 using HttpFilters::AiProtocolManager::AiFilterSharedPtr;
 using HttpFilters::AiProtocolManager::AiRequest;
-using HttpFilters::AiProtocolManager::BufferManager;
+using HttpFilters::AiProtocolManager::ChainWriter;
 using HttpFilters::AiProtocolManager::FakeBridge;
 using HttpFilters::AiProtocolManager::FilterManager;
-using HttpFilters::AiProtocolManager::InMemoryExternalBufferFactory;
 using HttpFilters::AiProtocolManager::JsonWithExtBuf;
 using HttpFilters::AiProtocolManager::LLMProtocol;
 using HttpFilters::AiProtocolManager::LocalReplier;
@@ -61,10 +59,8 @@ class SchemaValidationFilterTest : public testing::Test {
 public:
   SchemaValidationFilterTest()
       : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test")),
-        bridge_(*dispatcher_), buffer_manager_(BufferManager::Config{}, factory_, bridge_),
+        bridge_(*dispatcher_), writer_(bridge_),
         stream_info_(api_->timeSource(), nullptr, StreamInfo::FilterState::LifeSpan::FilterChain) {}
-
-  ~SchemaValidationFilterTest() override { buffer_manager_.onDestroy(); }
 
   void run(JsonWithExtBuf doc, LLMProtocol declared_protocol,
            absl::string_view path = "/v1/chat/completions") {
@@ -81,7 +77,7 @@ public:
     FilterManager manager(std::move(filters));
 
     manager.startRequest(
-        std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+        std::move(doc), &writer_, /*payload_reader=*/nullptr, *dispatcher_, stream_info_,
         [this](absl::Status status) { status_ = std::move(status); }, &request_headers_,
         [this](Http::Code code, std::string details) {
           reply_code_ = code;
@@ -124,9 +120,8 @@ public:
 
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
-  InMemoryExternalBufferFactory factory_;
   FakeBridge bridge_;
-  BufferManager buffer_manager_;
+  ChainWriter writer_;
   StreamInfo::StreamInfoImpl stream_info_;
   NiceMock<Stats::MockIsolatedStatsStore> stats_store_;
   Http::TestRequestHeaderMapImpl request_headers_;

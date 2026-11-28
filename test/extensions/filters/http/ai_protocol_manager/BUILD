@@ -115,8 +115,14 @@ envoy_extension_cc_test(
     deps = [
         ":fake_bridge_lib",
         "//source/common/buffer:buffer_lib",
+        "//source/common/coroutine:dispatcher_executor_lib",
+        "//source/common/coroutine:launch_lib",
         "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:chain_writer_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:external_buffer_interface",
+        "//source/extensions/filters/http/ai_protocol_manager:payload_reader_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:stream_payload_lib",
         "//test/mocks/event:event_mocks",
         "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",
@@ -160,6 +166,7 @@ envoy_extension_cc_test(
     deps = [
         "//envoy/http:codes_interface",
         "//source/common/buffer:buffer_lib",
+        "//source/common/coroutine:leaf_awaitable_lib",
         "//source/common/coroutine:status_macros_lib",
         "//source/extensions/filters/http/ai_protocol_manager:ai_filter_state_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
@@ -212,23 +219,6 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
-    name = "replay_awaitable_test",
-    srcs = ["replay_awaitable_test.cc"],
-    extension_names = ["envoy.filters.http.ai_protocol_manager"],
-    deps = [
-        ":fake_bridge_lib",
-        "//source/common/buffer:buffer_lib",
-        "//source/common/coroutine:dispatcher_executor_lib",
-        "//source/common/coroutine:launch_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:replay_awaitable_lib",
-        "//test/test_common:status_utility_lib",
-        "//test/test_common:utility_lib",
-    ],
-)
-
-envoy_extension_cc_test(
     name = "serializer_test",
     srcs = ["serializer_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],
@@ -238,8 +228,10 @@ envoy_extension_cc_test(
         "//source/common/coroutine:dispatcher_executor_lib",
         "//source/common/coroutine:launch_lib",
         "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:chain_writer_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
         "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:payload_reader_lib",
         "//source/extensions/filters/http/ai_protocol_manager:serializer_lib",
         "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",
@@ -316,8 +308,7 @@ envoy_extension_cc_test(
         "//source/common/coroutine:dispatcher_executor_lib",
         "//source/common/coroutine:launch_lib",
         "//source/common/coroutine:status_macros_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:chain_writer_lib",
         "//source/extensions/filters/http/ai_protocol_manager:flattening_json_codec_lib",
         "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",
@@ -338,8 +329,10 @@ envoy_extension_cc_test(
         "//source/common/coroutine:status_macros_lib",
         "//source/common/stream_info:stream_info_lib",
         "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:chain_writer_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
         "//source/extensions/filters/http/ai_protocol_manager:filter_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:payload_reader_lib",
         "//source/extensions/filters/http/ai_protocol_manager:serializer_lib",
         "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",
@@ -497,7 +490,7 @@ envoy_extension_cc_test(
     deps = [
         ":fake_bridge_lib",
         "//source/common/buffer:buffer_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:chain_writer_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
         "//source/extensions/filters/http/ai_protocol_manager:response_filter_manager_lib",
         "//test/test_common:status_utility_lib",

@@ -10,8 +10,8 @@
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
+#include "source/extensions/filters/http/ai_protocol_manager/payload_reader.h"
 
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
@@ -225,15 +225,24 @@ public:
 
   // Holds the payload bytes that json()'s ExternalRefs and raw_data_ext_refs() name. Owned by the
   // event, so those references stay valid exactly as long as the event does; null when the frame
-  // left none behind. Offsets are relative to this store, which holds only this frame.
-  BufferManager* payload_store() const { return payload_store_.get(); }
-  void set_payload_store(BufferManagerPtr store) { payload_store_ = std::move(store); }
+  // left none behind. Offsets are relative to this reader, which holds only this frame.
+  // `in_memory_bytes` records how many of the reader's bytes reside in memory (0 if offloaded)
+  // for watermark accounting in byteSize().
+  PayloadReader* payload_reader() const { return payload_reader_.get(); }
+  void set_payload_reader(PayloadReaderSharedPtr reader, uint64_t in_memory_bytes = 0) {
+    payload_reader_ = std::move(reader);
+    payload_in_memory_bytes_ = payload_reader_ != nullptr ? in_memory_bytes : 0;
+  }
 
   // The frame's comment lines and field lines that this codec does not model, verbatim and in
-  // arrival order, terminators included; null when the frame carried none. The store holds nothing
-  // else, so the bytes to write back out are its whole range.
-  BufferManager* extras_store() const { return extras_store_.get(); }
-  void set_extras_store(BufferManagerPtr store) { extras_store_ = std::move(store); }
+  // arrival order, terminators included; null when the frame carried none. The reader holds nothing
+  // else, so the bytes to write back out are its whole range. `in_memory_bytes` records how many
+  // of the reader's bytes reside in memory (0 if offloaded) for watermark accounting in byteSize().
+  PayloadReader* extras_reader() const { return extras_reader_.get(); }
+  void set_extras_reader(PayloadReaderSharedPtr reader, uint64_t in_memory_bytes = 0) {
+    extras_reader_ = std::move(reader);
+    extras_in_memory_bytes_ = extras_reader_ != nullptr ? in_memory_bytes : 0;
+  }
 
   // How the frame was terminated on the wire (BlankLine by default).
   enum class Termination {
@@ -255,19 +264,14 @@ public:
   bool blank_line_terminated() const { return termination_ == Termination::BlankLine; }
 
   // Estimated in-memory byte size of this event for watermark accounting.
-  // Stores that have offloaded to external storage (inMemoryBytes() == nullptr) contribute 0
-  // here because their bytes do not reside in memory.
+  // Readers that have offloaded to external storage contribute 0 here because their bytes do not
+  // reside in memory.
   uint64_t byteSize() const {
     uint64_t size = sizeof(SseEvent);
     for (const auto& field : metadata_) {
       size += sizeof(MetadataField) + field.value.size();
     }
-    if (extras_store_ != nullptr && extras_store_->inMemoryBytes() != nullptr) {
-      size += extras_store_->inMemoryBytes()->length();
-    }
-    if (payload_store_ != nullptr && payload_store_->inMemoryBytes() != nullptr) {
-      size += payload_store_->inMemoryBytes()->length();
-    }
+    size += extras_in_memory_bytes_ + payload_in_memory_bytes_;
     if (is_json_) {
       size += json_payload_bytes_;
     } else {
@@ -286,8 +290,10 @@ private:
   // Never null; replaced wholesale by set_raw_data().
   Buffer::InstancePtr raw_data_;
   std::vector<JsonWithExtBuf::ExternalRef> raw_data_ext_refs_;
-  BufferManagerPtr payload_store_;
-  BufferManagerPtr extras_store_;
+  PayloadReaderSharedPtr payload_reader_;
+  uint64_t payload_in_memory_bytes_{0};
+  PayloadReaderSharedPtr extras_reader_;
+  uint64_t extras_in_memory_bytes_{0};
 };
 
 using SseEventPtr = std::unique_ptr<SseEvent>;

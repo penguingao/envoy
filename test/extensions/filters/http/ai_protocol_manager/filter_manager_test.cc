@@ -11,6 +11,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_request.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
@@ -35,8 +36,13 @@ class FilterManagerTest : public testing::Test {
 public:
   FilterManagerTest()
       : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test")), factory_(),
-        bridge_(*dispatcher_), buffer_manager_(BufferManager::Config{}, factory_, bridge_),
+        bridge_(*dispatcher_), payload_reader_(makeEmptyPayloadReader()), writer_(bridge_),
         stream_info_(api_->timeSource(), nullptr, StreamInfo::FilterState::LifeSpan::FilterChain) {}
+
+  static PayloadReaderSharedPtr makeEmptyPayloadReader() {
+    Buffer::OwnedImpl empty;
+    return PayloadReader::fromInMemory(empty);
+  }
 
   void drain() {
     for (int i = 0; i < 20; ++i) {
@@ -47,9 +53,10 @@ public:
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
   InMemoryExternalBufferFactory factory_;
-  // Declared before buffer_manager_ so it outlives the manager that references it.
+  // Declared before writer_ so it outlives it.
   FakeBridge bridge_;
-  BufferManager buffer_manager_;
+  PayloadReaderSharedPtr payload_reader_;
+  ChainWriter writer_;
   StreamInfo::StreamInfoImpl stream_info_;
 };
 
@@ -64,7 +71,7 @@ TEST_F(FilterManagerTest, ZeroFilterPassThrough) {
   absl::Status status;
   bool completed = false;
 
-  manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager.startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                        [&status, &completed](absl::Status s) {
                          status = std::move(s);
                          completed = true;
@@ -110,7 +117,7 @@ TEST_F(FilterManagerTest, SingleFilterMutation) {
 
   absl::Status status;
   bool completed = false;
-  manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager.startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                        [&status, &completed](absl::Status s) {
                          status = std::move(s);
                          completed = true;
@@ -159,7 +166,7 @@ TEST_F(FilterManagerTest, MultiFilterPipeline) {
 
   absl::Status status;
   bool completed = false;
-  manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager.startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                        [&status, &completed](absl::Status s) {
                          status = std::move(s);
                          completed = true;
@@ -194,7 +201,7 @@ TEST_F(FilterManagerTest, FilterErrorPropagation) {
 
   absl::Status status;
   bool completed = false;
-  manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager.startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                        [&status, &completed](absl::Status s) {
                          status = std::move(s);
                          completed = true;
@@ -228,7 +235,7 @@ TEST_F(FilterManagerTest, FilterBypassEarlyReturnPassesThrough) {
 
   absl::Status status;
   bool completed = false;
-  manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager.startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                        [&status, &completed](absl::Status s) {
                          status = std::move(s);
                          completed = true;
@@ -263,7 +270,7 @@ TEST_F(FilterManagerTest, FilterConsumedWithoutPropagationFails) {
 
   absl::Status status;
   bool completed = false;
-  manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager.startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                        [&status, &completed](absl::Status s) {
                          status = std::move(s);
                          completed = true;
@@ -299,7 +306,7 @@ TEST_F(FilterManagerTest, FilterLocalReply) {
   absl::Status status;
   bool completed = false;
   manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+      std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
       [&status, &completed](absl::Status s) {
         status = std::move(s);
         completed = true;
@@ -332,7 +339,7 @@ TEST_F(FilterManagerTest, FilterErrorTriggersLocalReply) {
   absl::Status status;
   bool completed = false;
   manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+      std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
       [&status, &completed](absl::Status s) {
         status = std::move(s);
         completed = true;
@@ -362,7 +369,7 @@ TEST_F(FilterManagerTest, FilterLocalReplyWithoutLocalReplyFnInvokesCompletionWi
   absl::Status status;
   bool completed = false;
   manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+      std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
       [&status, &completed](absl::Status s) {
         status = std::move(s);
         completed = true;
@@ -420,7 +427,7 @@ TEST_F(FilterManagerTest, SynchronousFilterErrorStopsSubsequentFilterLaunches) {
 
   absl::Status status;
   bool completed = false;
-  manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager.startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                        [&status, &completed](absl::Status s) {
                          status = std::move(s);
                          completed = true;
@@ -449,7 +456,7 @@ TEST_F(FilterManagerTest, SynchronousFilterLocalReplyStopsSubsequentFilterLaunch
   absl::Status status;
   bool completed = false;
   manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+      std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
       [&status, &completed](absl::Status s) {
         status = std::move(s);
         completed = true;
@@ -475,7 +482,7 @@ TEST_F(FilterManagerTest, CancelCancelsCoroutines) {
   filters.push_back(std::make_unique<TestFieldAdderFilter>());
 
   auto manager = std::make_unique<FilterManager>(std::move(filters));
-  manager->startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager->startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                         [](absl::Status) {});
 
   manager->cancel();
@@ -524,7 +531,7 @@ TEST_F(FilterManagerTest, DestructWhileSuspendedIsSafe) {
   auto manager = std::make_unique<FilterManager>(std::move(filters));
 
   bool completed = false;
-  manager->startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager->startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                         [&completed](absl::Status) { completed = true; });
   drain();
 
@@ -628,8 +635,8 @@ TEST_F(FilterManagerTest, FilterNullPropagationFails) {
       {
         absl::Status status;
         bool completed = false;
-        manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
-                             [&status, &completed](absl::Status s) {
+        manager.startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_,
+                             stream_info_, [&status, &completed](absl::Status s) {
                                status = std::move(s);
                                completed = true;
                              });
@@ -653,7 +660,7 @@ TEST_F(FilterManagerTest, SetsContentLengthOnRequestHeaders) {
   absl::Status status;
   bool completed = false;
   manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+      std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
       [&status, &completed](absl::Status s) {
         status = std::move(s);
         completed = true;
@@ -683,7 +690,7 @@ TEST_F(FilterManagerTest, SetsContentLengthOnRequestHeadersAfterMutation) {
   absl::Status status;
   bool completed = false;
   manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+      std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
       [&status, &completed](absl::Status s) {
         status = std::move(s);
         completed = true;
@@ -718,9 +725,12 @@ public:
 
   // Buffers the body as the AI Protocol Manager does before parsing it.
   JsonWithExtBuf receive() {
+    auto buffer_manager =
+        std::make_unique<BufferManager>(BufferManager::Config{}, factory_, bridge_);
     Buffer::OwnedImpl data(kReceived);
-    buffer_manager_.onData(data);
-    buffer_manager_.endStream();
+    buffer_manager->onData(data);
+    buffer_manager->endStream();
+    payload_reader_ = BufferManager::exportPayloadReader(std::move(buffer_manager));
     JsonWithExtBuf doc;
     doc.setJson(nlohmann::json::parse(kReceived));
     return doc;
@@ -732,7 +742,7 @@ public:
     FilterManager manager(std::move(filters));
     absl::Status status = absl::UnknownError("request did not complete");
     manager.startRequest(
-        receive(), &buffer_manager_, *dispatcher_, stream_info_,
+        receive(), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
         [&status](absl::Status s) { status = std::move(s); }, &headers_,
         /*local_reply_fn=*/nullptr, always_serialize);
     drain();
@@ -782,7 +792,7 @@ TEST_F(FilterManagerTest, DoesNotSetContentLengthWhenNotPreviouslyPresent) {
   absl::Status status;
   bool completed = false;
   manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+      std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
       [&status, &completed](absl::Status s) {
         status = std::move(s);
         completed = true;
@@ -830,7 +840,7 @@ TEST_F(FilterManagerTest, FilterOutlivesManagerUntilItsCoroutineCompletes) {
   filters.push_back(std::make_shared<OutlivingFilter>(queue, seen, destroyed));
   auto manager = std::make_unique<FilterManager>(std::move(filters));
   bool completed = false;
-  manager->startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager->startRequest(std::move(doc), &writer_, payload_reader_.get(), *dispatcher_, stream_info_,
                         [&completed](absl::Status s) { completed = s.ok(); });
   drain();
   ASSERT_TRUE(completed);
@@ -890,16 +900,16 @@ TEST_F(FilterManagerTest, RequestAndResponseShareFilterInstancesInReverseOrder) 
   JsonWithExtBuf req_doc;
   req_doc.setJson(nlohmann::json{{"model", "gpt-4"}});
   bool req_completed = false;
-  manager.startRequest(std::move(req_doc), &buffer_manager_, *dispatcher_, stream_info_,
-                       [&req_completed](absl::Status s) { req_completed = s.ok(); });
+  manager.startRequest(std::move(req_doc), &writer_, payload_reader_.get(), *dispatcher_,
+                       stream_info_, [&req_completed](absl::Status s) { req_completed = s.ok(); });
   drain();
   ASSERT_TRUE(req_completed);
   EXPECT_EQ(trace, (std::vector<std::string>{"decode:A", "decode:B"}));
 
   FakeBridge resp_bridge(*dispatcher_);
-  BufferManager resp_out_manager(BufferManager::Config{}, factory_, resp_bridge);
+  ChainWriter resp_out_writer(resp_bridge);
   bool resp_completed = false;
-  manager.startSseResponse(factory_, resp_bridge, resp_out_manager,
+  manager.startSseResponse(factory_, resp_bridge, resp_out_writer,
                            [&resp_completed](absl::Status s) { resp_completed = s.ok(); });
 
   Buffer::OwnedImpl sse_input;
@@ -914,8 +924,6 @@ TEST_F(FilterManagerTest, RequestAndResponseShareFilterInstancesInReverseOrder) 
       nlohmann::json::parse(resp_output.substr(6, resp_output.size() - 8));
   EXPECT_EQ(parsed_resp["A_saw_model"], "gpt-4");
   EXPECT_EQ(parsed_resp["B_saw_model"], "gpt-4");
-
-  resp_out_manager.onDestroy();
 }
 
 } // namespace

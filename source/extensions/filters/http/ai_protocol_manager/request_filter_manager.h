@@ -12,8 +12,9 @@
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_request.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
+#include "source/extensions/filters/http/ai_protocol_manager/payload_reader.h"
 
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
@@ -26,8 +27,8 @@ namespace AiProtocolManager {
 // Runs the configured AI filters over a request payload index.
 //
 // Owned and managed by FilterManager for the decode path. Filters execute in forward order
-// (0..N-1). Once all filters propagate the request, the sink writes it out through the stream's
-// BufferManager: the re-serialized document, or the received body when `always_serialize` is
+// (0..N-1). Once all filters propagate the request, the sink writes it out through `writer`: the
+// re-serialized document, or the received body from `payload_reader` when `always_serialize` is
 // false.
 class RequestFilterManager : public Logger::Loggable<Logger::Id::ai_protocol_manager> {
 public:
@@ -35,9 +36,9 @@ public:
   using OnCompleteFn = absl::AnyInvocable<void(absl::Status)>;
 
   RequestFilterManager(std::vector<AiFilterSharedPtr> filters, JsonWithExtBuf payload_index,
-                       BufferManager* buffer_manager, Event::Dispatcher& dispatcher,
-                       StreamInfo::StreamInfo& stream_info, OnCompleteFn on_complete,
-                       Http::RequestHeaderMap* request_headers = nullptr,
+                       ChainWriter* writer, PayloadReader* payload_reader,
+                       Event::Dispatcher& dispatcher, StreamInfo::StreamInfo& stream_info,
+                       OnCompleteFn on_complete, Http::RequestHeaderMap* request_headers = nullptr,
                        LocalReplyFn local_reply_fn = nullptr, bool always_serialize = true,
                        LLMProtocol request_protocol = LLMProtocol::Unspecified);
   ~RequestFilterManager();

@@ -5,7 +5,7 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/coroutine/async_queue.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/response_filter_manager.h"
 
@@ -189,12 +189,7 @@ public:
   ResponseFilterManagerTest()
       : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test")) {}
 
-  ~ResponseFilterManagerTest() override {
-    manager_.reset();
-    if (out_buffer_manager_ != nullptr) {
-      out_buffer_manager_->onDestroy();
-    }
-  }
+  ~ResponseFilterManagerTest() override { manager_.reset(); }
 
   void drain() {
     for (int i = 0; i < 40; ++i) {
@@ -206,10 +201,9 @@ public:
                    ResponseFilterManager::Config config = ResponseFilterManager::Config{},
                    uint32_t buffer_limit = 1024 * 1024) {
     bridge_ = std::make_unique<FakeBridge>(*dispatcher_, buffer_limit);
-    out_buffer_manager_ =
-        std::make_unique<BufferManager>(BufferManager::Config{}, factory_, *bridge_);
+    out_writer_ = std::make_unique<ChainWriter>(*bridge_);
     manager_ = std::make_unique<ResponseFilterManager>(
-        std::move(filters), factory_, *bridge_, *out_buffer_manager_,
+        std::move(filters), factory_, *bridge_, *out_writer_,
         [this](absl::Status status) {
           ++complete_calls_;
           result_ = std::move(status);
@@ -231,7 +225,7 @@ public:
   Event::DispatcherPtr dispatcher_;
   InMemoryExternalBufferFactory factory_;
   std::unique_ptr<FakeBridge> bridge_;
-  std::unique_ptr<BufferManager> out_buffer_manager_;
+  std::unique_ptr<ChainWriter> out_writer_;
   std::unique_ptr<ResponseFilterManager> manager_;
 
   int complete_calls_{0};
@@ -562,10 +556,9 @@ TEST_F(ResponseFilterManagerTest, DataAfterCancelIsDropped) {
 TEST_F(ResponseFilterManagerTest, DestroyedInsideOnCompleteCallbackIsSafe) {
   bool callback_ran = false;
   bridge_ = std::make_unique<FakeBridge>(*dispatcher_, 1024 * 1024);
-  out_buffer_manager_ =
-      std::make_unique<BufferManager>(BufferManager::Config{}, factory_, *bridge_);
+  out_writer_ = std::make_unique<ChainWriter>(*bridge_);
   manager_ = std::make_unique<ResponseFilterManager>(
-      std::vector<AiFilterSharedPtr>{}, factory_, *bridge_, *out_buffer_manager_,
+      std::vector<AiFilterSharedPtr>{}, factory_, *bridge_, *out_writer_,
       [&](absl::Status status) {
         callback_ran = true;
         result_ = std::move(status);

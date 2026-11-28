@@ -9,6 +9,7 @@
 #include "envoy/http/codes.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/coroutine/leaf_awaitable.h"
 #include "source/common/coroutine/status_macros.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
@@ -70,6 +71,25 @@ private:
   InMemoryExternalBufferFactory inner_;
 };
 
+class TrackedSchedulableCallback : public NiceMock<Event::MockSchedulableCallback> {
+public:
+  TrackedSchedulableCallback(Event::MockDispatcher* dispatcher, std::function<void()> cb,
+                             NiceMock<Event::MockSchedulableCallback>** slot = nullptr)
+      : NiceMock<Event::MockSchedulableCallback>(dispatcher, std::move(cb)), slot_(slot) {}
+
+  ~TrackedSchedulableCallback() override {
+    *alive_ = false;
+    if (slot_ != nullptr && *slot_ == this) {
+      *slot_ = nullptr;
+    }
+  }
+
+  std::shared_ptr<bool> alive_{std::make_shared<bool>(true)};
+
+private:
+  NiceMock<Event::MockSchedulableCallback>** slot_{nullptr};
+};
+
 class AiProtocolManagerFilterTest : public testing::Test {
 public:
   AiProtocolManagerFilterTest() {
@@ -109,39 +129,47 @@ public:
           local_reply_details_ = std::string(details);
           ++local_reply_calls_;
         });
-    // The BufferManager creates its replay callback on its first replay, so the mock is
+    // ChainWriter creates its replay callback on its first replay/inject, so the mock is
     // manufactured on demand rather than armed up front. replay_cb_ stays null for a stream that
     // never replays.
+    auto make_schedulable_cb =
+        [this](Event::MockDispatcher& dispatcher, std::function<void()> cb,
+               NiceMock<Event::MockSchedulableCallback>** slot) -> Event::SchedulableCallback* {
+      auto* scb = new TrackedSchedulableCallback(&dispatcher, cb, slot);
+      if (slot != nullptr) {
+        *slot = scb;
+      }
+      ON_CALL(*scb, scheduleCallbackCurrentIteration())
+          .WillByDefault([this, scb, alive = scb->alive_, cb]() {
+            scb->enabled_ = true;
+            posted_.push_back([scb, alive, cb]() {
+              if (*alive && scb->enabled_) {
+                scb->enabled_ = false;
+                cb();
+              }
+            });
+          });
+      ON_CALL(*scb, scheduleCallbackNextIteration())
+          .WillByDefault([this, scb, alive = scb->alive_, cb]() {
+            scb->enabled_ = true;
+            posted_.push_back([scb, alive, cb]() {
+              if (*alive && scb->enabled_) {
+                scb->enabled_ = false;
+                cb();
+              }
+            });
+          });
+      return scb;
+    };
     ON_CALL(callbacks_.dispatcher_, createSchedulableCallback_(testing::_))
-        .WillByDefault([this](std::function<void()> cb) -> Event::SchedulableCallback* {
-          replay_cb_ = new NiceMock<Event::MockSchedulableCallback>(&callbacks_.dispatcher_, cb);
-          return replay_cb_;
+        .WillByDefault([make_schedulable_cb, this](std::function<void()> cb) {
+          return make_schedulable_cb(callbacks_.dispatcher_, std::move(cb), &replay_cb_);
         });
     ON_CALL(encoder_callbacks_.dispatcher_, post(testing::_))
         .WillByDefault([this](Event::PostCb cb) { posted_.push_back(std::move(cb)); });
     ON_CALL(encoder_callbacks_.dispatcher_, createSchedulableCallback_(testing::_))
-        .WillByDefault([this](std::function<void()> cb) -> Event::SchedulableCallback* {
-          auto* scb =
-              new NiceMock<Event::MockSchedulableCallback>(&encoder_callbacks_.dispatcher_, cb);
-          ON_CALL(*scb, scheduleCallbackCurrentIteration()).WillByDefault([this, scb, cb]() {
-            scb->enabled_ = true;
-            posted_.push_back([scb, cb]() {
-              if (scb->enabled_) {
-                scb->enabled_ = false;
-                cb();
-              }
-            });
-          });
-          ON_CALL(*scb, scheduleCallbackNextIteration()).WillByDefault([this, scb, cb]() {
-            scb->enabled_ = true;
-            posted_.push_back([scb, cb]() {
-              if (scb->enabled_) {
-                scb->enabled_ = false;
-                cb();
-              }
-            });
-          });
-          return scb;
+        .WillByDefault([make_schedulable_cb, this](std::function<void()> cb) {
+          return make_schedulable_cb(encoder_callbacks_.dispatcher_, std::move(cb), nullptr);
         });
     ON_CALL(encoder_callbacks_, injectEncodedDataToFilterChain(testing::_, testing::_))
         .WillByDefault([this](Buffer::Instance& data, bool end_stream) {
@@ -364,21 +392,15 @@ TEST_F(AiProtocolManagerFilterTest, SingleFrameBody) {
   EXPECT_EQ(injected_.toString(), "{}");
 }
 
-// An empty terminal frame produces an empty end_stream marker downstream. It
-// issues no write, so replay is scheduled (not started reentrantly from
-// decodeData) and runs on the next event-loop iteration.
+// An empty terminal frame has no payload to forward, so decodeData() lets the held headers and
+// empty terminal frame continue directly without launching replay.
 TEST_F(AiProtocolManagerFilterTest, EmptyBody) {
   engageIgnoringPayload();
   Buffer::OwnedImpl empty;
-  EXPECT_EQ(filter_->decodeData(empty, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  EXPECT_EQ(filter_->decodeData(empty, true), Http::FilterDataStatus::Continue);
 
   EXPECT_EQ(inject_calls_, 0);
-  ASSERT_TRUE(replay_cb_->enabled());
-  replay_cb_->invokeCallback();
-
-  EXPECT_EQ(inject_calls_, 1);
-  EXPECT_TRUE(injected_end_stream_);
-  EXPECT_EQ(injected_.length(), 0);
+  EXPECT_TRUE(posted_.empty());
 }
 
 // A payload larger than the replay chunk size is streamed back in multiple
@@ -487,6 +509,7 @@ TEST_F(AiProtocolManagerFilterTest, ReplayResumesMidStream) {
   watermark_cb_->onBelowWriteBufferLowWatermark();
   ASSERT_TRUE(replay_cb_->enabled());
   replay_cb_->invokeCallback();
+  drain();
   EXPECT_TRUE(injected_end_stream_);
   EXPECT_EQ(injected_.toString(), big);
 }
@@ -1945,14 +1968,11 @@ TEST_F(AiProtocolManagerFilterTest, EmptyBodyOnDeclaredEndpointIsPassedThrough) 
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
   Buffer::OwnedImpl empty;
-  EXPECT_EQ(filter_->decodeData(empty, true), Http::FilterDataStatus::StopIterationNoBuffer);
-  ASSERT_TRUE(replay_cb_->enabled());
-  replay_cb_->invokeCallback();
-  drain();
+  EXPECT_EQ(filter_->decodeData(empty, true), Http::FilterDataStatus::Continue);
+  EXPECT_EQ(inject_calls_, 0);
+  EXPECT_TRUE(posted_.empty());
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_TRUE(injected_end_stream_);
-  EXPECT_EQ(injected_.length(), 0);
   // No payload arrived, so there is no document and nothing to count parsed.
   EXPECT_EQ(counterValue("request_parsed"), 0);
   EXPECT_EQ(counterValue("request_parse_error"), 0);
@@ -2197,14 +2217,11 @@ TEST_F(AiProtocolManagerFilterTest, BestEffortParsingForwardsEmptyBody) {
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
   Buffer::OwnedImpl empty;
-  EXPECT_EQ(filter_->decodeData(empty, true), Http::FilterDataStatus::StopIterationNoBuffer);
-  ASSERT_TRUE(replay_cb_->enabled());
-  replay_cb_->invokeCallback();
-  drain();
+  EXPECT_EQ(filter_->decodeData(empty, true), Http::FilterDataStatus::Continue);
+  EXPECT_EQ(inject_calls_, 0);
+  EXPECT_TRUE(posted_.empty());
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_TRUE(injected_end_stream_);
-  EXPECT_EQ(injected_.length(), 0);
 }
 
 // The one shape best effort can hold: the whole request arrives before a response
@@ -2753,6 +2770,255 @@ TEST_F(AiProtocolManagerFilterTest,
   EXPECT_EQ(
       encoded_injected_.toString(),
       R"({"model":"gpt-4","usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12},"tagged":true})");
+}
+
+class FailingTestExternalBuffer : public ExternalBuffer {
+public:
+  enum class FailMode { Write, Read };
+
+  FailingTestExternalBuffer(Event::Dispatcher& dispatcher, FailMode mode)
+      : dispatcher_(dispatcher), mode_(mode) {}
+
+  void write(Buffer::InstancePtr data, bool, WriteCallback cb) override {
+    if (mode_ == FailMode::Write) {
+      auto alive = alive_;
+      dispatcher_.post([alive, cb = std::move(cb)]() mutable {
+        if (*alive) {
+          cb(ExternalBufferStatus::Error);
+        }
+      });
+      return;
+    }
+    stored_ += data->toString();
+    auto alive = alive_;
+    dispatcher_.post([alive, cb = std::move(cb)]() mutable {
+      if (*alive) {
+        cb(ExternalBufferStatus::Ok);
+      }
+    });
+  }
+
+  void read(uint64_t, uint64_t, ReadCallback cb) override {
+    auto alive = alive_;
+    dispatcher_.post([alive, cb = std::move(cb)]() mutable {
+      if (*alive) {
+        cb(ExternalBufferStatus::Error, nullptr);
+      }
+    });
+  }
+
+  uint64_t length() const override { return stored_.size(); }
+
+  ~FailingTestExternalBuffer() override { *alive_ = false; }
+
+private:
+  Event::Dispatcher& dispatcher_;
+  FailMode mode_;
+  std::string stored_;
+  std::shared_ptr<bool> alive_{std::make_shared<bool>(true)};
+};
+
+class FailingTestExternalBufferFactory : public ExternalBufferFactory {
+public:
+  explicit FailingTestExternalBufferFactory(FailingTestExternalBuffer::FailMode mode)
+      : mode_(mode) {}
+
+  ExternalBufferPtr createBuffer(Event::Dispatcher& dispatcher) override {
+    return std::make_unique<FailingTestExternalBuffer>(dispatcher, mode_);
+  }
+
+private:
+  FailingTestExternalBuffer::FailMode mode_;
+};
+
+TEST_F(AiProtocolManagerFilterTest, ExternalBufferWriteErrorSendsSingle500) {
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(0));
+  factory_ = std::make_shared<FailingTestExternalBufferFactory>(
+      FailingTestExternalBuffer::FailMode::Write);
+  createFilter(/*parse_unconfigured_routes=*/true);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  // Non-JSON payload takes the passthrough streamPayload() path, which awaits the failing external
+  // write; both BufferManager and on_complete observe the failure, but notifyUnrecoverableError()
+  // must emit a single 500 local reply and inject nothing.
+  Buffer::OwnedImpl body("not-json");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_code_, Http::Code::InternalServerError);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_external_buffer_error");
+  EXPECT_EQ(counterValue("request_external_buffer_error"), 1);
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, ExternalBufferReadErrorSendsSingle500) {
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(0));
+  factory_ =
+      std::make_shared<FailingTestExternalBufferFactory>(FailingTestExternalBuffer::FailMode::Read);
+  createFilter(/*parse_unconfigured_routes=*/true);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  // Oversized string value creates an ExternalRef so Serializer::serialize() reads from
+  // PayloadReader -> ExternalBuffer::read(), surfacing DataLossError through RequestFilterManager
+  // to AiProtocolManagerFilter's on_complete -> notifyUnrecoverableError().
+  Buffer::OwnedImpl body(oversizedModelPayload());
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_code_, Http::Code::InternalServerError);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_external_buffer_error");
+  EXPECT_EQ(counterValue("request_external_buffer_error"), 1);
+  EXPECT_FALSE(injected_end_stream_);
+}
+
+TEST_F(AiProtocolManagerFilterTest, InvalidJsonLocalReplySuppressesLateExternalBufferWriteError) {
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(0));
+  factory_ = std::make_shared<FailingTestExternalBufferFactory>(
+      FailingTestExternalBuffer::FailMode::Write);
+  setRouteConfig();
+  createFilter();
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  // First chunk exceeds bufferLimit(0) and starts an async failing write.
+  Buffer::OwnedImpl chunk1(R"({"model":"gpt-4",)");
+  EXPECT_EQ(filter_->decodeData(chunk1, false), Http::FilterDataStatus::StopIterationNoBuffer);
+
+  // Second chunk fails JSON parsing, sending a 400 and detaching decode_bridge_.
+  Buffer::OwnedImpl chunk2("not-json}");
+  EXPECT_EQ(filter_->decodeData(chunk2, true), Http::FilterDataStatus::StopIterationNoBuffer);
+
+  // Draining any queued async write completion must not emit a duplicate 500 or bump error stats.
+  drain();
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_code_, Http::Code::BadRequest);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_invalid_json");
+  EXPECT_EQ(counterValue("request_external_buffer_error"), 0);
+}
+
+// When a self-owned decode BufferManager fails asynchronously while a parsed JSON request (with no
+// ExternalRefs) is still in the AI filter pipeline, finalizeDecode()'s on_complete must suppress
+// terminal end_stream injection after the 500 local reply.
+TEST_F(AiProtocolManagerFilterTest, ParsedJsonAsyncExternalBufferWriteErrorSuppressesEndStream) {
+  class YieldingPassThroughAiFilter : public AiFilter {
+  public:
+    Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
+                                         AiRequestPropagator propagate_request,
+                                         LocalReplier) override {
+      ASSIGN_OR_CO_RETURN(AiRequestPtr request, co_await std::move(receive_request)());
+      CO_RETURN_IF_ERROR(co_await Coroutine::yield());
+      co_return co_await std::move(propagate_request)(std::move(request));
+    }
+  };
+
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(0));
+  factory_ = std::make_shared<FailingTestExternalBufferFactory>(
+      FailingTestExternalBuffer::FailMode::Write);
+  createFilterWithAiFilters({[](const AiFilterContext&) -> AiFilterSharedPtr {
+    return std::make_shared<YieldingPassThroughAiFilter>();
+  }});
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  // Small valid JSON with no ExternalRefs: Serializer::serialize() completes with OkStatus()
+  // without reading decode_reader_, exercising on_complete's decodeRejected() guard.
+  Buffer::OwnedImpl body(R"({"model":"gpt-4","a":1})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_code_, Http::Code::InternalServerError);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_external_buffer_error");
+  EXPECT_EQ(counterValue("request_external_buffer_error"), 1);
+  EXPECT_FALSE(injected_end_stream_);
+}
+
+// On the SSE response path, an async ExternalBuffer::write() failure sends a single 500 local
+// reply and suppresses terminal end_stream injection in onEncodeComplete() even when the AI filter
+// drops all frames and finishes with OkStatus().
+TEST_F(AiProtocolManagerFilterTest, SseResponseExternalBufferWriteErrorSendsSingle500) {
+  class YieldingDroppingSseFilter : public AiFilter {
+  public:
+    Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
+                                         AiRequestPropagator propagate_request,
+                                         LocalReplier) override {
+      ASSIGN_OR_CO_RETURN(AiRequestPtr request, co_await std::move(receive_request)());
+      co_return co_await std::move(propagate_request)(std::move(request));
+    }
+    Coroutine::Task<absl::Status> encodeSSE(SseStreamReceiver receive,
+                                            SseStreamPropagator) override {
+      while (true) {
+        ASSIGN_OR_CO_RETURN(auto event, co_await receive());
+        if (!event.has_value()) {
+          break;
+        }
+        CO_RETURN_IF_ERROR(co_await Coroutine::yield());
+      }
+      co_return absl::OkStatus();
+    }
+  };
+
+  // Keep the small request in memory so only the 70 KiB SSE response frame spills to
+  // ExternalBuffer.
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(1024));
+  factory_ = std::make_shared<FailingTestExternalBufferFactory>(
+      FailingTestExternalBuffer::FailMode::Write);
+  createFilterWithAiFilters({[](const AiFilterContext&) -> AiFilterSharedPtr {
+    return std::make_shared<YieldingDroppingSseFilter>();
+  }});
+  setRouteConfig();
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl req_body(R"({"model":"gpt-4","messages":[{"role":"user","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(req_body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+  ASSERT_TRUE(injected_end_stream_);
+
+  Http::TestResponseHeaderMapImpl resp_headers{{":status", "200"},
+                                               {"content-type", "text/event-stream"}};
+  EXPECT_EQ(filter_->encodeHeaders(resp_headers, false), Http::FilterHeadersStatus::Continue);
+
+  // Exceeds SseEventDecoder's 64 KiB in-memory threshold so data_store_ spills and fails writing.
+  Buffer::OwnedImpl sse_chunk("data: " + std::string(70 * 1024, 'x') + "\n\n");
+  EXPECT_EQ(filter_->encodeData(sse_chunk, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(encode_local_reply_calls_, 1);
+  EXPECT_EQ(encode_local_reply_code_, Http::Code::InternalServerError);
+  EXPECT_EQ(counterValue("response_external_buffer_error"), 1);
+  EXPECT_EQ(encoded_inject_calls_, 0);
+  EXPECT_FALSE(encoded_injected_end_stream_);
+}
+
+// On the SSE response path, an ExternalBuffer::read() failure during SseEventSerializer::serialize
+// propagates DataLossError through onEncodeComplete() to send a single 500 local reply.
+TEST_F(AiProtocolManagerFilterTest, SseResponseExternalBufferReadErrorSendsSingle500) {
+  factory_ =
+      std::make_shared<FailingTestExternalBufferFactory>(FailingTestExternalBuffer::FailMode::Read);
+  createFilterWithAiFilters({[](const AiFilterContext&) -> AiFilterSharedPtr {
+    return std::make_shared<SseTaggingAiFilter>("tagged");
+  }});
+  setRouteConfig();
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl req_body(R"({"model":"gpt-4","messages":[{"role":"user","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(req_body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+  ASSERT_TRUE(injected_end_stream_);
+
+  Http::TestResponseHeaderMapImpl resp_headers{{":status", "200"},
+                                               {"content-type", "text/event-stream"}};
+  EXPECT_EQ(filter_->encodeHeaders(resp_headers, false), Http::FilterHeadersStatus::Continue);
+
+  // Offloaded raw SSE payload forces SseEventSerializer -> streamPayload -> ExternalBuffer::read().
+  Buffer::OwnedImpl sse_chunk("data: " + std::string(70 * 1024, 'x') + "\n\n");
+  EXPECT_EQ(filter_->encodeData(sse_chunk, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(encode_local_reply_calls_, 1);
+  EXPECT_EQ(encode_local_reply_code_, Http::Code::InternalServerError);
+  EXPECT_EQ(counterValue("response_external_buffer_error"), 1);
+  EXPECT_FALSE(encoded_injected_end_stream_);
 }
 
 } // namespace

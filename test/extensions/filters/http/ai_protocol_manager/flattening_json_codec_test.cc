@@ -7,8 +7,7 @@
 #include "source/common/coroutine/dispatcher_executor.h"
 #include "source/common/coroutine/launch.h"
 #include "source/common/coroutine/status_macros.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
-#include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/flattening_json_codec.h"
 
 #include "test/extensions/filters/http/ai_protocol_manager/fake_bridge.h"
@@ -32,9 +31,7 @@ public:
   FlatteningJsonCodecTest()
       : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test")),
         executor_(std::make_shared<Coroutine::DispatcherExecutor>(*dispatcher_)),
-        bridge_(*dispatcher_), out_buffer_manager_(BufferManager::Config{}, factory_, bridge_) {}
-
-  ~FlatteningJsonCodecTest() override { out_buffer_manager_.onDestroy(); }
+        bridge_(*dispatcher_), out_writer_(bridge_) {}
 
   void drain() {
     for (int i = 0; i < 40; ++i) {
@@ -44,7 +41,7 @@ public:
 
   absl::Status serializeBatches(const std::vector<std::vector<FlattenJsonField>>& batches) {
     absl::Status result = absl::UnknownError("not finished");
-    FlatteningJsonSerializer serializer(out_buffer_manager_);
+    FlatteningJsonSerializer serializer(out_writer_);
     auto task = [&serializer, &batches]() -> Coroutine::Task<absl::Status> {
       for (const auto& batch : batches) {
         CO_RETURN_IF_ERROR(co_await serializer.serializeBatch(batch));
@@ -92,9 +89,8 @@ public:
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
   std::shared_ptr<Coroutine::DispatcherExecutor> executor_;
-  InMemoryExternalBufferFactory factory_;
   FakeBridge bridge_;
-  BufferManager out_buffer_manager_;
+  ChainWriter out_writer_;
 };
 
 TEST_F(FlatteningJsonCodecTest, FlattenJsonFieldCopyMoveAndMutationPreservePath) {

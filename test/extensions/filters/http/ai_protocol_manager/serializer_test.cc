@@ -6,6 +6,7 @@
 #include "source/common/coroutine/dispatcher_executor.h"
 #include "source/common/coroutine/launch.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
@@ -29,7 +30,9 @@ class SerializerTest : public testing::Test {
 public:
   SerializerTest()
       : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test")), factory_(),
-        bridge_(*dispatcher_), buffer_manager_(BufferManager::Config{}, factory_, bridge_) {}
+        bridge_(*dispatcher_), buffer_manager_(std::make_unique<BufferManager>(
+                                   BufferManager::Config{}, factory_, bridge_)),
+        writer_(bridge_) {}
 
   void drain() {
     for (int i = 0; i < 10; ++i) {
@@ -38,12 +41,17 @@ public:
   }
 
   absl::StatusOr<JsonWithExtBuf> runSerialize(const JsonWithExtBuf& doc,
-                                              BufferManager* buffer_manager) {
-    return runSerialize(doc, buffer_manager, buffer_manager);
+                                              BufferManagerPtr buffer_manager) {
+    if (buffer_manager == nullptr) {
+      return runSerialize(doc, nullptr, nullptr);
+    }
+    buffer_manager->endStream();
+    PayloadReaderSharedPtr reader = BufferManager::exportPayloadReader(std::move(buffer_manager));
+    return runSerialize(doc, &writer_, reader.get());
   }
 
-  absl::StatusOr<JsonWithExtBuf> runSerialize(const JsonWithExtBuf& doc, BufferManager* out,
-                                              BufferManager* ref_source) {
+  absl::StatusOr<JsonWithExtBuf> runSerialize(const JsonWithExtBuf& doc, ChainWriter* out,
+                                              PayloadReader* ref_source) {
     auto executor = std::make_shared<Coroutine::DispatcherExecutor>(*dispatcher_);
     absl::StatusOr<JsonWithExtBuf> final_result;
     bool completed = false;
@@ -82,9 +90,10 @@ public:
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
   InMemoryExternalBufferFactory factory_;
-  // Declared before buffer_manager_ so it outlives the manager that references it.
+  // Declared before buffer_manager_ and writer_ so it outlives the objects that reference it.
   FakeBridge bridge_;
-  BufferManager buffer_manager_;
+  BufferManagerPtr buffer_manager_;
+  ChainWriter writer_;
 };
 
 TEST_F(SerializerTest, PureJsonSerialization) {
@@ -97,7 +106,7 @@ TEST_F(SerializerTest, PureJsonSerialization) {
       {"extra", nullptr},
   });
 
-  auto result_or = runSerialize(doc, &buffer_manager_);
+  auto result_or = runSerialize(doc, std::move(buffer_manager_));
   ASSERT_OK(result_or);
   std::string output = bridge_.injected_.toString();
 
@@ -116,8 +125,8 @@ TEST_F(SerializerTest, PureJsonSerialization) {
 TEST_F(SerializerTest, ExternalRefSerializationAndOffsetRecalculation) {
   std::string secret = "This is a very long offloaded prompt text.";
   Buffer::OwnedImpl secret_buf(secret);
-  buffer_manager_.onData(secret_buf);
-  buffer_manager_.endStream();
+  buffer_manager_->onData(secret_buf);
+  buffer_manager_->endStream();
   drain();
 
   JsonWithExtBuf doc;
@@ -126,7 +135,7 @@ TEST_F(SerializerTest, ExternalRefSerializationAndOffsetRecalculation) {
       {"prompt", JsonWithExtBuf::makeExternalRef({0, secret.size()})},
   });
 
-  auto result_or = runSerialize(doc, &buffer_manager_);
+  auto result_or = runSerialize(doc, std::move(buffer_manager_));
   ASSERT_OK(result_or);
   std::string output = bridge_.injected_.toString();
 
@@ -165,15 +174,15 @@ TEST_F(SerializerTest, ExternalRefWithNoRefSourceFails) {
       {"prompt", JsonWithExtBuf::makeExternalRef({0, 10})},
   });
 
-  auto result_or = runSerialize(doc, &buffer_manager_, nullptr);
+  auto result_or = runSerialize(doc, &writer_, nullptr);
   EXPECT_THAT(result_or.status(), HasStatusCode(absl::StatusCode::kInternal));
 }
 
 TEST_F(SerializerTest, ExternalRefOutOfBoundsFails) {
   std::string secret = "hello world";
   Buffer::OwnedImpl secret_buf(secret);
-  buffer_manager_.onData(secret_buf);
-  buffer_manager_.endStream();
+  buffer_manager_->onData(secret_buf);
+  buffer_manager_->endStream();
   drain();
 
   // ref offset + length exceeds buffer length (11 bytes)
@@ -182,7 +191,7 @@ TEST_F(SerializerTest, ExternalRefOutOfBoundsFails) {
       {"prompt", JsonWithExtBuf::makeExternalRef({5, 100})},
   });
 
-  auto result_or = runSerialize(doc, &buffer_manager_);
+  auto result_or = runSerialize(doc, std::move(buffer_manager_));
   EXPECT_THAT(result_or.status(), HasStatusCode(absl::StatusCode::kInvalidArgument));
   EXPECT_THAT(result_or.status().message(), testing::HasSubstr("exceeds buffer length"));
 }
@@ -190,8 +199,8 @@ TEST_F(SerializerTest, ExternalRefOutOfBoundsFails) {
 TEST_F(SerializerTest, ExternalRefOffsetOutOfBoundsFails) {
   std::string secret = "hello world";
   Buffer::OwnedImpl secret_buf(secret);
-  buffer_manager_.onData(secret_buf);
-  buffer_manager_.endStream();
+  buffer_manager_->onData(secret_buf);
+  buffer_manager_->endStream();
   drain();
 
   // ref offset itself exceeds buffer length (11 bytes)
@@ -200,7 +209,7 @@ TEST_F(SerializerTest, ExternalRefOffsetOutOfBoundsFails) {
       {"prompt", JsonWithExtBuf::makeExternalRef({100, 0})},
   });
 
-  auto result_or = runSerialize(doc, &buffer_manager_);
+  auto result_or = runSerialize(doc, std::move(buffer_manager_));
   EXPECT_THAT(result_or.status(), HasStatusCode(absl::StatusCode::kInvalidArgument));
 }
 
@@ -209,10 +218,10 @@ TEST_F(SerializerTest, NestedStructureWithMultipleRefs) {
   std::string part2 = "User query text";
 
   Buffer::OwnedImpl part1_buf(part1);
-  buffer_manager_.onData(part1_buf);
+  buffer_manager_->onData(part1_buf);
   Buffer::OwnedImpl part2_buf(part2);
-  buffer_manager_.onData(part2_buf);
-  buffer_manager_.endStream();
+  buffer_manager_->onData(part2_buf);
+  buffer_manager_->endStream();
   drain();
 
   JsonWithExtBuf doc;
@@ -225,7 +234,7 @@ TEST_F(SerializerTest, NestedStructureWithMultipleRefs) {
        })},
   });
 
-  auto result_or = runSerialize(doc, &buffer_manager_);
+  auto result_or = runSerialize(doc, std::move(buffer_manager_));
   ASSERT_OK(result_or);
   std::string output = bridge_.injected_.toString();
 
@@ -248,8 +257,8 @@ TEST_F(SerializerTest, NestedStructureWithMultipleRefs) {
 TEST_F(SerializerTest, LargeExternalRefMultiChunk) {
   std::string large_payload(150 * 1024, 'x'); // 150KB > 2 chunks of 64KB
   Buffer::OwnedImpl large_buf(large_payload);
-  buffer_manager_.onData(large_buf);
-  buffer_manager_.endStream();
+  buffer_manager_->onData(large_buf);
+  buffer_manager_->endStream();
   drain();
 
   JsonWithExtBuf doc;
@@ -257,7 +266,7 @@ TEST_F(SerializerTest, LargeExternalRefMultiChunk) {
       {"large_field", JsonWithExtBuf::makeExternalRef({0, large_payload.size()})},
   });
 
-  auto result_or = runSerialize(doc, &buffer_manager_);
+  auto result_or = runSerialize(doc, std::move(buffer_manager_));
   ASSERT_OK(result_or);
 
   std::string output = bridge_.injected_.toString();
@@ -272,7 +281,7 @@ TEST_F(SerializerTest, SpecialCharactersEscaping) {
       {"quote\"key", "value\nwith\tspecial \"quotes\" and /slashes/ and \\backslashes\\"},
   });
 
-  auto result_or = runSerialize(doc, &buffer_manager_);
+  auto result_or = runSerialize(doc, std::move(buffer_manager_));
   ASSERT_OK(result_or);
   std::string output = bridge_.injected_.toString();
 
@@ -288,7 +297,7 @@ TEST_F(SerializerTest, InvalidUtf8StringReturnsError) {
       {"invalid_str", invalid_utf8},
   });
 
-  auto result_or = runSerialize(doc, &buffer_manager_);
+  auto result_or = runSerialize(doc, std::move(buffer_manager_));
   EXPECT_FALSE(result_or.ok());
   EXPECT_THAT(result_or.status(), HasStatusCode(absl::StatusCode::kInvalidArgument));
   EXPECT_THAT(result_or.status().message(), testing::HasSubstr("JSON serialization error"));
@@ -306,7 +315,7 @@ TEST_F(SerializerTest, InvalidUtf8KeyReturnsError) {
   j[invalid_utf8_key] = "value";
   doc.setJson(std::move(j));
 
-  auto result_or = runSerialize(doc, &buffer_manager_);
+  auto result_or = runSerialize(doc, std::move(buffer_manager_));
   EXPECT_FALSE(result_or.ok());
   EXPECT_THAT(result_or.status(), HasStatusCode(absl::StatusCode::kInvalidArgument));
   EXPECT_THAT(result_or.status().message(), testing::HasSubstr("JSON serialization error"));

@@ -9,9 +9,15 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
 #include "source/common/coroutine/status_macros.h"
-#include "source/extensions/filters/http/ai_protocol_manager/replay_awaitable.h"
+#include "source/common/coroutine/task.h"
+#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/payload_reader.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/stream_payload.h"
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 
@@ -32,19 +38,19 @@ constexpr absl::string_view kRetryField = "retry";
 constexpr size_t kMaxModeledFieldNameBytes =
     std::max({kDataField.size(), kEventField.size(), kIdField.size(), kRetryField.size()});
 
-// Writes `bytes` out through the buffer manager, resuming once they have drained.
+// Writes `bytes` out through the writer, resuming once they have drained.
 //
 // Takes its bytes by value so the coroutine frame owns them: callers routinely pass a freshly
 // formatted string, and a view would have to outlive a suspension point.
-Coroutine::Task<absl::Status> writeOut(BufferManager& out, std::string bytes) {
+Coroutine::Task<absl::Status> writeOut(ChainWriter& out, std::string bytes) {
   Buffer::OwnedImpl buf;
   buf.add(bytes);
-  co_return co_await ReplayAwaitable(out, buf);
+  co_return co_await out.inject(buf);
 }
 
 // Emits one `data:` line holding `line`. An empty value is written without the conventional
 // space, so `data:` round-trips as `data:` rather than gaining a trailing blank.
-Coroutine::Task<absl::Status> writeDataLine(BufferManager& out, absl::string_view line,
+Coroutine::Task<absl::Status> writeDataLine(ChainWriter& out, absl::string_view line,
                                             bool emit_newline = true) {
   const absl::string_view suffix = emit_newline ? "\n" : "";
   co_return co_await writeOut(out, line.empty() ? absl::StrCat("data:", suffix)
@@ -282,7 +288,7 @@ absl::Status SseEventDecoder::appendPayload(absl::string_view bytes) {
         absl::StrCat("SSE frame exceeded the ", config_.max_frame_bytes, " byte limit"));
   }
   if (data_store_ == nullptr) {
-    data_store_ = std::make_shared<BufferManager>(
+    data_store_ = std::make_unique<BufferManager>(
         BufferManager::Config{config_.max_in_memory_frame_bytes}, buffer_factory_, bridge_);
     json_parser_ = std::make_unique<JsonWithExtBufParser>(config_.parser);
   }
@@ -306,7 +312,7 @@ absl::Status SseEventDecoder::appendExtras(absl::string_view bytes) {
         absl::StrCat("SSE frame exceeded the ", config_.max_frame_bytes, " byte limit"));
   }
   if (extras_store_ == nullptr) {
-    extras_store_ = std::make_shared<BufferManager>(
+    extras_store_ = std::make_unique<BufferManager>(
         BufferManager::Config{config_.max_in_memory_frame_bytes}, buffer_factory_, bridge_);
   }
   Buffer::OwnedImpl buf;
@@ -329,7 +335,11 @@ void SseEventDecoder::finishFrame(std::vector<SseEventPtr>& out,
   if (extras_store_ != nullptr) {
     // No more lines belong to this frame, so nothing more will be appended.
     extras_store_->endStream();
-    event->set_extras_store(std::move(extras_store_));
+    const Buffer::Instance* extras_in_memory = extras_store_->inMemoryBytes();
+    const uint64_t extras_in_memory_bytes =
+        extras_in_memory != nullptr ? extras_in_memory->length() : 0;
+    event->set_extras_reader(BufferManager::exportPayloadReader(std::move(extras_store_)),
+                             extras_in_memory_bytes);
   }
 
   if (has_data_ && data_store_ == nullptr) {
@@ -362,7 +372,9 @@ void SseEventDecoder::finishFrame(std::vector<SseEventPtr>& out,
       keeps_references = true;
     }
     if (keeps_references) {
-      event->set_payload_store(std::move(data_store_));
+      const uint64_t payload_in_memory_bytes = in_memory != nullptr ? in_memory->length() : 0;
+      event->set_payload_reader(BufferManager::exportPayloadReader(std::move(data_store_)),
+                                payload_in_memory_bytes);
     }
   }
 
@@ -392,8 +404,8 @@ void SseEventDecoder::resetFrame() {
   data_spans_.clear();
 }
 
-Coroutine::Task<absl::Status> SseEventSerializer::serialize(SseEvent& event, BufferManager& out) {
-  const bool has_extras = event.extras_store() != nullptr && event.extras_store()->length() > 0;
+Coroutine::Task<absl::Status> SseEventSerializer::serialize(SseEvent& event, ChainWriter& out) {
+  const bool has_extras = event.extras_reader() != nullptr && event.extras_reader()->length() > 0;
   const bool metadata_is_last = !event.has_data() && !has_extras;
   for (size_t i = 0; i < event.metadata().size(); ++i) {
     const SseEvent::MetadataField& field = event.metadata()[i];
@@ -420,10 +432,10 @@ Coroutine::Task<absl::Status> SseEventSerializer::serialize(SseEvent& event, Buf
     }
   }
 
-  // Comments and fields this codec does not model, put back byte for byte. The store holds those
+  // Comments and fields this codec does not model, put back byte for byte. The reader holds those
   // lines and nothing else, so its whole range is what goes out.
   if (has_extras) {
-    BufferManager& extras = *event.extras_store();
+    PayloadReader& extras = *event.extras_reader();
     const bool extras_is_last = !event.has_data();
     uint64_t len = extras.length();
     if (extras_is_last && event.termination() == SseEvent::Termination::None && len > 0) {
@@ -432,7 +444,7 @@ Coroutine::Task<absl::Status> SseEventSerializer::serialize(SseEvent& event, Buf
       len -= 1;
     }
     if (len > 0) {
-      CO_RETURN_IF_ERROR(co_await ReplayAwaitable(extras, 0, len));
+      CO_RETURN_IF_ERROR(co_await streamPayload(extras, 0, len, out));
     }
   }
 
@@ -442,13 +454,13 @@ Coroutine::Task<absl::Status> SseEventSerializer::serialize(SseEvent& event, Buf
       // Serializer emits compact JSON, so the payload cannot contain a raw newline that would
       // break framing, and ExternalRef bytes stream straight out of the buffer.
       absl::StatusOr<JsonWithExtBuf> serialized =
-          co_await Serializer::serialize(event.json(), &out, event.payload_store());
+          co_await Serializer::serialize(event.json(), &out, event.payload_reader());
       CO_RETURN_IF_ERROR(serialized.status());
       if (event.termination() != SseEvent::Termination::None) {
         CO_RETURN_IF_ERROR(co_await writeOut(out, "\n"));
       }
     } else if (!event.raw_data_ext_refs().empty()) {
-      ASSERT(event.payload_store() != nullptr);
+      ASSERT(event.payload_reader() != nullptr);
       // One data line per reference: this is exactly how the decoder split them, so a payload
       // whose bytes contain newlines reassembles unchanged.
       for (size_t i = 0; i < event.raw_data_ext_refs().size(); ++i) {
@@ -458,7 +470,7 @@ Coroutine::Task<absl::Status> SseEventSerializer::serialize(SseEvent& event, Buf
             !is_last_line || (event.termination() != SseEvent::Termination::None);
         CO_RETURN_IF_ERROR(co_await writeOut(out, "data: "));
         CO_RETURN_IF_ERROR(
-            co_await ReplayAwaitable(*event.payload_store(), ref.offset, ref.length));
+            co_await streamPayload(*event.payload_reader(), ref.offset, ref.length, out));
         if (emit_newline) {
           CO_RETURN_IF_ERROR(co_await writeOut(out, "\n"));
         }

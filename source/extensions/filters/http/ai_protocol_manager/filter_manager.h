@@ -9,9 +9,11 @@
 
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
+#include "source/extensions/filters/http/ai_protocol_manager/payload_reader.h"
 #include "source/extensions/filters/http/ai_protocol_manager/request_filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/response_filter_manager.h"
 
@@ -41,20 +43,21 @@ public:
   // Starts the request filter chain in forward filter order (0..N-1). Unless `always_serialize`,
   // the received body is forwarded instead of the re-serialized document. `request_protocol`
   // seeds AiRequest::protocol().
-  void startRequest(JsonWithExtBuf payload_index, BufferManager* buffer_manager,
-                    Event::Dispatcher& dispatcher, StreamInfo::StreamInfo& stream_info,
-                    OnCompleteFn on_complete, Http::RequestHeaderMap* request_headers = nullptr,
+  void startRequest(JsonWithExtBuf payload_index, ChainWriter* writer,
+                    PayloadReader* payload_reader, Event::Dispatcher& dispatcher,
+                    StreamInfo::StreamInfo& stream_info, OnCompleteFn on_complete,
+                    Http::RequestHeaderMap* request_headers = nullptr,
                     LocalReplyFn local_reply_fn = nullptr, bool always_serialize = true,
                     LLMProtocol request_protocol = LLMProtocol::Unspecified);
 
   // Starts the SSE response filter chain in reverse filter order (N-1..0).
   void startSseResponse(ExternalBufferFactory& buffer_factory, FilterChainBridge& bridge,
-                        BufferManager& out_buffer_manager, OnCompleteFn on_complete,
+                        ChainWriter& writer, OnCompleteFn on_complete,
                         ResponseFilterManager::Config config = {});
 
   // Starts the unary JSON response filter chain in reverse filter order (N-1..0).
   void startUnaryResponse(ExternalBufferFactory& buffer_factory, FilterChainBridge& bridge,
-                          BufferManager& out_buffer_manager, OnCompleteFn on_complete);
+                          ChainWriter& writer, OnCompleteFn on_complete);
 
   // Feeds response body bytes to the active response filter manager.
   void onResponseData(Buffer::Instance& data, bool end_stream);

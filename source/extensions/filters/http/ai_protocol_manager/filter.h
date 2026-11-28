@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -11,14 +12,17 @@
 #include "envoy/stats/scope.h"
 
 #include "source/common/common/logger.h"
+#include "source/common/coroutine/launch.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_binding.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_conversion.h"
+#include "source/extensions/filters/http/ai_protocol_manager/payload_reader.h"
 #include "source/extensions/filters/http/ai_protocol_manager/response_handler.h"
 #include "source/extensions/filters/http/ai_protocol_manager/stats.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
@@ -147,17 +151,15 @@ private:
 // None of that happens for a stream the filter has no reason to inspect:
 // decodeHeaders() returns Continue and the offload path is never entered.
 //
-// The offload/replay pipeline and its bidirectional flow control live in the
-// path-agnostic BufferManager (buffer_manager.h); the filter is a thin delegator
-// that constructs one BufferManager per direction with the matching
-// FilterChainBridge (filter_chain_bridge.h). Today only the decode (request) path
-// is wired; the encode path will construct a second BufferManager with the
-// encoder bridge.
+// Payload ingestion, reading, and filter-chain emission are split across
+// BufferManager (buffer_manager.h), PayloadReader
+// (payload_reader.h), and ChainWriter (chain_writer.h), coordinated through the
+// path-specific FilterChainBridge (filter_chain_bridge.h).
 //
 // Parsing runs alongside the offload: every body frame is fed to a
-// JsonWithExtBufParser before it reaches the BufferManager, so the two see the
-// identical byte stream from the first body byte -- which is what makes the
-// parser's recorded offsets valid buffer offsets (json_with_ext_buf_parser.h).
+// JsonWithExtBufParser before it reaches the BufferManager, so the two
+// see the identical byte stream from the first body byte -- which is what makes
+// the parser's recorded offsets valid buffer offsets (json_with_ext_buf_parser.h).
 // Feeding first also fails a malformed payload the moment the bad byte arrives,
 // not after the whole upload.
 //
@@ -184,9 +186,10 @@ private:
 // configured routes (or on all routes with include_unconfigured_routes) are
 // teed into a ResponseHandler; at end of stream the normalized usage is
 // published as dynamic metadata on the downstream StreamInfo, from downstream
-// and upstream installations alike. The filter never stops iteration or
-// mutates the response; extraction works on bounded side state, synchronously
-// on the encode callbacks, and no handler failure can affect the stream.
+// and upstream installations alike. Without an active encode_writer_, the
+// filter never stops iteration or mutates the response; extraction works on
+// bounded side state, synchronously on the encode callbacks, and no handler
+// failure can affect the stream.
 class AiProtocolManagerFilter : public Http::PassThroughFilter,
                                 public Logger::Loggable<Logger::Id::filter> {
 public:
@@ -231,25 +234,38 @@ private:
   bool finalizeResponseHandling();
 
   // Finalizes the decode path when the full request body (and optional trailers) has been received.
-  // Sets endStream on decode_manager_ and executes the AI filter chain or replays the body.
+  // Sets endStream on `decode_manager_` and executes the AI filter chain or forwards the body.
   void finalizeDecode(bool has_trailers);
 
   // Invoked when the SSE response filter pipeline completes or fails.
   void onEncodeComplete(absl::Status status);
 
+  bool decodeRejected() const {
+    return payload_rejected_ ||
+           (decode_bridge_ != nullptr && decode_bridge_->hasUnrecoverableError());
+  }
+
+  bool encodeRejected() const {
+    return encode_rejected_ ||
+           (encode_bridge_ != nullptr && encode_bridge_->hasUnrecoverableError());
+  }
+
   FilterConfigSharedPtr config_;
 
-  // Declared before decode_manager_, encode_manager_, and filter_manager_ so they outlive the
-  // managers and coroutines that reference them.
+  // Declared before `decode_manager_`, `decode_writer_`, `encode_writer_`, and `filter_manager_`
+  // so they outlive the ingest managers, writers, and coroutines that reference them.
   FilterChainBridgePtr decode_bridge_;
 
   // Non-null exactly when decodeHeaders() decided to inspect this stream, so it
   // doubles as the engaged flag. Outlives request_parser_, which is released as
   // soon as parsing is done with.
   BufferManagerPtr decode_manager_;
+  PayloadReaderSharedPtr decode_reader_;
+  ChainWriterPtr decode_writer_;
+  std::optional<Coroutine::DetachedHandle> passthrough_handle_;
 
   FilterChainBridgePtr encode_bridge_;
-  BufferManagerPtr encode_manager_;
+  ChainWriterPtr encode_writer_;
 
   // Copied out of the route configuration rather than held by pointer: the route
   // can be re-resolved mid-stream, which would leave a cached pointer dangling,

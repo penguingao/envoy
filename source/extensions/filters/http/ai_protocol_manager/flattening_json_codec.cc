@@ -8,7 +8,7 @@
 
 #include "source/common/common/assert.h"
 #include "source/common/coroutine/status_macros.h"
-#include "source/extensions/filters/http/ai_protocol_manager/replay_awaitable.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 
 #include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
@@ -250,7 +250,7 @@ void FlatteningJsonDecoder::onContainerClose(int, size_t) {
   }
 }
 
-FlatteningJsonSerializer::FlatteningJsonSerializer(BufferManager& out) : out_(out) {}
+FlatteningJsonSerializer::FlatteningJsonSerializer(ChainWriter& out) : out_(out) {}
 
 bool FlatteningJsonSerializer::pathMatchesOpenContainers(FieldPath path) const {
   if (path.size() != open_containers_.size()) {
@@ -392,7 +392,7 @@ Coroutine::Task<absl::Status> FlatteningJsonSerializer::maybeFlushBuffer() {
 
 Coroutine::Task<absl::Status> FlatteningJsonSerializer::flushBuffer() {
   if (small_buf_.length() > 0) {
-    CO_RETURN_IF_ERROR(co_await ReplayAwaitable(out_, small_buf_));
+    CO_RETURN_IF_ERROR(co_await out_.inject(small_buf_));
   }
   co_return absl::OkStatus();
 }

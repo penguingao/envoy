@@ -11,7 +11,7 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/coroutine/task.h"
 #include "source/common/json/wuffs_json/wuffs_json_cursor.h"
-#include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/chain_writer.h"
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -126,7 +126,7 @@ private:
 };
 
 // Re-serializes a stream of `FlattenJsonField` batches into compact JSON through a
-// `BufferManager`.
+// `ChainWriter`.
 //
 // Maintains an explicit stack of open containers across batches, closing completed containers and
 // opening new ones from the prefix diff between consecutive `field_path()`s. Consecutive partial
@@ -135,9 +135,9 @@ private:
 // string literal (`"..."`).
 class FlatteningJsonSerializer {
 public:
-  explicit FlatteningJsonSerializer(BufferManager& out);
+  explicit FlatteningJsonSerializer(ChainWriter& out);
 
-  // Serializes a batch of `FlattenJsonField`s into the output buffer manager.
+  // Serializes a batch of `FlattenJsonField`s into the output writer.
   Coroutine::Task<absl::Status> serializeBatch(absl::Span<const FlattenJsonField> fields);
 
   // Closes any remaining open string and container scopes and flushes the output buffer.
@@ -156,7 +156,7 @@ private:
   Coroutine::Task<absl::Status> maybeFlushBuffer();
   Coroutine::Task<absl::Status> flushBuffer();
 
-  BufferManager& out_;
+  ChainWriter& out_;
   Buffer::OwnedImpl small_buf_;
   std::vector<OpenContainer> open_containers_;
   bool string_open_{false};
